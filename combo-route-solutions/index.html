@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Combo Route UX Lab — Fighting Game Combo Display Solutions</title>
+<style>
+  :root{
+    --bg:#0d0f14; --panel:#151824; --panel2:#1c2130; --line:#2a3040;
+    --txt:#e8eaf0; --dim:#9aa3b5; --accent:#ffd23f;
+    --mech-dr:#3ddc84; --mech-rc:#ff4d5e; --mech-hd:#ff8a2a; --mech-km:#4da3ff;
+    --btn:#232a3a;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:14px/1.5 "Segoe UI",system-ui,-apple-system,sans-serif;}
+  header{padding:28px 24px 8px;max-width:1100px;margin:0 auto}
+  header h1{margin:0 0 4px;font-size:22px;letter-spacing:.5px}
+  header h1 span{color:var(--accent)}
+  header p{margin:0;color:var(--dim);max-width:760px}
+  main{max-width:1100px;margin:0 auto;padding:16px 24px 64px}
+
+  /* ---------- control bar ---------- */
+  .controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;
+    background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:12px 14px;margin:16px 0}
+  .controls label{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin-right:2px}
+  select,button.seg{background:var(--btn);color:var(--txt);border:1px solid var(--line);
+    border-radius:8px;padding:7px 10px;font:inherit;cursor:pointer}
+  select:hover,button.seg:hover{border-color:var(--accent)}
+  .seggroup{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .seggroup button{background:transparent;border:0;border-right:1px solid var(--line);
+    color:var(--dim);padding:7px 12px;font:inherit;cursor:pointer}
+  .seggroup button:last-child{border-right:0}
+  .seggroup button.on{background:var(--accent);color:#111;font-weight:700}
+
+  /* ---------- solution tabs ---------- */
+  .tabs{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 10px}
+  .tab{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:9px 13px;color:var(--dim);cursor:pointer;font:inherit;text-align:left}
+  .tab b{display:block;color:var(--txt);font-size:13px}
+  .tab small{font-size:11px}
+  .tab.on{border-color:var(--accent);background:var(--panel2)}
+  .tab.on b{color:var(--accent)}
+  .desc{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:14px 16px;color:var(--dim);font-size:13px}
+  .desc b{color:var(--txt)}
+  .proscons{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+  @media(max-width:640px){.proscons{grid-template-columns:1fr}}
+  .pc{border-radius:8px;padding:10px 12px;font-size:12px}
+  .pc.pro{background:rgba(61,220,132,.08);border:1px solid rgba(61,220,132,.35)}
+  .pc.con{background:rgba(255,77,94,.08);border:1px solid rgba(255,77,94,.35)}
+  .pc b{display:block;margin-bottom:4px;font-size:11px;text-transform:uppercase;letter-spacing:1px}
+  .pc.pro b{color:var(--mech-dr)} .pc.con b{color:var(--mech-rc)}
+  .pc ul{margin:0;padding-left:16px}
+
+  /* ---------- viewport simulator ---------- */
+  .stage{margin-top:16px;display:flex;justify-content:center}
+  .viewport{background:#090b10;border:1px solid var(--line);border-radius:14px;
+    padding:18px;transition:width .25s ease;overflow:hidden;width:100%}
+  .viewport.mobile{width:390px;border-radius:28px;border-width:3px}
+  .vp-label{text-align:center;font-size:11px;color:var(--dim);letter-spacing:2px;
+    text-transform:uppercase;margin-bottom:12px}
+
+  .combo-card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:14px 16px;margin-bottom:14px}
+  .combo-card:last-child{margin-bottom:0}
+  .combo-meta{display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;margin-bottom:10px}
+  .combo-name{font-weight:700;font-size:13px}
+  .combo-tag{font-size:10px;color:var(--dim);border:1px solid var(--line);
+    border-radius:20px;padding:2px 8px;letter-spacing:.5px}
+
+  /* ---------- token primitives ---------- */
+  .flow{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+  .tok{white-space:nowrap;display:inline-flex;align-items:center;gap:5px;
+    background:var(--btn);border:1px solid var(--line);border-radius:8px;
+    padding:5px 9px;font:700 13px/1 "Consolas","SF Mono",monospace}
+  .tok.small{padding:3px 7px;font-size:11px}
+  .sep{color:var(--dim);background:transparent;border:0;padding:0 1px;font-weight:900}
+  .mech{border-radius:20px;padding:5px 11px;font:800 11px/1.1 "Segoe UI",sans-serif;
+    letter-spacing:.8px;color:#111;border:0;text-transform:uppercase}
+  .mech-dr{background:var(--mech-dr)} .mech-rc{background:var(--mech-rc);color:#fff}
+  .mech-hd{background:var(--mech-hd)} .mech-km{background:var(--mech-km);color:#fff}
+  .glyph{width:26px;height:26px;border-radius:50%;display:inline-flex;align-items:center;
+    justify-content:center;font:800 10px/1 sans-serif;color:#fff;border:1px solid rgba(255,255,255,.25)}
+  .g-p{background:#2f6fd0}.g-k{background:#3fa34d}.g-s{background:#c33}.g-h{background:#c9a227;color:#111}
+  .g-n{background:#555}.dir{background:#333;border-radius:6px;width:auto;min-width:22px;
+    padding:0 4px;border-radius:6px;font-size:11px}
+  .plus{color:var(--dim);font-weight:900;background:transparent;border:0;padding:0}
+
+  /* Solution B: scroll rail */
+  .rail{overflow-x:auto;scrollbar-width:thin;padding-bottom:6px;
+    -webkit-mask-image:linear-gradient(90deg,#000 88%,transparent);
+    mask-image:linear-gradient(90deg,#000 88%,transparent)}
+  .rail .flow{flex-wrap:nowrap;width:max-content}
+  .rail-hint{font-size:10px;color:var(--dim);text-align:right;letter-spacing:1px;margin-top:2px}
+
+  /* Solution C: step stack */
+  .steps{display:flex;flex-direction:column;gap:6px}
+  .step{display:flex;align-items:center;gap:10px;background:var(--panel2);
+    border:1px solid var(--line);border-radius:8px;padding:7px 10px}
+  .stepnum{flex:0 0 22px;height:22px;border-radius:50%;background:var(--accent);color:#111;
+    display:flex;align-items:center;justify-content:center;font:800 11px/1 sans-serif}
+  .step .tok,.step .mech{margin:0}
+
+  /* Solution D/E shared */
+  .tooltip{position:fixed;z-index:50;background:#000;border:1px solid var(--accent);
+    border-radius:8px;padding:8px 10px;font-size:11px;color:var(--txt);max-width:240px;
+    pointer-events:none;display:none;box-shadow:0 6px 24px rgba(0,0,0,.6)}
+  .tooltip b{color:var(--accent);display:block;margin-bottom:2px}
+  [data-tip]{cursor:help}
+  .adaptive-note{font-size:11px;color:var(--dim);margin-top:8px;font-style:italic}
+
+  footer{max-width:1100px;margin:0 auto;padding:0 24px 40px;color:var(--dim);font-size:12px}
+  footer b{color:var(--txt)}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>COMBO ROUTE <span>UX LAB</span></h1>
+  <p>Five candidate solutions for displaying modern fighting-game combo routes on the web.
+     Pick a game engine, a solution pattern, and toggle the viewport between desktop and a
+     390px phone to see how each pattern survives the squeeze.</p>
+</header>
+
+<main>
+  <div class="controls">
+    <div><label>Game</label>
+      <select id="game">
+        <option value="sf6">Street Fighter 6 (Capcom)</option>
+        <option value="mk1">Mortal Kombat 1 (NRS)</option>
+        <option value="tk8">Tekken 8 (Namco)</option>
+        <option value="ggst">Guilty Gear Strive (ArcSys)</option>
+      </select>
+    </div>
+    <div><label>Viewport</label>
+      <div class="seggroup" id="vpSeg">
+        <button data-vp="desktop" class="on">🖥 Desktop</button>
+        <button data-vp="mobile">📱 Mobile 390px</button>
+      </div>
+    </div>
+    <div><label>Notation</label>
+      <div class="seggroup" id="ntSeg">
+        <button data-nt="text" class="on">Text</button>
+        <button data-nt="icon">Icons</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="tabs" id="tabs"></div>
+  <div class="desc" id="desc"></div>
+
+  <div class="stage">
+    <div class="viewport" id="viewport">
+      <div class="vp-label" id="vpLabel">DESKTOP VIEW</div>
+      <div id="comboHost"></div>
+    </div>
+  </div>
+</main>
+
+<footer id="thesis"></footer>
+<div class="tooltip" id="tip"></div>
+
+<script>
+/* ================= TOKEN MODEL =================
+   Every combo is an array of tokens — never a flat string.
+   kind: "move" | "sep" | "mech"
+   glyphs lets the icon renderer map a token to button icons.  */
+const GAMES = {
+  sf6: {
+    label: "Street Fighter 6", style: "Capcom — separators: > (link), xx (cancel)",
+    combos: [
+      { name: "Ken — midscreen BnB", tags: ["Meterless", "12 hits"], tokens: [
+        M("5HP","HP button — 8f startup, -2 on block, 800 dmg",["HP"]),
+        S(">"),
+        M("2HP","Crouching HP — anti-air, cancelable",["2","+","HP"]),
+        S("xx"),
+        MECH("DR","Drive Rush — costs 1 Drive bar. State change: dash momentum + advantage.","dr"),
+        M("5HK","Standing HK — long poke",["5","HK"]),
+        S(">"),
+        M("5HP","HP button — links after DR",["5","HP"]),
+        S("xx"),
+        M("236HP","Heavy Hadoken — fireball special",["236","HP"]),
+      ]},
+      { name: "Ken — corner punish", tags: ["2 bars", "21 hits"], tokens: [
+        M("5HP","Punish counter starter",["5","HP"]),
+        S(">"),
+        M("5HP","Second HP link (counter only)",["5","HP"]),
+        S("xx"),
+        M("214MK","MK Shoryuken motion special",["214","MK"]),
+        MECH("DR","Drive Rush cancel — 3 bars total spent this route","dr"),
+        M("2LP","Jab check after dash",["2","LP"]),
+        S("xx"),
+        M("236236P","Super Art — Shinryu Reppa",["236236","P"]),
+      ]},
+    ]
+  },
+  mk1: {
+    label: "Mortal Kombat 1", style: "NRS — dial-a-combo: contiguous string groups (1=FP … 4=BK)",
+    combos: [
+      { name: "Scorpion — midscreen", tags: ["Kameo", "14 hits"], tokens: [
+        M("F212","Dial-a-string: Forward+FP, FP, FP — must be input rapidly with no gaps",["F","2","1","2"]),
+        S("~"),
+        MECH("KAMEO","Kameo assist call — spends Kameo meter, extends juggle","km"),
+        M("B32","Back+BP, BP — launcher string",["B","3","2"]),
+        S("~"),
+        M("BF2","Spear — Back, Forward + FP special",["B","F","2"]),
+      ]},
+      { name: "Scorpion — corner", tags: ["Fatal available", "19 hits"], tokens: [
+        M("111","Triple jab dial-string",["1","1","1"]),
+        S("~"),
+        M("F212","Forward string into juggle",["F","2","1","2"]),
+        S("~"),
+        M("DB3","Hell Port teleport — Down, Back + BK",["D","B","3"]),
+        S("~"),
+        M("J12","Jump-in FP, FP",["J","1","2"]),
+        S("~"),
+        M("BF2","Spear ender",["B","F","2"]),
+      ]},
+    ]
+  },
+  tk8: {
+    label: "Tekken 8", style: "Namco — commas separate beats, N = neutral, S! = Tornado",
+    combos: [
+      { name: "Jin — df2 launch", tags: ["Heat", "11 hits"], tokens: [
+        M("df2","Down-forward + right punch launcher — 15f",["df","2"]),
+        S(","),
+        M("1","Left punch jab filler",["1"]),
+        S(","),
+        M("b3~1,2","Back+left kick into strings",["b","3","~","1",",","2"]),
+        S(","),
+        M("S!","Tornado flip — spike state, next hit enders",["S","!"]),
+        S(","),
+        MECH("HD","Heat Dash — spends Heat gauge, re-stands opponent","hd"),
+        M("f3,1","Forward+LK, LP ender string",["f","3",",","1"]),
+      ]},
+      { name: "Jin — wall carry", tags: ["Wall splat", "9 hits"], tokens: [
+        M("df2","Launcher",["df","2"]),
+        S(","),
+        M("b3,1","Knee into jab",["b","3",",","1"]),
+        S(","),
+        M("N","Return stick to neutral — required for electric input",["N"]),
+        S(","),
+        M("f,N,d,df2","Electric Wind God Fist — just-frame motion",["f","N","d","df","2"]),
+        S(","),
+        M("f4,1","Wall-carry ender",["f","4",",","1"]),
+      ]},
+    ]
+  },
+  ggst: {
+    label: "Guilty Gear Strive", style: "ArcSys — numpad notation + proximity normals (c.S / f.S)",
+    combos: [
+      { name: "Sol — c.S confirm", tags: ["50% Tension", "13 hits"], tokens: [
+        M("c.S","Close Slash — proximity normal, only at point blank",["c",".","S"]),
+        S(">"),
+        M("2H","Crouching Heavy — launcher",["2","H"]),
+        S("xx"),
+        M("236H","Bandit Revolver — quarter-circle H",["236","H"]),
+        MECH("RC","Red Roman Cancel — 50% Tension. Freezes opponent, frees your routing.","rc"),
+        M("66","Dash forward (double-tap 6)",["66"]),
+        M("c.S","Re-dash close Slash",["c",".","S"]),
+        S(">"),
+        M("5H","Far Heavy",["5","H"]),
+        S("xx"),
+        M("623H","Volcanic Viper — DP ender",["623","H"]),
+      ]},
+      { name: "Sol — counter hit c.S", tags: ["100% Tension", "18 hits"], tokens: [
+        M("c.S","CH starter — extra hitstun",["c",".","S"]),
+        S(">"),
+        M("6H","Command Heavy — big bounce",["6","H"]),
+        MECH("RC","Roman Cancel to convert the bounce","rc"),
+        M("66","Dash",["66"]),
+        M("c.S","Close Slash",["c",".","S"]),
+        S(">"),
+        M("2H","Launcher",["2","H"]),
+        S("xx"),
+        M("632146H","Tyrant Rave super ender",["632146","H"]),
+      ]},
+    ]
+  }
+};
+function M(t, tip, glyphs){ return {kind:"move", text:t, tip:tip, glyphs:glyphs||[t]}; }
+function S(t){ return {kind:"sep", text:t}; }
+function MECH(t, tip, color){ return {kind:"mech", text:t, tip:tip, color:color}; }
+
+/* ================= SOLUTION DEFINITIONS ================= */
+const SOLUTIONS = [
+  { id:"A", name:"Token Flex Wrap", sub:"Whole-token line breaking",
+    desc:`<b>Solution A — every input is an atomic flex item.</b> Each move, separator and
+    mechanic badge is its own token with <code>white-space:nowrap</code>, laid out in a
+    <code>flex-wrap</code> row. On desktop it reads as one clean string; on mobile the line
+    breaks <b>only between tokens</b>, never inside one (<code>236H</code> can never split).`,
+    pros:["Zero layout code beyond flexbox — the baseline every site should have",
+          "Graceful on any width; copy-paste friendly"],
+    cons:["A 15-input anime combo still wraps into 3–4 ragged lines on a phone",
+          "Reading order ambiguity when wraps are deep"] },
+  { id:"B", name:"Scroll Rail", sub:"Single line, overflow-x",
+    desc:`<b>Solution B — the combo never wraps.</b> Tokens live in one horizontal rail with
+    <code>overflow-x:auto</code> and an edge fade hinting at off-screen content. Rhythm and
+    grouping stay perfectly linear, like reading a music staff.`,
+    pros:["Preserves true left-to-right combo rhythm on any screen",
+          "Great for very long routes and side-by-side comparisons"],
+    cons:["Hides information off-screen — users must discover scrolling",
+          "Terrible for skimming; phone users drag back and forth"] },
+  { id:"C", name:"Step Stack", sub:"In-game trial list",
+    desc:`<b>Solution C — abandon the horizontal string entirely.</b> The token array is
+    rendered as a numbered vertical list, exactly like SF6's Combo Trials or Tekken 8's
+    Combo Challenges. Each step carries one beat of the combo.`,
+    pros:["Perfect legibility on 390px screens — nothing ever wraps",
+          "Numbered steps map to muscle-memory practice; tap-friendly targets"],
+    cons:["Costs vertical space; a 12-hit combo = a full scroll",
+          "Loses the 'one string' reading feel veterans expect on desktop"] },
+  { id:"D", name:"Glyph / Icon Tokens", sub:"Button icons instead of text",
+    desc:`<b>Solution D — tokens rendered as visual button glyphs</b> (colored circles for
+    punches/kicks, direction chips), mirroring SF6's in-game icon toggle. Toggle the
+    Notation switch above to compare. Icons compress width and read across languages,
+    at the cost of a legend.`,
+    pros:["Language-independent; instantly scannable once learned",
+          "Narrower per-token footprint helps mobile density"],
+    cons:["Glyphs vary per platform (Xbox/PS/PC) — needs a control-scheme selector",
+          "Directions + buttons compound: 236HP becomes a long icon train"] },
+  { id:"E", name:"Adaptive Hybrid", sub:"Recommended — desktop string, mobile steps",
+    desc:`<b>Solution E — the recommended architecture.</b> One tokenized data model, two
+    render targets chosen by viewport width: desktop gets the linear string with
+    <b>hover tooltips carrying frame data</b>; mobile gets the step stack. Mechanic badges
+    (Drive Rush, Roman Cancel, Heat Dash, Kameo) stay visually loud in both. Try it —
+    flip the viewport toggle and watch the same combo re-render.`,
+    pros:["Best UX on both surfaces from a single token source of truth",
+          "Tooltips on desktop turn the string into teaching material",
+          "Mechanic badging preserves resource-rhythm hierarchy everywhere"],
+    cons:["Two render paths to maintain (mitigated: one shared token renderer)",
+          "Needs a resize listener or container queries"] },
+];
+
+/* ================= STATE ================= */
+const state = { game:"sf6", vp:"desktop", notation:"text", sol:"A" };
+
+/* ================= RENDERERS ================= */
+const host = document.getElementById("comboHost");
+
+function tokenHTML(tok, mode){
+  if(tok.kind==="sep"){
+    return `<span class="tok sep">${tok.text}</span>`;
+  }
+  if(tok.kind==="mech"){
+    const tipAttr = tok.tip ? ` data-tip="${esc(tok.text)}" data-tipbody="${esc(tok.tip)}"` : "";
+    return `<span class="mech mech-${tok.color}"${tipAttr}>${tok.text}</span>`;
+  }
+  // move
+  const tipAttr = tok.tip ? ` data-tip="${esc(tok.text)}" data-tipbody="${esc(tok.tip)}"` : "";
+  if(mode==="icon"){
+    const glyphs = tok.glyphs.map(g=>{
+      if(g==="+") return `<span class="tok plus">+</span>`;
+      if(/^[A-Z]{1,2}$/.test(g) && !/^(N|S)$/.test(g)){
+        const cls = /P/.test(g)?"g-p":/K/.test(g)?"g-k":/S/.test(g)?"g-s":/H/.test(g)?"g-h":"g-n";
+        return `<span class="glyph ${cls}">${g}</span>`;
+      }
+      return `<span class="glyph dir">${g}</span>`;
+    }).join("");
+    return `<span class="tok"${tipAttr}>${glyphs}</span>`;
+  }
+  return `<span class="tok"${tipAttr}>${tok.text}</span>`;
+}
+function esc(s){ return s.replace(/"/g,"&quot;"); }
+
+/* merge consecutive separators into steps for stack mode:
+   split the token array on sep tokens, one beat per step */
+function beats(tokens){
+  const out=[[]];
+  for(const t of tokens){
+    if(t.kind==="sep"){ out.push([]); }
+    else out[out.length-1].push(t);
+  }
+  return out.filter(b=>b.length);
+}
+
+function renderCombo(combo, sol, vp, notation){
+  const meta = `<div class="combo-meta"><span class="combo-name">${combo.name}</span>
+    ${combo.tags.map(t=>`<span class="combo-tag">${t}</span>`).join("")}</div>`;
+  const mode = notation;
+
+  if(sol==="B"){
+    return meta + `<div class="rail"><div class="flow">${
+      combo.tokens.map(t=>tokenHTML(t,mode)).join("")}</div></div>
+      <div class="rail-hint">⟵ SCROLL ⟶</div>`;
+  }
+  if(sol==="C"){
+    return meta + `<div class="steps">${
+      beats(combo.tokens).map((b,i)=>
+        `<div class="step"><span class="stepnum">${i+1}</span>${
+          b.map(t=>tokenHTML(t,mode)).join("")}</div>`).join("")}</div>`;
+  }
+  if(sol==="E" && vp==="mobile"){
+    return meta + `<div class="steps">${
+      beats(combo.tokens).map((b,i)=>
+        `<div class="step"><span class="stepnum">${i+1}</span>${
+          b.map(t=>tokenHTML(t,mode)).join("")}</div>`).join("")}</div>
+      <div class="adaptive-note">Adaptive: mobile viewport → step stack</div>`;
+  }
+  if(sol==="E"){
+    return meta + `<div class="flow">${
+      combo.tokens.map(t=>tokenHTML(t,mode)).join("")}</div>
+      <div class="adaptive-note">Adaptive: desktop viewport → linear string · hover any token for frame data</div>`;
+  }
+  // A and D
+  return meta + `<div class="flow">${
+    combo.tokens.map(t=>tokenHTML(t, sol==="D"?"icon":mode)).join("")}</div>`;
+}
+
+function render(){
+  const g = GAMES[state.game];
+  const vp = document.getElementById("viewport");
+  vp.classList.toggle("mobile", state.vp==="mobile");
+  document.getElementById("vpLabel").textContent =
+    state.vp==="mobile" ? "MOBILE VIEW · 390px" : "DESKTOP VIEW";
+  host.innerHTML = g.combos.map(c=>
+    `<div class="combo-card">${renderCombo(c, state.sol, state.vp, state.notation)}</div>`).join("");
+  document.getElementById("thesis").innerHTML =
+    `<b>${g.label}</b> · ${g.style}. Notice how the mechanic badge
+     (<b>DR / RC / HD / KAMEO</b>) breaks the visual flow on purpose — it marks a resource
+     spend and state change, not a normal attack.`;
+  const s = SOLUTIONS.find(x=>x.id===state.sol);
+  document.getElementById("desc").innerHTML =
+    s.desc + `<div class="proscons">
+      <div class="pc pro"><b>Strengths</b><ul>${s.pros.map(p=>`<li>${p}</li>`).join("")}</ul></div>
+      <div class="pc con"><b>Trade-offs</b><ul>${s.cons.map(c=>`<li>${c}</li>`).join("")}</ul></div>
+    </div>`;
+  document.querySelectorAll(".tab").forEach(t=>t.classList.toggle("on", t.dataset.id===state.sol));
+  bindTips();
+}
+
+/* ================= TABS + CONTROLS ================= */
+const tabs = document.getElementById("tabs");
+SOLUTIONS.forEach(s=>{
+  const b=document.createElement("button");
+  b.className="tab"; b.dataset.id=s.id;
+  b.innerHTML=`<b>${s.id} · ${s.name}</b><small>${s.sub}</small>`;
+  b.onclick=()=>{state.sol=s.id; render();};
+  tabs.appendChild(b);
+});
+document.getElementById("game").onchange=e=>{state.game=e.target.value;render();};
+document.getElementById("vpSeg").querySelectorAll("button").forEach(b=>{
+  b.onclick=()=>{ state.vp=b.dataset.vp;
+    document.querySelectorAll("#vpSeg button").forEach(x=>x.classList.toggle("on",x===b));
+    render(); };
+});
+document.getElementById("ntSeg").querySelectorAll("button").forEach(b=>{
+  b.onclick=()=>{ state.notation=b.dataset.nt;
+    document.querySelectorAll("#ntSeg button").forEach(x=>x.classList.toggle("on",x===b));
+    render(); };
+});
+
+/* ================= DESKTOP TOOLTIPS ================= */
+const tip = document.getElementById("tip");
+function bindTips(){
+  document.querySelectorAll("[data-tip]").forEach(el=>{
+    el.onmouseenter=e=>{
+      if(state.vp==="mobile") return;
+      tip.innerHTML=`<b>${el.dataset.tip}</b>${el.dataset.tipbody||""}`;
+      tip.style.display="block";
+    };
+    el.onmousemove=e=>{
+      tip.style.left=Math.min(e.clientX+14, innerWidth-260)+"px";
+      tip.style.top=(e.clientY+14)+"px";
+    };
+    el.onmouseleave=()=>{ tip.style.display="none"; };
+  });
+}
+
+render();
+</script>
+</body>
+</html>

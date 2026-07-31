@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>demos</title>
+<meta name="description" content="Small self-contained browser demos." />
+<style>
+  :root {
+    --bg: #06060c;
+    --fg: #e8e8f0;
+    --dim: #8a8aa0;
+    --accent: #ff3d81;
+    --line: rgba(255, 255, 255, 0.12);
+    --card: rgba(255, 255, 255, 0.035);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); }
+  body {
+    font: 16px/1.6 ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+    padding: clamp(1.5rem, 6vw, 5rem);
+    max-width: 60rem;
+    margin: 0 auto;
+    min-height: 100vh;
+  }
+  h1 {
+    margin: 0 0 .25rem;
+    font-size: clamp(1.6rem, 5vw, 2.4rem);
+    letter-spacing: .16em;
+    text-transform: uppercase;
+  }
+  .sub { margin: 0 0 2.5rem; color: var(--dim); }
+  ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 1rem; }
+  a.card {
+    display: block;
+    padding: 1.1rem 1.25rem;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--card);
+    color: inherit;
+    text-decoration: none;
+    transition: border-color .15s ease, background .15s ease, transform .15s ease;
+  }
+  a.card:hover, a.card:focus-visible {
+    border-color: var(--accent);
+    background: rgba(255, 61, 129, 0.07);
+    transform: translateY(-2px);
+  }
+  a.card:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  .name { font-weight: 600; letter-spacing: .06em; }
+  .name .tag {
+    margin-left: .6rem;
+    padding: .1rem .45rem;
+    border-radius: 999px;
+    background: var(--accent);
+    color: #0b0b14;
+    font-size: .7em;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    vertical-align: middle;
+  }
+  .desc { margin-top: .35rem; color: var(--dim); font-size: .9em; }
+  footer { margin-top: 3rem; color: var(--dim); font-size: .82em; }
+  footer a { color: var(--dim); }
+  @media (prefers-reduced-motion: reduce) {
+    a.card { transition: none; }
+    a.card:hover { transform: none; }
+  }
+</style>
+</head>
+<body>
+  <h1>demos</h1>
+  <p class="sub">Small, self-contained browser demos. Headphones recommended.</p>
+
+  <ul>
+    <li>
+      <a class="card" href="audio-reactive-textwall/">
+        <div class="name">Pulse <span class="tag">new</span></div>
+        <div class="desc">
+          Audio-reactive WebGL. Three scenes — reactive type, a geometric tunnel,
+          a synthwave landscape — with 19 stackable effects, fluid and particle
+          solvers, and a sequencer locked to the detected tempo. Plays whatever
+          you feed it: loopback, mic, or a dropped file.
+        </div>
+      </a>
+    </li>
+    <li>
+      <a class="card" href="audio-reactive/">
+        <div class="name">Audio reactive</div>
+        <div class="desc">Earlier audio-reactive experiment.</div>
+      </a>
+    </li>
+    <li>
+      <a class="card" href="combo-route-solutions/">
+        <div class="name">Combo route solutions</div>
+        <div class="desc">Single-page combo route solver.</div>
+      </a>
+    </li>
+  </ul>
+
+  <footer>
+    Static pages, no build step. Source on
+    <a href="https://github.com/LevonFrench/demos">GitHub</a>.
+  </footer>
+</body>
+</html>

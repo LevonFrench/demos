@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Audio Reactive Shader</title>
+    <link rel="stylesheet" href="./style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="ui">
+      <h1>Audio Visualizer</h1>
+      <p>Select an audio file to start</p>
+      <input type="file" id="audio-upload" accept="audio/*" />
+      <div class="controls">
+        <button id="play-btn" disabled>Play</button>
+        <button id="pause-btn" disabled>Pause</button>
+      </div>
+    </div>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

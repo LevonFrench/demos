@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pulse — audio reactive scenes</title>
+<meta name="description" content="Audio-reactive WebGL scenes: reactive type, a tunnel and a synthwave landscape, with 19 stackable effects and a beat-synced sequencer." />
+<link rel="stylesheet" href="src/style.css" />
+</head>
+<body>
+  <canvas id="stage" aria-label="Audio reactive text wall visualisation"></canvas>
+
+  <div id="hint" role="status">drop an audio file &middot; <kbd>H</kbd> panel &middot; <kbd>?</kbd> help</div>
+
+  <div id="howtoWrap" hidden>
+    <div id="howto" role="dialog" aria-modal="true" aria-labelledby="howtoTitle" tabindex="-1">
+      <header>
+        <h2 id="howtoTitle">pulse</h2>
+        <button id="howtoClose" type="button" aria-label="Close">&times;</button>
+      </header>
+
+      <p class="lead">
+        An audio-reactive visualiser. Feed it sound, then stack effects on top.
+      </p>
+
+      <h3>1 &middot; Get audio in</h3>
+      <dl>
+        <dt>Drop a file</dt>
+        <dd>Easiest. Drag any audio file onto the page &mdash; no permissions needed.</dd>
+
+        <dt>Find inputs</dt>
+        <dd>Lists recording devices. A <b>loopback</b> device (Stereo&nbsp;Mix,
+          CABLE&nbsp;Output, your interface&rsquo;s Loopback) is your speaker mix exposed
+          as an input. Best option if you have one &mdash; the permission sticks.
+          Detected ones are marked <b>&#9679;</b>.</dd>
+
+        <dt>Screen / tab audio</dt>
+        <dd>What you pick in the share dialog decides whether there is <em>any</em> audio:
+          <ul>
+            <li><b>A Chrome tab</b> &mdash; works everywhere. Good for YouTube, SoundCloud.</li>
+            <li><b>Entire screen</b> &mdash; works on Windows. The <em>only</em> way to capture
+              a desktop app like the Spotify client.</li>
+            <li><b>A single window</b> &mdash; never carries audio. This is usually why
+              &ldquo;system audio doesn&rsquo;t work&rdquo;.</li>
+          </ul>
+          DRM tabs such as Spotify&nbsp;Web capture silent &mdash; use Entire&nbsp;screen for those.</dd>
+
+        <dt>Mic</dt>
+        <dd>Point it at a speaker. Works, but picks up the room.</dd>
+      </dl>
+
+      <h3>2 &middot; Play with it</h3>
+      <dl>
+        <dt>Fire effects</dt>
+        <dd>Press <kbd>1</kbd>&ndash;<kbd>8</kbd>, <kbd>9</kbd> <kbd>0</kbd>, or
+          <kbd>Q</kbd><kbd>W</kbd><kbd>E</kbd><kbd>R</kbd><kbd>T</kbd><kbd>Y</kbd><kbd>U</kbd><kbd>I</kbd><kbd>O</kbd>.
+          They stack, and every one reverses itself back to rest.</dd>
+
+        <dt>Auto-fire</dt>
+        <dd>The effect buttons choose what auto-fire may pick. Lit = eligible.
+          Clicking one never fires it &mdash; the key still does, armed or not.
+          <kbd>Shift</kbd>+key arms one, <kbd>X</kbd> flips them all.</dd>
+
+        <dt>Mouse</dt>
+        <dd>Drag on the canvas to shove the wall. Hold to swirl.</dd>
+      </dl>
+
+      <h3>3 &middot; Shortcuts</h3>
+      <table class="keys">
+        <tr><td><kbd>H</kbd></td><td>show / hide the panel</td></tr>
+        <tr><td><kbd>A</kbd></td><td>auto-fire on beat</td></tr>
+        <tr><td><kbd>M</kbd></td><td>microphone</td></tr>
+        <tr><td><kbd>S</kbd></td><td>screen / tab audio</td></tr>
+        <tr><td><kbd>X</kbd></td><td>arm / disarm every effect</td></tr>
+        <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>previous / next scene in the show</td></tr>
+        <tr><td><kbd>?</kbd></td><td>this help</td></tr>
+      </table>
+
+      <button id="howtoGo" type="button" class="primary">Got it</button>
+    </div>
+  </div>
+
+  <aside id="panel" aria-label="Controls">
+    <header>
+      <h1>pulse</h1>
+      <div class="btns">
+        <button id="help" type="button" title="How to use (?)">?</button>
+        <button id="hide" type="button" title="Hide panel (H)">&times;</button>
+      </div>
+    </header>
+
+    <div class="row">
+      <label for="scene">Scene</label>
+      <select id="scene"></select>
+    </div>
+
+    <div class="row">
+      <label for="text">Text</label>
+      <input id="text" type="text" value="PULSE" autocomplete="off" spellcheck="false" />
+    </div>
+
+    <div class="row">
+      <label for="size">Font size <output id="sizeOut">44</output>px</label>
+      <input id="size" type="range" min="14" max="120" step="1" value="44" />
+    </div>
+
+    <div class="row">
+      <label for="kern">Kerning <output id="kernOut">0.00</output>em <span class="dim">(letters)</span></label>
+      <input id="kern" type="range" min="-0.1" max="0.8" step="0.01" value="0" />
+    </div>
+
+    <div class="row">
+      <label for="lead">Row pitch <output id="leadOut">1.32</output>&times; <span class="dim">(rows)</span></label>
+      <input id="lead" type="range" min="0.85" max="4" step="0.01" value="1.32" />
+    </div>
+
+    <div class="row">
+      <label for="scroll">Beat drift <output id="scrollOut">0.50</output>
+        <span class="dim">words/bar</span></label>
+      <input id="scroll" type="range" min="-4" max="4" step="0.05" value="0.5" />
+    </div>
+
+    <div class="row">
+      <label for="beatSens">Beat sensitivity <output id="beatSensOut">1.00</output>&times;</label>
+      <input id="beatSens" type="range" min="0.3" max="2" step="0.05" value="1" />
+    </div>
+
+    <div class="row">
+      <label for="gain">Sensitivity <output id="gainOut">1.0</output>&times;</label>
+      <input id="gain" type="range" min="0.2" max="4" step="0.05" value="1" />
+    </div>
+
+    <div class="row">
+      <label for="source">Audio source</label>
+      <div class="btns">
+        <button id="scan" type="button">Find inputs</button>
+        <button id="mic" type="button">Mic (M)</button>
+        <button id="pick" type="button">File</button>
+        <button id="metro" type="button" aria-pressed="true">Metronome</button>
+      </div>
+      <select id="inputDevice" hidden></select>
+      <div class="btns" style="margin-top:.35rem">
+        <button id="system" type="button">Screen / tab audio (S)</button>
+      </div>
+      <input id="file" type="file" accept="audio/*" hidden />
+      <p class="note" id="systemNote">
+        Stuck? <button type="button" class="linkish" id="helpAudio">Read the audio guide</button>
+      </p>
+    </div>
+
+    <div class="row">
+      <label for="origin">Effects fire from</label>
+      <select id="origin">
+        <option value="scatter" selected>A new random spot each time</option>
+        <option value="mouse">The mouse cursor</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <label>Auto-fire pool <span class="dim"><output id="armCount">19</output> of <output id="armTotal">19</output> armed</span></label>
+      <div class="btns" id="fxButtons"></div>
+    </div>
+
+    <div class="row">
+      <label for="auto">
+        <input id="auto" type="checkbox" /> Auto-fire on beat
+      </label>
+      <label for="cursorFx">
+        <input id="cursorFx" type="checkbox" checked /> Mouse pushes the text
+      </label>
+      <label for="pulse">
+        <input id="pulse" type="checkbox" /> Pulse the resting wall
+      </label>
+      <label for="beatPulse">
+        <input id="beatPulse" type="checkbox" /> Beat pulse
+      </label>
+      <label for="fxaa">
+        <input id="fxaa" type="checkbox" checked /> Anti-alias (FXAA)
+      </label>
+    </div>
+
+    <div class="row">
+      <label for="grain">Film grain <output id="grainOut">0.35</output></label>
+      <input id="grain" type="range" min="0" max="1" step="0.05" value="0.35" />
+    </div>
+
+    <div class="row">
+      <label for="dof">Defocus <output id="dofOut">1.00</output></label>
+      <input id="dof" type="range" min="0" max="3" step="0.1" value="1" />
+    </div>
+
+    <div class="row">
+      <label for="fluid">Fluid <output id="fluidOut">1.00</output> <span class="dim">drag to stir</span></label>
+      <input id="fluid" type="range" min="0" max="2" step="0.05" value="1" />
+    </div>
+
+    <div class="row">
+      <label for="bloom">Bloom <output id="bloomOut">0.50</output></label>
+      <input id="bloom" type="range" min="0" max="2" step="0.05" value="0.5" />
+    </div>
+
+    <div class="row">
+      <label for="tone">Tone curve <output id="toneOut">0.00</output></label>
+      <input id="tone" type="range" min="0" max="1" step="0.05" value="0" />
+    </div>
+
+    <div class="row">
+      <label for="trails">Trails <output id="trailsOut">0.00</output><span class="dim">s fade</span></label>
+      <input id="trails" type="range" min="0" max="1" step="0.02" value="0" />
+    </div>
+
+    <div class="row">
+      <label for="show">
+        <input id="show" type="checkbox" /> Run the show
+      </label>
+      <div id="showState" hidden>
+        <div class="scene">
+          <b id="sceneName">&mdash;</b>
+          <span id="sceneBar" class="dim"></span>
+        </div>
+        <div class="btns skipbtns">
+          <button id="prevScene" type="button" title="Previous scene ([)">&larr;</button>
+          <button id="nextScene" type="button" title="Next scene (])">&rarr;</button>
+        </div>
+        <div class="track"><i id="sceneFill"></i></div>
+        <ul id="layerList"></ul>
+      </div>
+    </div>
+
+    <div class="row bpm">
+      <label>Tempo lock</label>
+      <div class="bpmline">
+        <span id="beatDot" aria-hidden="true"></span>
+        <output id="bpmOut" data-locked="false">listening&hellip;</output>
+      </div>
+    </div>
+
+    <div class="meters" aria-hidden="true">
+      <div class="meter"><i id="mBass"></i><span>bass</span></div>
+      <div class="meter"><i id="mMid"></i><span>mid</span></div>
+      <div class="meter"><i id="mTre"></i><span>tre</span></div>
+    </div>
+  </aside>
+
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>
