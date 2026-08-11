@@ -1,0 +1,10650 @@
+// src/gpu.ts
+var GpuInitError = class extends Error {
+};
+async function initGpu(canvas2) {
+  if (!navigator.gpu) {
+    throw new GpuInitError(
+      "WebGPU is not available. aaavs is WebGPU-only by design (plan \xA74.9) \u2014 use Chrome, Edge, Firefox or Safari 26+."
+    );
+  }
+  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  if (!adapter) throw new GpuInitError("No WebGPU adapter. A GPU driver may be blocklisted.");
+  const noTimer = new URLSearchParams(location.search).has("notimer");
+  const hasTimestamp = !noTimer && adapter.features.has("timestamp-query");
+  const device2 = await adapter.requestDevice({
+    requiredFeatures: hasTimestamp ? ["timestamp-query"] : []
+  });
+  device2.lost.then((info) => {
+    console.error(`[gpu] device lost: ${info.reason} \u2014 ${info.message}`);
+  });
+  const context = canvas2.getContext("webgpu");
+  if (!context) throw new GpuInitError("Could not acquire a webgpu canvas context.");
+  const swapFormat = navigator.gpu.getPreferredCanvasFormat();
+  context.configure({ device: device2, format: swapFormat, alphaMode: "opaque" });
+  return {
+    device: device2,
+    canvas: canvas2,
+    context,
+    swapFormat,
+    hdrFormat: "rgba16float",
+    width: canvas2.width,
+    height: canvas2.height,
+    hasTimestamp
+  };
+}
+function createSampler(gpu2) {
+  return gpu2.device.createSampler({
+    magFilter: "linear",
+    minFilter: "linear",
+    addressModeU: "clamp-to-edge",
+    addressModeV: "clamp-to-edge"
+  });
+}
+function createFullscreenPipeline(gpu2, label, code, format, blend) {
+  const module = gpu2.device.createShaderModule({ label, code });
+  return gpu2.device.createRenderPipeline({
+    label,
+    layout: "auto",
+    vertex: { module, entryPoint: "vs" },
+    fragment: { module, entryPoint: "fs", targets: [{ format, blend }] },
+    primitive: { topology: "triangle-list" }
+  });
+}
+function resize(gpu2, cssW, cssH, dpr) {
+  const w = Math.max(1, Math.round(cssW * dpr));
+  const h = Math.max(1, Math.round(cssH * dpr));
+  if (w === gpu2.width && h === gpu2.height) return false;
+  gpu2.canvas.width = w;
+  gpu2.canvas.height = h;
+  gpu2.width = w;
+  gpu2.height = h;
+  return true;
+}
+
+// src/audio.ts
+var BANDS = {
+  sub: [20, 80],
+  low: [80, 250],
+  mid: [250, 2e3],
+  high: [2e3, 8e3],
+  air: [8e3, 2e4]
+};
+var BAND_NAMES = Object.keys(BANDS);
+var WAVE_N = 1024;
+var SPEC_N = 256;
+var SPECTROGRAM_ROWS = 256;
+var DETECT_RING = 256;
+var DETECT_WINDOW = 1.1;
+var DETECT_K = 1.6;
+var DETECT_FLOOR = 4e-3;
+var DETECT_HZ = 8e3;
+var MIN_GAP = 0.09;
+var AudioEngine = class {
+  ctx = null;
+  input = null;
+  monitor = null;
+  splitter = null;
+  anL = null;
+  // smoothed, left
+  anR = null;
+  // smoothed, right
+  detector = null;
+  // unsmoothed, mono, fast
+  coarse = null;
+  // 8192, mono — chroma later
+  source = null;
+  buffer = null;
+  // --- exposed to the GPU ------------------------------------------------
+  /** Interleaved L,R time-domain, WAVE_N frames. */
+  waveform = new Float32Array(WAVE_N * 2);
+  /** Interleaved L,R magnitudes 0..1, SPEC_N bins. */
+  spectrum = new Float32Array(SPEC_N * 2);
+  /** Per-bin pan, -1..1. Beyond broadband pan — this is what places effects. */
+  bandPan = new Float32Array(SPEC_N);
+  /** Scrolling magnitude history, SPEC_N x SPECTROGRAM_ROWS, ring-written. */
+  spectrogram = new Float32Array(SPEC_N * SPECTROGRAM_ROWS);
+  spectrogramRow = 0;
+  /** Peak-hold with fall, per bin. */
+  peaks = new Float32Array(SPEC_N);
+  bands = { sub: 0, low: 0, mid: 0, high: 0, air: 0 };
+  level = 0;
+  beat = 0;
+  /** Broadband pan, -1..1. */
+  pan = 0;
+  /** ‖S‖/(‖M‖+‖S‖) — spikes when wide material enters. Feeds tension later. */
+  width = 0;
+  /** peak/rms. Low = compressed; a build compresses. */
+  crest = 1;
+  /** Spectral centroid, normalised. */
+  centroid = 0;
+  /** Spectral flatness — tonal (0) to noisy (1). */
+  flatness = 0;
+  onOnset = null;
+  // Exposed for the debug overlay — a detector you cannot see the internals of
+  // is a detector you tune by superstition.
+  debugFlux = 0;
+  debugThresh = 0;
+  // --- internals ---------------------------------------------------------
+  freqL = new Uint8Array(0);
+  freqR = new Uint8Array(0);
+  timeL = new Float32Array(0);
+  timeR = new Float32Array(0);
+  detSpec = new Uint8Array(0);
+  prevSpec = new Uint8Array(0);
+  /** Running max per bin — adaptive whitening makes detection loudness-invariant. */
+  whiten = new Float32Array(0);
+  fluxT = new Float32Array(DETECT_RING);
+  fluxV = new Float32Array(DETECT_RING);
+  fi = 0;
+  lastBeat = -1;
+  /** Short white-noise burst, reused for test-signal hats. */
+  noiseBuf = null;
+  startedAt = 0;
+  playing = false;
+  testBpm = 0;
+  nextClick = 0;
+  clickTimer = null;
+  get isPlaying() {
+    return this.playing;
+  }
+  get duration() {
+    return this.buffer?.duration ?? 0;
+  }
+  /** Audio-clock seconds since playback began. The only clock (§4.6). */
+  get currentTime() {
+    if (!this.ctx || !this.playing) return 0;
+    return this.ctx.currentTime - this.startedAt;
+  }
+  /** Real output latency, for scheduler compensation. Can change; read often. */
+  get outputLatency() {
+    return this.ctx?.outputLatency ?? 0;
+  }
+  /**
+   * The node an external analyser should TAP.
+   *
+   * This is the pre-monitor input gain — everything played goes through it,
+   * including the built-in test signal, and it sits before the stereo split so
+   * a tap sees the same signal the analysers do. Exposed (rather than the
+   * analysers) because `worklet-host.ts` needs a source to connect FROM, and
+   * `null` until the first trusted gesture has created the context.
+   */
+  get tap() {
+    return this.input;
+  }
+  ensure() {
+    if (this.ctx) return this.ctx;
+    const ctx = new AudioContext({ latencyHint: "interactive" });
+    this.ctx = ctx;
+    this.input = ctx.createGain();
+    this.monitor = ctx.createGain();
+    this.monitor.gain.value = 1;
+    this.input.connect(this.monitor);
+    this.monitor.connect(ctx.destination);
+    this.splitter = ctx.createChannelSplitter(2);
+    this.input.connect(this.splitter);
+    this.anL = ctx.createAnalyser();
+    this.anR = ctx.createAnalyser();
+    for (const a of [this.anL, this.anR]) {
+      a.fftSize = 2048;
+      a.smoothingTimeConstant = 0.72;
+    }
+    this.splitter.connect(this.anL, 0);
+    this.splitter.connect(this.anR, 1);
+    this.detector = ctx.createAnalyser();
+    this.detector.fftSize = 512;
+    this.detector.smoothingTimeConstant = 0;
+    this.input.connect(this.detector);
+    this.coarse = ctx.createAnalyser();
+    this.coarse.fftSize = 8192;
+    this.coarse.smoothingTimeConstant = 0.5;
+    this.input.connect(this.coarse);
+    this.freqL = new Uint8Array(this.anL.frequencyBinCount);
+    this.freqR = new Uint8Array(this.anR.frequencyBinCount);
+    this.timeL = new Float32Array(this.anL.fftSize);
+    this.timeR = new Float32Array(this.anR.fftSize);
+    this.detSpec = new Uint8Array(this.detector.frequencyBinCount);
+    this.prevSpec = new Uint8Array(this.detector.frequencyBinCount);
+    this.whiten = new Float32Array(this.detector.frequencyBinCount).fill(1);
+    return ctx;
+  }
+  async loadFile(file) {
+    const ctx = this.ensure();
+    await ctx.resume();
+    this.buffer = await ctx.decodeAudioData(await file.arrayBuffer());
+    this.play();
+  }
+  play() {
+    if (!this.ctx || !this.buffer || !this.input) return;
+    this.stop();
+    const src2 = this.ctx.createBufferSource();
+    src2.buffer = this.buffer;
+    src2.loop = true;
+    src2.connect(this.input);
+    this.startedAt = this.ctx.currentTime;
+    src2.start(this.startedAt);
+    this.source = src2;
+    this.playing = true;
+    this.resetDetector();
+  }
+  /**
+   * Synthetic click track. Exists so the clock and scheduler can be verified
+   * without a file — with a known tempo, "did it lock correctly" becomes an
+   * assertion rather than a vibe.
+   */
+  startTestSignal(bpm = 128) {
+    const ctx = this.ensure();
+    void ctx.resume();
+    this.stop();
+    this.testBpm = bpm;
+    this.startedAt = ctx.currentTime;
+    this.playing = true;
+    this.resetDetector();
+    this.scheduleClicks();
+  }
+  scheduleClicks() {
+    const ctx = this.ctx;
+    const period = 60 / this.testBpm;
+    if (!this.nextClick) this.nextClick = ctx.currentTime + 0.1;
+    while (this.nextClick < ctx.currentTime + 0.5) {
+      const t = this.nextClick;
+      const beat = Math.round((t - this.startedAt) / period);
+      const isHat = beat % 2 === 1;
+      const env = ctx.createGain();
+      const pan = ctx.createStereoPanner();
+      pan.pan.value = isHat ? 0.6 : 0;
+      env.connect(pan);
+      pan.connect(this.input);
+      if (isHat) {
+        const src2 = ctx.createBufferSource();
+        src2.buffer = this.noise(ctx);
+        const hp = ctx.createBiquadFilter();
+        hp.type = "highpass";
+        hp.frequency.value = 6e3;
+        env.gain.setValueAtTime(1e-4, t);
+        env.gain.exponentialRampToValueAtTime(0.5, t + 2e-3);
+        env.gain.exponentialRampToValueAtTime(1e-4, t + 0.045);
+        src2.connect(hp);
+        hp.connect(env);
+        src2.start(t);
+        src2.stop(t + 0.06);
+      } else {
+        const osc = ctx.createOscillator();
+        osc.frequency.setValueAtTime(180, t);
+        osc.frequency.exponentialRampToValueAtTime(45, t + 0.09);
+        env.gain.setValueAtTime(1e-4, t);
+        env.gain.exponentialRampToValueAtTime(0.9, t + 4e-3);
+        env.gain.exponentialRampToValueAtTime(1e-4, t + 0.16);
+        osc.connect(env);
+        osc.start(t);
+        osc.stop(t + 0.2);
+      }
+      this.nextClick += period;
+    }
+    this.clickTimer = window.setTimeout(() => {
+      if (this.testBpm) this.scheduleClicks();
+    }, 200);
+  }
+  /** Deterministic noise, per plan §4.7 — no Math.random anywhere. */
+  noise(ctx) {
+    if (this.noiseBuf) return this.noiseBuf;
+    const n = Math.floor(ctx.sampleRate * 0.12);
+    const buf = ctx.createBuffer(1, n, ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    let h = 2654435769;
+    for (let i = 0; i < n; i++) {
+      h = Math.imul(h ^ h >>> 15, 2221713035) >>> 0;
+      d[i] = h / 2147483648 - 1;
+    }
+    this.noiseBuf = buf;
+    return buf;
+  }
+  stop() {
+    this.testBpm = 0;
+    this.nextClick = 0;
+    if (this.clickTimer !== null) {
+      clearTimeout(this.clickTimer);
+      this.clickTimer = null;
+    }
+    if (this.source) {
+      try {
+        this.source.stop();
+      } catch {
+      }
+      this.source.disconnect();
+      this.source = null;
+    }
+    this.playing = false;
+  }
+  /**
+   * Final page teardown. `stop()` handles the current source, while closing the
+   * context guarantees that a just-scheduled test click cannot escape a tab
+   * close and keep playing in a background browser process.
+   */
+  dispose() {
+    this.stop();
+    const ctx = this.ctx;
+    if (!ctx || ctx.state === "closed") return;
+    void ctx.close().catch(() => {
+    });
+  }
+  resetDetector() {
+    this.prevSpec.fill(0);
+    this.whiten.fill(1);
+    this.fluxT.fill(0);
+    this.fluxV.fill(0);
+    this.fi = 0;
+    this.lastBeat = -1;
+    this.beat = 0;
+    this.spectrogram.fill(0);
+    this.spectrogramRow = 0;
+  }
+  update(dt) {
+    const t = this.currentTime;
+    if (!this.anL || !this.anR || !this.ctx || !this.playing) {
+      this.beat *= Math.exp(-dt * 7);
+      return;
+    }
+    this.anL.getByteFrequencyData(this.freqL);
+    this.anR.getByteFrequencyData(this.freqR);
+    this.anL.getFloatTimeDomainData(this.timeL);
+    this.anR.getFloatTimeDomainData(this.timeR);
+    const wStep = this.timeL.length / WAVE_N;
+    for (let i = 0; i < WAVE_N; i++) {
+      const j = Math.floor(i * wStep);
+      this.waveform[i * 2] = this.timeL[j];
+      this.waveform[i * 2 + 1] = this.timeR[j];
+    }
+    let sq = 0, peak = 0, mSq = 0, sSq = 0;
+    for (let i = 0; i < this.timeL.length; i++) {
+      const l = this.timeL[i], r = this.timeR[i];
+      const m = (l + r) * 0.5, s = (l - r) * 0.5;
+      sq += m * m;
+      mSq += m * m;
+      sSq += s * s;
+      const a = Math.abs(m);
+      if (a > peak) peak = a;
+    }
+    const rms = Math.sqrt(sq / this.timeL.length);
+    this.level = clamp(rms * 4);
+    this.crest = peak / Math.max(rms, 1e-5);
+    const mN = Math.sqrt(mSq), sN = Math.sqrt(sSq);
+    this.width = sN / Math.max(mN + sN, 1e-6);
+    const step = this.freqL.length / SPEC_N;
+    let cenNum = 0, cenDen = 0, logSum = 0, linSum = 0;
+    for (let i = 0; i < SPEC_N; i++) {
+      const a = Math.floor(i * step);
+      const b = Math.min(this.freqL.length, Math.floor((i + 1) * step));
+      let eL = 0, eR = 0;
+      for (let j = a; j < b; j++) {
+        const l = this.freqL[j] / 255;
+        const r = this.freqR[j] / 255;
+        eL += l * l;
+        eR += r * r;
+      }
+      const n = Math.max(1, b - a);
+      const L = Math.sqrt(eL / n), R = Math.sqrt(eR / n);
+      this.spectrum[i * 2] = L;
+      this.spectrum[i * 2 + 1] = R;
+      const sum = L + R;
+      this.bandPan[i] = sum > 0.01 ? (L - R) / sum : 0;
+      const mag = sum * 0.5;
+      this.peaks[i] = Math.max(mag, this.peaks[i] - dt * 0.6);
+      this.spectrogram[this.spectrogramRow * SPEC_N + i] = mag;
+      cenNum += mag * i;
+      cenDen += mag;
+      logSum += Math.log(mag + 1e-6);
+      linSum += mag;
+    }
+    this.spectrogramRow = (this.spectrogramRow + 1) % SPECTROGRAM_ROWS;
+    this.centroid = cenDen > 0 ? cenNum / cenDen / SPEC_N : 0;
+    this.flatness = linSum > 0 ? Math.exp(logSum / SPEC_N) / (linSum / SPEC_N) : 0;
+    const nyq = this.ctx.sampleRate / 2;
+    const binOf = (hz) => Math.min(this.freqL.length - 1, Math.round(hz / nyq * this.freqL.length));
+    let panNum = 0, panDen = 0;
+    for (const name of BAND_NAMES) {
+      const [lo, hi] = BANDS[name];
+      const a = binOf(lo), b = binOf(hi);
+      let sL = 0, sR = 0;
+      for (let i = a; i <= b; i++) {
+        sL += this.freqL[i];
+        sR += this.freqR[i];
+      }
+      const n = (b - a + 1) * 255;
+      const gain = name === "sub" ? 1.6 : name === "low" ? 1.5 : name === "mid" ? 2.2 : 3;
+      this.bands[name] = clamp((sL + sR) / (2 * n) * gain);
+      panNum += sL - sR;
+      panDen += sL + sR;
+    }
+    this.pan = panDen > 0 ? clampSigned(panNum / panDen) : 0;
+    this.detectOnset(dt, t);
+  }
+  detectOnset(dt, t) {
+    const det = this.detector;
+    det.getByteFrequencyData(this.detSpec);
+    const nyq = this.ctx.sampleRate / 2;
+    const top = Math.min(this.detSpec.length, Math.ceil(DETECT_HZ / nyq * this.detSpec.length));
+    let flux = 0, wsum = 0;
+    let lg = 0, ln = 0;
+    let loE = 0, midE = 0, hiE = 0;
+    const loTop = Math.min(top, Math.max(1, Math.round(250 / nyq * this.detSpec.length)));
+    const hiBot = Math.min(top, Math.round(5e3 / nyq * this.detSpec.length));
+    for (let i = 0; i < top; i++) {
+      const cur = this.detSpec[i] / 255;
+      this.whiten[i] = Math.max(cur, this.whiten[i] * 0.999, 0.02);
+      const norm = cur / this.whiten[i];
+      const prev = this.prevSpec[i] / 255 / this.whiten[i];
+      const w = 1 + 3 * Math.exp(-i / 5);
+      const d = norm - prev;
+      if (d > 0) flux += d * w;
+      wsum += w;
+      this.prevSpec[i] = this.detSpec[i];
+      lg += Math.log(cur + 1e-6);
+      ln += cur;
+      const pos = d > 0 ? d : 0;
+      if (i < loTop) loE += pos;
+      else if (i >= hiBot) hiE += pos;
+      else midE += pos;
+    }
+    flux /= wsum;
+    this.fluxT[this.fi] = t;
+    this.fluxV[this.fi] = flux;
+    this.fi = (this.fi + 1) % DETECT_RING;
+    let n = 0, s = 0, s2 = 0;
+    for (let i = 0; i < DETECT_RING; i++) {
+      if (t - this.fluxT[i] > DETECT_WINDOW) continue;
+      const v = this.fluxV[i];
+      s += v;
+      s2 += v * v;
+      n++;
+    }
+    const mean = n ? s / n : 0;
+    const varc = n ? Math.max(0, s2 / n - mean * mean) : 0;
+    const thresh = mean + DETECT_K * Math.sqrt(varc);
+    this.debugFlux = flux;
+    this.debugThresh = thresh;
+    this.beat *= Math.exp(-dt * 7);
+    if (flux > thresh && flux > DETECT_FLOOR && t - this.lastBeat > MIN_GAP) {
+      this.lastBeat = t;
+      const strength = clamp(0.55 + (flux - thresh) / Math.max(thresh, 1e-4) * 0.45);
+      this.beat = Math.max(this.beat, strength);
+      const flat = ln > 0 ? Math.exp(lg / top) / (ln / top) : 0;
+      const loD = loE / Math.max(1, loTop);
+      const midD = midE / Math.max(1, hiBot - loTop);
+      const hiD = hiE / Math.max(1, top - hiBot);
+      const tot = loD + midD + hiD + 1e-6;
+      const lo = loD / tot, hi = hiD / tot;
+      let klass;
+      if (hi > 0.42) klass = "hat";
+      else if (lo > 0.42) klass = "kick";
+      else if (flat > 0.3) klass = "snare";
+      else klass = "tonal";
+      this.onOnset?.({ time: t, strength, klass, pan: this.pan });
+    }
+  }
+};
+function clamp(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+function clampSigned(v) {
+  return v < -1 ? -1 : v > 1 ? 1 : v;
+}
+
+// src/clock.ts
+var SLOTS_PER_BEAT = 240;
+var SLOTS_PER_BAR = SLOTS_PER_BEAT * 4;
+var MIN_BPM = 90;
+var MAX_BPM = 180;
+var MAX_LOOKAHEAD = 10;
+var WINDOW = 48;
+var MIN_ONSETS = 8;
+var DIVISIONS = {
+  "1/64": SLOTS_PER_BEAT / 16,
+  // 15
+  "1/32": SLOTS_PER_BEAT / 8,
+  // 30
+  "1/16": SLOTS_PER_BEAT / 4,
+  // 60
+  "1/8": SLOTS_PER_BEAT / 2,
+  // 120
+  "beat": SLOTS_PER_BEAT,
+  // 240
+  "half": SLOTS_PER_BEAT * 2,
+  // 480
+  "bar": SLOTS_PER_BAR,
+  // 960
+  "2bar": SLOTS_PER_BAR * 2,
+  "4bar": SLOTS_PER_BAR * 4,
+  // Triplets — the reason 16 slots/beat was not enough.
+  "1/8T": SLOTS_PER_BEAT / 3,
+  // 80
+  "1/16T": SLOTS_PER_BEAT / 6,
+  // 40
+  // Quintuplets — the reason 48 was not enough either.
+  "1/4quint": SLOTS_PER_BEAT / 5,
+  // 48
+  // Dotted.
+  "1/8dot": SLOTS_PER_BEAT * 3 / 4
+  // 180
+};
+var TempoTracker = class {
+  onsets = [];
+  bpm = 0;
+  confidence = 0;
+  locked = false;
+  /** Absolute time of the next grid beat. NEVER an index recomputed from an
+   *  anchor — easing a moving anchor makes the index run backwards and the
+   *  grid dies silently. Pulse lost an evening to this. */
+  nextBeat = 0;
+  beatIndex = 0;
+  phase = 0;
+  reset() {
+    this.onsets.length = 0;
+    this.bpm = 0;
+    this.confidence = 0;
+    this.locked = false;
+    this.nextBeat = 0;
+    this.beatIndex = 0;
+    this.phase = 0;
+  }
+  addOnset(t) {
+    const last2 = this.onsets[this.onsets.length - 1];
+    if (last2 !== void 0 && t - last2 < 0.12) return;
+    this.onsets.push(t);
+    if (this.onsets.length > WINDOW) this.onsets.shift();
+    if (this.onsets.length >= MIN_ONSETS) this.score();
+    if (this.locked && this.nextBeat) {
+      const period = 60 / this.bpm;
+      const err2 = wrapSigned(t - this.nextBeat, period);
+      if (Math.abs(err2) > period * 0.12) this.nextBeat += err2 * 0.25;
+    }
+  }
+  score() {
+    const hist = /* @__PURE__ */ new Map();
+    for (let i = 0; i < this.onsets.length; i++) {
+      for (let j = 1; j <= MAX_LOOKAHEAD; j++) {
+        const k = i + j;
+        if (k >= this.onsets.length) break;
+        const dt = this.onsets[k] - this.onsets[i];
+        if (dt <= 0) continue;
+        const tempo2 = foldTempo(60 / dt);
+        if (!tempo2) continue;
+        const key = Math.round(tempo2);
+        hist.set(key, (hist.get(key) ?? 0) + 1);
+      }
+    }
+    if (!hist.size) return;
+    const smooth = /* @__PURE__ */ new Map();
+    let total = 0;
+    for (const [tempo2, count] of hist) {
+      for (let d = -2; d <= 2; d++) {
+        smooth.set(tempo2 + d, (smooth.get(tempo2 + d) ?? 0) + count * (1 - Math.abs(d) * 0.3));
+      }
+      total += count;
+    }
+    let best = 0, bestScore = 0;
+    for (const [tempo2, sc] of smooth) {
+      if (tempo2 < MIN_BPM || tempo2 > MAX_BPM) continue;
+      if (sc > bestScore) {
+        bestScore = sc;
+        best = tempo2;
+      }
+    }
+    if (!best) return;
+    this.confidence = Math.min(1, bestScore / Math.max(total, 1));
+    if (!this.bpm) this.bpm = best;
+    else if (Math.abs(best - this.bpm) > 6) this.bpm = best;
+    else this.bpm += (best - this.bpm) * 0.2;
+    this.locked = this.confidence > 0.12 && this.onsets.length >= MIN_ONSETS;
+  }
+  /** Advance the predicted grid. `now` is audio-clock seconds. */
+  update(now) {
+    if (!this.locked || !this.bpm) {
+      this.phase = 0;
+      return;
+    }
+    const period = 60 / this.bpm;
+    if (!this.nextBeat) this.nextBeat = now + period;
+    let guard = 4;
+    while (now >= this.nextBeat && guard-- > 0) {
+      this.nextBeat += period;
+      this.beatIndex++;
+    }
+    if (now >= this.nextBeat) this.nextBeat = now + period;
+    this.phase = 1 - Math.max(0, Math.min(1, (this.nextBeat - now) / period));
+  }
+  /** Continuous position in slots. Fractional; monotonic while locked. */
+  slotAt(now) {
+    if (!this.locked || !this.bpm) return 0;
+    const period = 60 / this.bpm;
+    const beats = this.beatIndex + this.phase;
+    void period;
+    void now;
+    return beats * SLOTS_PER_BEAT;
+  }
+};
+function foldTempo(bpm) {
+  if (!isFinite(bpm) || bpm <= 0) return 0;
+  while (bpm < MIN_BPM) bpm *= 2;
+  while (bpm > MAX_BPM) bpm /= 2;
+  return bpm >= MIN_BPM && bpm <= MAX_BPM ? bpm : 0;
+}
+function wrapSigned(v, period) {
+  const m = (v % period + period) % period;
+  return m > period / 2 ? m - period : m;
+}
+
+// src/contracts.ts
+var SLOTS_PER_BEAT2 = 240;
+var SLOTS_PER_BAR2 = SLOTS_PER_BEAT2 * 4;
+var PRESET_VERSION = 1;
+var PresetVersionError = class extends Error {
+};
+function migrate(raw) {
+  if (typeof raw !== "object" || raw === null) {
+    throw new PresetVersionError("Preset is not an object.");
+  }
+  const version = raw.version;
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
+    throw new PresetVersionError(`Preset has no usable version field (got ${String(version)}).`);
+  }
+  if (version > PRESET_VERSION) {
+    throw new PresetVersionError(
+      `Preset version ${version} is newer than this build understands (${PRESET_VERSION}). Refusing to guess at the missing fields.`
+    );
+  }
+  return raw;
+}
+function secondsPerSlot(bpm) {
+  return 60 / bpm / SLOTS_PER_BEAT2;
+}
+function envelopeBeats(env) {
+  return env.attackBeats + env.holdBeats + env.releaseBeats;
+}
+function anchorLeadBeats(anchor, env) {
+  switch (anchor) {
+    case "start":
+      return 0;
+    case "peak":
+      return env.attackBeats;
+    case "end":
+      return envelopeBeats(env);
+  }
+}
+
+// src/rng.ts
+function hashU32(x) {
+  let h = x | 0;
+  h = Math.imul(h ^ h >>> 16, 2146121005);
+  h = Math.imul(h ^ h >>> 15, 2221713035);
+  h = (h ^ h >>> 16) >>> 0;
+  return h;
+}
+function hash01(x) {
+  return hashU32(x) / 4294967296;
+}
+function hash2(a, b) {
+  return hash01(hashU32(a) ^ Math.imul(b | 0, 2654435769));
+}
+function hashString(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function forbidNondeterminism() {
+  const boom = (name) => () => {
+    throw new Error(
+      `${name}() is banned \u2014 aaavs must be deterministic (plan \xA74.7). Use rng.ts instead.`
+    );
+  };
+  Math.random = boom("Math.random");
+  Date.now = boom("Date.now");
+}
+
+// src/timeline.ts
+var DIVISION_SLOTS = {
+  "1/64": SLOTS_PER_BEAT2 / 16,
+  "1/32": SLOTS_PER_BEAT2 / 8,
+  "1/16": SLOTS_PER_BEAT2 / 4,
+  "1/8": SLOTS_PER_BEAT2 / 2,
+  "beat": SLOTS_PER_BEAT2,
+  "half": SLOTS_PER_BEAT2 * 2,
+  "bar": SLOTS_PER_BAR2,
+  "2bar": SLOTS_PER_BAR2 * 2,
+  "4bar": SLOTS_PER_BAR2 * 4,
+  "1/8T": SLOTS_PER_BEAT2 / 3,
+  "1/16T": SLOTS_PER_BEAT2 / 6,
+  "1/4quint": SLOTS_PER_BEAT2 / 5,
+  "1/8dot": SLOTS_PER_BEAT2 * 3 / 4
+};
+function assertIntegerStrides() {
+  for (const name of Object.keys(DIVISION_SLOTS)) {
+    const slots = DIVISION_SLOTS[name];
+    if (!Number.isInteger(slots) || slots <= 0) {
+      throw new Error(
+        `Division '${name}' is ${slots} slots, which is not a positive integer. The 240-slot grid (plan \xA73.1) exists to make every division exact; a fractional stride drifts silently over a track.`
+      );
+    }
+  }
+}
+assertIntegerStrides();
+var euclidCache = /* @__PURE__ */ new Map();
+function euclid(k, n) {
+  const steps = Math.max(0, Math.floor(n));
+  if (steps === 0) return [];
+  const onsets = Math.max(0, Math.min(steps, Math.floor(k)));
+  let byOnsets = euclidCache.get(steps);
+  if (byOnsets === void 0) {
+    byOnsets = /* @__PURE__ */ new Map();
+    euclidCache.set(steps, byOnsets);
+  }
+  const hit = byOnsets.get(onsets);
+  if (hit !== void 0) return hit;
+  const pattern = bjorklund(onsets, steps);
+  byOnsets.set(onsets, pattern);
+  return pattern;
+}
+function bjorklund(k, n) {
+  if (k === 0) return new Array(n).fill(false);
+  if (k === n) return new Array(n).fill(true);
+  let head = Array.from({ length: k }, () => [true]);
+  let tail = Array.from({ length: n - k }, () => [false]);
+  while (tail.length > 1 && head.length > 1) {
+    const pairs = Math.min(head.length, tail.length);
+    const merged = [];
+    for (let i = 0; i < pairs; i++) merged.push([...head[i], ...tail[i]]);
+    const remainder = head.length > pairs ? head.slice(pairs) : tail.slice(pairs);
+    head = merged;
+    tail = remainder;
+  }
+  const out = [];
+  for (const group of head) out.push(...group);
+  for (const group of tail) out.push(...group);
+  return out;
+}
+function euclidAllows(trigger, tick) {
+  const n = Math.max(0, Math.floor(trigger.euclidN));
+  if (n === 0) return false;
+  const pattern = euclid(trigger.euclidK, n);
+  const index = ((tick + Math.floor(trigger.offsetSteps)) % n + n) % n;
+  return pattern[index] === true;
+}
+var MAX_SWING = 2 / 3;
+function swingSlots(swing, stride, tick) {
+  if (swing <= 0) return 0;
+  if ((tick & 1) === 0) return 0;
+  return Math.min(swing, MAX_SWING) * stride * 0.5;
+}
+var StaticTimeline = class _StaticTimeline {
+  beats;
+  extra;
+  downbeatOffset;
+  horizonSec;
+  confidence = 1;
+  constructor(init) {
+    if (init.beatTimes.length < 2) {
+      throw new Error("StaticTimeline needs at least two beat times to have a tempo at all.");
+    }
+    for (let i = 1; i < init.beatTimes.length; i++) {
+      if (!(init.beatTimes[i] > init.beatTimes[i - 1])) {
+        throw new Error(
+          `StaticTimeline beat times must be strictly increasing; index ${i} is ${init.beatTimes[i]} after ${init.beatTimes[i - 1]}.`
+        );
+      }
+    }
+    this.beats = init.beatTimes;
+    this.extra = [...init.events ?? []].sort((a, b) => a.time - b.time);
+    this.downbeatOffset = Math.floor(init.downbeatOffset ?? 0);
+    this.horizonSec = init.durationSec ?? this.beats[this.beats.length - 1];
+  }
+  /** A constant-tempo grid. For click fixtures and the golden-image harness. */
+  static fromTempo(bpm, offsetSec, durationSec, init) {
+    if (!(bpm > 0)) throw new Error(`StaticTimeline.fromTempo needs a positive bpm, got ${bpm}.`);
+    const period = 60 / bpm;
+    const count = Math.max(2, Math.ceil((durationSec - offsetSec) / period) + 2);
+    const beatTimes = new Array(count);
+    for (let i = 0; i < count; i++) beatTimes[i] = offsetSec + i * period;
+    return new _StaticTimeline({ ...init, beatTimes, durationSec });
+  }
+  bpm(atSec) {
+    const i = this.beatIndexAt(atSec);
+    const a = this.beats[i];
+    const b = this.beats[i + 1];
+    return 60 / (b - a);
+  }
+  slotAt(atSec) {
+    const i = this.beatIndexAt(atSec);
+    const a = this.beats[i];
+    const b = this.beats[i + 1];
+    return (i + (atSec - a) / (b - a)) * SLOTS_PER_BEAT2;
+  }
+  eventsBetween(a, b) {
+    const out = [];
+    if (!(b > a)) return out;
+    const firstBeat = Math.max(0, Math.ceil(this.slotAt(a) / SLOTS_PER_BEAT2));
+    for (let i = firstBeat; i < this.beats.length; i++) {
+      const t = this.beats[i];
+      if (t < a) continue;
+      if (t >= b) break;
+      out.push(beatEvent(i - this.downbeatOffset, t, i * SLOTS_PER_BEAT2));
+    }
+    for (let i = this.extraIndexAt(a); i < this.extra.length; i++) {
+      const e = this.extra[i];
+      if (e.time >= b) break;
+      out.push(e);
+    }
+    out.sort((x, y) => x.time - y.time);
+    return out;
+  }
+  /** First index in `extra` with `time >= at`. `extra.length` if there is none. */
+  extraIndexAt(at) {
+    let lo = 0;
+    let hi = this.extra.length;
+    while (lo < hi) {
+      const mid = lo + hi >> 1;
+      if (this.extra[mid].time < at) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+  /** Index of the segment containing `atSec`, clamped so extrapolation is total. */
+  beatIndexAt(atSec) {
+    const last2 = this.beats.length - 2;
+    if (atSec <= this.beats[0]) return 0;
+    if (atSec >= this.beats[last2 + 1]) return last2;
+    let lo = 0;
+    let hi = last2;
+    while (lo < hi) {
+      const mid = lo + hi + 1 >> 1;
+      if (this.beats[mid] <= atSec) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
+  }
+};
+var TIER_B_HORIZON_BARS = 2;
+var TIER_B_UNLOCKED_KEEP_SEC = 8;
+var TierBTimeline = class {
+  constructor(tracker) {
+    this.tracker = tracker;
+  }
+  anchorTime = 0;
+  anchorSlot = 0;
+  secPerBeat = 0;
+  bias = 0;
+  maxSlot = Number.NEGATIVE_INFINITY;
+  onsets = [];
+  /**
+   * Sample the tracker for this frame. Call once per frame with the audio clock,
+   * before anything asks the timeline a question — every method below reads the
+   * snapshot taken here rather than the live tracker, so that all layers in one
+   * frame agree about "now" (the same reasoning as `AudioSnapshot`).
+   */
+  update(now) {
+    this.tracker.update(now);
+    if (!this.tracker.locked || !this.tracker.bpm) {
+      this.secPerBeat = 0;
+      this.pruneOnsets(now);
+      return;
+    }
+    this.secPerBeat = 60 / this.tracker.bpm;
+    this.anchorTime = now;
+    const raw = (this.tracker.beatIndex + this.tracker.phase) * SLOTS_PER_BEAT2;
+    const biased = raw + this.bias;
+    if (biased < this.maxSlot) this.bias += this.maxSlot - biased;
+    this.anchorSlot = raw + this.bias;
+    this.maxSlot = this.anchorSlot;
+    this.pruneOnsets(now);
+  }
+  /**
+   * Drop onsets older than the horizon; past that they are history, and history
+   * is what the spectrogram is for.
+   *
+   * In place, via one `splice`, rather than reassigning the result of a
+   * `filter`. Once the buffer is full the stale-front condition is true on
+   * roughly every frame, so `filter` there is a fresh array per frame in the
+   * per-frame path — exactly the GC pressure §4.9 goes out of its way to keep
+   * out of the audio path.
+   */
+  pruneOnsets(now) {
+    const keepFrom = now - (this.secPerBeat > 0 ? this.horizonSec : TIER_B_UNLOCKED_KEEP_SEC);
+    let drop = 0;
+    while (drop < this.onsets.length && this.onsets[drop].time < keepFrom) drop++;
+    if (drop > 0) this.onsets.splice(0, drop);
+  }
+  /**
+   * Record a detected onset so `eventsBetween` can report it.
+   *
+   * These are content-dependent and therefore unavoidably reactive on this tier
+   * (§4.3) — they are already in the past when they arrive, and the scheduler
+   * fires them immediately rather than pretending it saw them coming. Tier A
+   * gets the same events ahead of time and the consumer does not change.
+   */
+  addOnset(e) {
+    this.onsets.push(e);
+  }
+  /**
+   * Everything invalid across a seek or a track change (§4.10).
+   *
+   * Must be called on a backwards seek, and the tracker reset alongside it.
+   * Skipping it does not corrupt anything: the monotonicity bias absorbs
+   * whatever the tracker's position drops by, so the grid stalls at its
+   * high-water mark until real time catches back up rather than rewinding. On a
+   * long seek that stall is long, and every layer is silent for the duration.
+   * Stillness is a much better failure than a rewound grid, but it is still a
+   * failure, so reset on seek.
+   */
+  reset() {
+    this.anchorTime = 0;
+    this.anchorSlot = 0;
+    this.secPerBeat = 0;
+    this.bias = 0;
+    this.maxSlot = Number.NEGATIVE_INFINITY;
+    this.onsets.length = 0;
+  }
+  bpm(_atSec) {
+    return this.tracker.locked ? this.tracker.bpm : 0;
+  }
+  slotAt(atSec) {
+    if (this.secPerBeat <= 0) return 0;
+    return this.anchorSlot + (atSec - this.anchorTime) / this.secPerBeat * SLOTS_PER_BEAT2;
+  }
+  eventsBetween(a, b) {
+    const out = [];
+    if (this.secPerBeat <= 0 || !(b > a)) return out;
+    const secPerBeat = this.secPerBeat;
+    const firstBeat = Math.ceil(this.slotAt(a) / SLOTS_PER_BEAT2);
+    const lastBeat = Math.floor(this.slotAt(b) / SLOTS_PER_BEAT2);
+    for (let i = firstBeat; i <= lastBeat; i++) {
+      const slot2 = i * SLOTS_PER_BEAT2;
+      const t = this.anchorTime + (slot2 - this.anchorSlot) / SLOTS_PER_BEAT2 * secPerBeat;
+      if (t < a || t >= b) continue;
+      out.push({ ...beatEvent(i, t, slot2), confidence: this.confidence });
+    }
+    for (const e of this.onsets) {
+      if (e.time >= a && e.time < b) out.push(e);
+    }
+    out.sort((x, y) => x.time - y.time);
+    return out;
+  }
+  get horizonSec() {
+    if (this.secPerBeat <= 0) return 0;
+    return this.secPerBeat * (SLOTS_PER_BAR2 / SLOTS_PER_BEAT2) * TIER_B_HORIZON_BARS;
+  }
+  get confidence() {
+    return this.tracker.locked ? this.tracker.confidence : 0;
+  }
+};
+function beatEvent(beatIndex, time, slot2) {
+  const inBar = (beatIndex % 4 + 4) % 4;
+  return { time, slot: slot2, kind: inBar === 0 ? "downbeat" : "beat" };
+}
+var MAX_PER_POLL = 32;
+var MAX_CATCHUP_TICKS = 256;
+var Scheduler = class {
+  /**
+   * Real hardware/OS output latency. Read `ctx.outputLatency` EVERY frame and
+   * assign it here — it is 5–40 ms typically, much worse on Bluetooth, and it
+   * changes at runtime when the output device does (§4.6).
+   */
+  outputLatency = 0;
+  /** The persisted audio offset of §3.1's three. Video and input offsets are not this module's business. */
+  userAudioOffset = 0;
+  /** Last tick fired per request key. `undefined` means "not primed yet". */
+  lastTick = /* @__PURE__ */ new Map();
+  /**
+   * Flush all scheduled state (§4.10).
+   *
+   * Called on seek, on track change, and whenever the Timeline instance is
+   * swapped (Tier B -> Tier A). Not called on pause: pause stops polling, and
+   * resume must not replay the events it missed, which is exactly what the
+   * priming behaviour in `due()` gives us for free.
+   */
+  reset(key) {
+    if (key === void 0) this.lastTick.clear();
+    else this.lastTick.delete(key);
+  }
+  /**
+   * Events for `req` whose fire time has arrived at `now`.
+   *
+   * Contract, and each clause is there because breaking it is a real failure
+   * mode seen in this kind of code:
+   *
+   *  - Never returns the same tick twice, even if `now` goes backwards slightly
+   *    or the timeline re-anchors. State is a tick INDEX, not a time.
+   *  - Never skips a tick between two polls: the window is [lastTick+1, due],
+   *    not "whatever is closest to now", so a long frame emits the backlog
+   *    rather than dropping it.
+   *  - Survives a tempo change: ticks are grid positions and the grid is
+   *    continuous through a tempo change by construction (§4.10). Only the
+   *    seconds-per-slot conversion moves.
+   *  - After `reset()` the first poll fires NOTHING. It primes the tick cursor
+   *    at the current position, which is what makes a seek land cleanly instead
+   *    of dumping the whole gap into one frame.
+   */
+  due(timeline2, now, req) {
+    const out = [];
+    const bpm = timeline2.bpm(now);
+    if (!(bpm > 0)) return out;
+    const stride = DIVISION_SLOTS[req.trigger.division];
+    const secPerSlot = secondsPerSlot(bpm);
+    const lead = anchorLeadBeats(req.anchor, req.envelope) * (60 / bpm) + this.outputLatency + this.userAudioOffset;
+    const horizonSlot = timeline2.slotAt(now + lead);
+    const dueTick = Math.floor(horizonSlot / stride);
+    const primed = this.lastTick.get(req.key);
+    if (primed === void 0) {
+      this.lastTick.set(req.key, dueTick);
+      return out;
+    }
+    let cursor = primed;
+    if (dueTick - cursor > MAX_CATCHUP_TICKS) cursor = dueTick - 1;
+    const seed = req.seed ?? 0;
+    const keyHash = hashString(req.key) ^ seed;
+    const swing = req.swing ?? 0;
+    for (let tick = cursor + 1; tick <= dueTick; tick++) {
+      const slot2 = tick * stride + swingSlots(swing, stride, tick);
+      const time = solveTime(timeline2, slot2, now, secPerSlot);
+      const fireTime = time - lead;
+      if (fireTime > now) break;
+      this.lastTick.set(req.key, tick);
+      if (!euclidAllows(req.trigger, tick)) continue;
+      if (req.trigger.probability < 1 && hash2(keyHash, tick) >= req.trigger.probability) continue;
+      out.push({
+        key: req.key,
+        division: req.trigger.division,
+        anchor: req.anchor,
+        tick,
+        slot: slot2,
+        time,
+        fireTime,
+        lateBy: now - fireTime
+      });
+      if (out.length >= MAX_PER_POLL) break;
+    }
+    return out;
+  }
+  /**
+   * Content-dependent and structural events over the same poll window
+   * (§4.3) — onsets, sections, drops. Grid events are excluded because `due()`
+   * already produces those from the division, and emitting both would fire every
+   * beat twice.
+   *
+   * `from` is the previous poll's `now`; the window is half-open, matching
+   * `Timeline.eventsBetween`, so nothing is seen twice and nothing falls between
+   * two frames.
+   */
+  content(timeline2, from, now) {
+    if (!(now > from)) return [];
+    return timeline2.eventsBetween(from, now).filter((e) => e.kind !== "beat" && e.kind !== "downbeat" && e.kind !== "bar" && e.kind !== "division");
+  }
+};
+function solveTime(timeline2, slot2, near, secPerSlot) {
+  let t = near + (slot2 - timeline2.slotAt(near)) * secPerSlot;
+  for (let i = 0; i < 2; i++) {
+    const err2 = slot2 - timeline2.slotAt(t);
+    if (Math.abs(err2) < 1e-6) break;
+    const bpm = timeline2.bpm(t);
+    t += err2 * (bpm > 0 ? secondsPerSlot(bpm) : secPerSlot);
+  }
+  return t;
+}
+
+// src/worklet-host.ts
+var FEATURE_FLOATS = 16;
+var RING_FRAMES = 256;
+var HEADER_INTS = 4;
+var HEADER_BYTES = HEADER_INTS * 4;
+var CTL_WRITE_COUNT = 0;
+var F_TIME = 0;
+var F_FLUX = 1;
+var F_THRESH = 2;
+var F_LEVEL = 3;
+var F_CREST = 4;
+var F_PAN = 5;
+var F_WIDTH = 6;
+var F_CENTROID = 7;
+var F_FLATNESS = 8;
+var F_BAND_SUB = 9;
+var F_ONSET_STRENGTH = 14;
+var F_ONSET_CLASS = 15;
+var BAND_ORDER = ["sub", "low", "mid", "high", "air"];
+var CLASS_NAMES = [null, "kick", "snare", "hat", "tonal"];
+var DETECTOR_PROCESSOR = "aaavs-detector";
+var DETECTOR_MODULE_URL = "dist/detector.worklet.js";
+var WorkletDetectorError = class extends Error {
+};
+function ringAvailable() {
+  return typeof SharedArrayBuffer !== "undefined" && crossOriginIsolated;
+}
+var WorkletDetector = class {
+  node = null;
+  sink = null;
+  /**
+   * Kept solely so `detach()` can undo the tap. `node.disconnect()` severs
+   * OUTGOING edges only — the source's connection into the node survives it,
+   * and a processor with a live input keeps running (and keeps writing the
+   * ring) after the object that owns it has been thrown away. Attach/detach
+   * across a few track changes then leaves several detectors analysing at once.
+   */
+  source = null;
+  ctl = null;
+  frames = null;
+  readCount = 0;
+  /**
+   * Audio-clock time playback started, subtracted from everything reported.
+   * The worklet's `currentTime` is the raw context clock, which starts when the
+   * context does and not when the track does; `audio.ts` exposes its own
+   * `currentTime` the same way. Set this at `play()`, and again on seek.
+   */
+  timeOrigin = 0;
+  onOnset = null;
+  /** Latest decoded frame. Overwritten in place — do not retain it. */
+  features = {
+    time: 0,
+    flux: 0,
+    thresh: 0,
+    level: 0,
+    crest: 1,
+    pan: 0,
+    width: 0,
+    centroid: 0,
+    flatness: 0,
+    bands: { sub: 0, low: 0, mid: 0, high: 0, air: 0 },
+    onsetClass: null
+  };
+  /** Onset envelope, 0..1, decaying. The reactive counterpart to `Timeline`. */
+  beat = 0;
+  /**
+   * Frames the reader missed because it fell more than a ring behind. Should
+   * be 0. A non-zero value means the main thread stalled for ~0.68 s, which is
+   * worth seeing in the HUD rather than silently papering over.
+   */
+  dropped = 0;
+  get attached() {
+    return this.node !== null;
+  }
+  /**
+   * Load the module, create the node, and splice it into the graph.
+   *
+   * `source` is tapped, not intercepted — the node's own output is silent and
+   * goes to a zero-gain sink. That sink is not optional: a worklet whose output
+   * reaches no destination is not guaranteed to be pulled, and the processor
+   * then simply never runs while everything else looks correctly wired.
+   */
+  async attach(ctx, source3, moduleUrl = DETECTOR_MODULE_URL) {
+    if (this.node) this.detach();
+    let ring;
+    if (ringAvailable()) {
+      ring = new SharedArrayBuffer(HEADER_BYTES + RING_FRAMES * FEATURE_FLOATS * 4);
+    }
+    try {
+      await ctx.audioWorklet.addModule(moduleUrl);
+    } catch (e) {
+      throw new WorkletDetectorError(
+        `Could not load the detector worklet from "${moduleUrl}". It is a separate esbuild entry point; check that the build produced it. (${String(e)})`
+      );
+    }
+    const node = new AudioWorkletNode(ctx, DETECTOR_PROCESSOR, {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+      // Downmixing to stereo here rather than in the processor keeps the
+      // channel logic in one place, and the detector's pan/width need L and R
+      // separately (§3.1).
+      channelCount: 2,
+      channelCountMode: "explicit",
+      channelInterpretation: "speakers",
+      processorOptions: ring ? { ring } : {}
+    });
+    node.port.onmessage = (e) => {
+      const d = e.data;
+      if (!d || d.type !== "onset") return;
+      const strength = d.strength ?? 0;
+      this.beat = Math.max(this.beat, strength);
+      this.onOnset?.({
+        time: (d.time ?? 0) - this.timeOrigin,
+        strength,
+        klass: d.klass ?? "tonal",
+        pan: d.pan ?? 0
+      });
+    };
+    const sink = ctx.createGain();
+    sink.gain.value = 0;
+    source3.connect(node);
+    node.connect(sink);
+    sink.connect(ctx.destination);
+    this.node = node;
+    this.sink = sink;
+    this.source = source3;
+    if (ring) {
+      this.ctl = new Int32Array(ring, 0, HEADER_INTS);
+      this.frames = new Float32Array(ring, HEADER_BYTES, RING_FRAMES * FEATURE_FLOATS);
+    }
+    this.readCount = this.ctl ? Atomics.load(this.ctl, CTL_WRITE_COUNT) : 0;
+  }
+  /**
+   * Drain the ring and advance the onset envelope. Call once per frame, with
+   * the frame's `dt`, before anything reads `features`.
+   *
+   * Returns how many feature frames were consumed — at 120 fps and 48 kHz that
+   * is about 3, and a sustained 0 means the audio thread is not running.
+   */
+  poll(dt) {
+    this.beat *= Math.exp(-dt * 7);
+    if (this.beat < 1e-4) this.beat = 0;
+    const ctl = this.ctl, frames2 = this.frames;
+    if (!ctl || !frames2) return 0;
+    const write = Atomics.load(ctl, CTL_WRITE_COUNT);
+    let count = write - this.readCount;
+    if (count <= 0) return 0;
+    if (count > RING_FRAMES) {
+      this.dropped += count - RING_FRAMES;
+      this.readCount = write - RING_FRAMES;
+      count = RING_FRAMES;
+    }
+    for (let i = 0; i < count; i++) {
+      const base3 = (this.readCount + i) % RING_FRAMES * FEATURE_FLOATS;
+      const s = frames2[base3 + F_ONSET_STRENGTH];
+      if (s > this.beat) this.beat = s;
+    }
+    this.readCount = write;
+    const base2 = (write - 1) % RING_FRAMES * FEATURE_FLOATS;
+    const f = this.features;
+    f.time = frames2[base2 + F_TIME] - this.timeOrigin;
+    f.flux = frames2[base2 + F_FLUX];
+    f.thresh = frames2[base2 + F_THRESH];
+    f.level = frames2[base2 + F_LEVEL];
+    f.crest = frames2[base2 + F_CREST];
+    f.pan = frames2[base2 + F_PAN];
+    f.width = frames2[base2 + F_WIDTH];
+    f.centroid = frames2[base2 + F_CENTROID];
+    f.flatness = frames2[base2 + F_FLATNESS];
+    for (let b = 0; b < BAND_ORDER.length; b++) {
+      f.bands[BAND_ORDER[b]] = frames2[base2 + F_BAND_SUB + b];
+    }
+    f.onsetClass = CLASS_NAMES[frames2[base2 + F_ONSET_CLASS] | 0] ?? null;
+    return count;
+  }
+  /**
+   * Clear every running statistic in the detector. Required on seek and on
+   * track change (§4.10): a whitening curve and a flux mean carried over from a
+   * passage we jumped away from either floods the next bar with false onsets or
+   * suppresses it entirely.
+   */
+  reset() {
+    this.beat = 0;
+    this.dropped = 0;
+    this.node?.port.postMessage({ type: "reset" });
+    if (this.ctl) this.readCount = Atomics.load(this.ctl, CTL_WRITE_COUNT);
+  }
+  detach() {
+    if (this.node) {
+      this.node.port.onmessage = null;
+      try {
+        this.source?.disconnect(this.node);
+      } catch {
+      }
+      this.node.disconnect();
+      this.node = null;
+    }
+    this.source = null;
+    if (this.sink) {
+      this.sink.disconnect();
+      this.sink = null;
+    }
+    this.ctl = null;
+    this.frames = null;
+    this.readCount = 0;
+    this.beat = 0;
+    this.dropped = 0;
+  }
+};
+
+// src/audiogpu.ts
+var AUDIO_GROUP = 1;
+var SCALAR_FLOATS = 20;
+var S_TIME = 0;
+var S_LEVEL = 1;
+var S_BEAT = 2;
+var S_PAN = 3;
+var S_WIDTH = 4;
+var S_CREST = 5;
+var S_CENTROID = 6;
+var S_FLATNESS = 7;
+var S_BANDS = 8;
+var S_AIR = 12;
+var S_SPEC_ROW = 13;
+var S_SPEC_N = 14;
+var S_WAVE_N = 15;
+var S_SPEC_ROWS = 16;
+var ROW_CATCHUP_LIMIT = 8;
+var AudioGpu = class {
+  layout;
+  bindGroup;
+  scalarBuf;
+  waveBuf;
+  specBuf;
+  panBuf;
+  spectrogramBuf;
+  peakBuf;
+  /** Staging for the uniform. Reused; allocating 80 bytes per frame is litter. */
+  scalars = new Float32Array(SCALAR_FLOATS);
+  /** Write head we last mirrored. -1 means "nothing uploaded yet". */
+  lastRow = -1;
+  constructor(device2) {
+    const storage = (label, floats) => device2.createBuffer({
+      label,
+      size: floats * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+    });
+    this.scalarBuf = device2.createBuffer({
+      label: "audio:scalars",
+      size: SCALAR_FLOATS * 4,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    this.waveBuf = storage("audio:waveform", WAVE_N * 2);
+    this.specBuf = storage("audio:spectrum", SPEC_N * 2);
+    this.panBuf = storage("audio:bandPan", SPEC_N);
+    this.spectrogramBuf = storage("audio:spectrogram", SPEC_N * SPECTROGRAM_ROWS);
+    this.peakBuf = storage("audio:peaks", SPEC_N);
+    const vis = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE;
+    const ro = { type: "read-only-storage" };
+    this.layout = device2.createBindGroupLayout({
+      label: "audio",
+      entries: [
+        { binding: 0, visibility: vis, buffer: { type: "uniform" } },
+        { binding: 1, visibility: vis, buffer: ro },
+        { binding: 2, visibility: vis, buffer: ro },
+        { binding: 3, visibility: vis, buffer: ro },
+        { binding: 4, visibility: vis, buffer: ro },
+        { binding: 5, visibility: vis, buffer: ro }
+      ]
+    });
+    this.bindGroup = device2.createBindGroup({
+      label: "audio",
+      layout: this.layout,
+      entries: [
+        { binding: 0, resource: { buffer: this.scalarBuf } },
+        { binding: 1, resource: { buffer: this.waveBuf } },
+        { binding: 2, resource: { buffer: this.specBuf } },
+        { binding: 3, resource: { buffer: this.panBuf } },
+        { binding: 4, resource: { buffer: this.spectrogramBuf } },
+        { binding: 5, resource: { buffer: this.peakBuf } }
+      ]
+    });
+  }
+  /**
+   * Mirror one frame of analysis. Call once, before any pass that reads audio.
+   *
+   * `audio`'s typed arrays are live references into the engine (see
+   * `AudioSnapshot`), which is exactly what makes `writeBuffer` the right call
+   * here: it copies into the queue's own staging immediately, so nothing
+   * retains a view that the next `AudioEngine.update` will overwrite.
+   */
+  upload(audio2, queue) {
+    const s = this.scalars;
+    s[S_TIME] = audio2.time;
+    s[S_LEVEL] = audio2.level;
+    s[S_BEAT] = audio2.beat;
+    s[S_PAN] = audio2.pan;
+    s[S_WIDTH] = audio2.width;
+    s[S_CREST] = audio2.crest;
+    s[S_CENTROID] = audio2.centroid;
+    s[S_FLATNESS] = audio2.flatness;
+    s[S_BANDS + 0] = audio2.bands.sub;
+    s[S_BANDS + 1] = audio2.bands.low;
+    s[S_BANDS + 2] = audio2.bands.mid;
+    s[S_BANDS + 3] = audio2.bands.high;
+    s[S_AIR] = audio2.bands.air;
+    s[S_SPEC_ROW] = audio2.spectrogramRow;
+    s[S_SPEC_N] = SPEC_N;
+    s[S_WAVE_N] = WAVE_N;
+    s[S_SPEC_ROWS] = SPECTROGRAM_ROWS;
+    queue.writeBuffer(this.scalarBuf, 0, s);
+    queue.writeBuffer(this.waveBuf, 0, src(audio2.waveform));
+    queue.writeBuffer(this.specBuf, 0, src(audio2.spectrum));
+    queue.writeBuffer(this.panBuf, 0, src(audio2.bandPan));
+    queue.writeBuffer(this.peakBuf, 0, src(audio2.peaks));
+    this.uploadSpectrogram(audio2, queue);
+  }
+  /**
+   * The spectrogram is 256 KB and gains ONE row per analysis frame. Re-sending
+   * it whole would be ~30 MB/s of pointless PCIe traffic at 120 fps, and it is
+   * the single largest thing this module touches, so it gets the only real
+   * incremental path here.
+   */
+  uploadSpectrogram(audio2, queue) {
+    const head = audio2.spectrogramRow;
+    const advanced = this.lastRow < 0 ? SPECTROGRAM_ROWS : (head - this.lastRow + SPECTROGRAM_ROWS) % SPECTROGRAM_ROWS;
+    this.lastRow = head;
+    if (advanced === 0) return;
+    if (advanced > ROW_CATCHUP_LIMIT || head - advanced <= 0) {
+      queue.writeBuffer(this.spectrogramBuf, 0, src(audio2.spectrogram));
+      return;
+    }
+    for (let i = 0; i < advanced; i++) {
+      const row = (head - 1 - i + SPECTROGRAM_ROWS) % SPECTROGRAM_ROWS;
+      queue.writeBuffer(
+        this.spectrogramBuf,
+        row * SPEC_N * 4,
+        src(audio2.spectrogram),
+        row * SPEC_N,
+        SPEC_N
+      );
+    }
+  }
+  destroy() {
+    for (const b of [
+      this.scalarBuf,
+      this.waveBuf,
+      this.specBuf,
+      this.panBuf,
+      this.spectrogramBuf,
+      this.peakBuf
+    ]) b.destroy();
+  }
+};
+function src(a) {
+  return a;
+}
+var AUDIO_WGSL = (
+  /* wgsl */
+  `
+// ---- audio (generated by audiogpu.ts \u2014 keep in sync) ----------------------
+//
+// std140-ish uniform layout, explicit about every byte. WGSL's uniform address
+// space rounds a struct's alignment up to 16, so the CPU-side Float32Array must
+// agree about the tail padding or the last real field lands in the wrong slot.
+//
+//   0  time      4  level     8  beat      12 pan
+//   16 width     20 crest     24 centroid  28 flatness
+//   32 bands     (vec4: align 16 \u2014 32 is the first legal offset for it)
+//   48 air       52 specRow   56 specN     60 waveN
+//   64 specRows  68 _pad0     72 _pad1     76 _pad2   -> size 80
+//
+// The pads at 68..79 exist solely to round the struct size to a multiple of 16.
+// There is deliberately NO vec3 anywhere in here: vec3 aligns to 16 but is only
+// 12 bytes wide, so it drags four bytes of INVISIBLE padding after it that the
+// TypeScript side has to know about and cannot see. Five bands are therefore a
+// vec4 plus a loose f32, not a vec4 plus a vec3 \u2014 uglier, and never wrong.
+struct AudioScalars {
+  time     : f32,
+  level    : f32,
+  beat     : f32,
+  pan      : f32,
+  width    : f32,
+  crest    : f32,
+  centroid : f32,
+  flatness : f32,
+  bands    : vec4<f32>,   // sub, low, mid, high
+  air      : f32,
+  specRow  : f32,         // ring row that will be written NEXT
+  specN    : f32,
+  waveN    : f32,
+  specRows : f32,
+  _pad0    : f32,
+  _pad1    : f32,
+  _pad2    : f32,
+};
+
+@group(${AUDIO_GROUP}) @binding(0) var<uniform> A : AudioScalars;
+@group(${AUDIO_GROUP}) @binding(1) var<storage, read> audioWave : array<f32>;        // interleaved L,R
+@group(${AUDIO_GROUP}) @binding(2) var<storage, read> audioSpec : array<f32>;        // interleaved L,R
+@group(${AUDIO_GROUP}) @binding(3) var<storage, read> audioPan  : array<f32>;        // per bin, -1..1
+@group(${AUDIO_GROUP}) @binding(4) var<storage, read> audioGram : array<f32>;        // ring, row-major
+@group(${AUDIO_GROUP}) @binding(5) var<storage, read> audioPeak : array<f32>;        // per bin, peak-hold
+
+/** Bin index and lerp weight for a normalised position across n items. */
+fn audioIndex(x: f32, n: f32) -> vec3<f32> {
+  let p = clamp(x, 0.0, 1.0) * (n - 1.0);
+  let i0 = floor(p);
+  return vec3<f32>(i0, min(i0 + 1.0, n - 1.0), p - i0);
+}
+
+/** Stereo magnitude at normalised frequency f. */
+fn fftStereoAt(f: f32) -> vec2<f32> {
+  let ix = audioIndex(f, A.specN);
+  let a = u32(ix.x) * 2u;
+  let b = u32(ix.y) * 2u;
+  let l = mix(audioSpec[a],      audioSpec[b],      ix.z);
+  let r = mix(audioSpec[a + 1u], audioSpec[b + 1u], ix.z);
+  return vec2<f32>(l, r);
+}
+
+/**
+ * Mono magnitude 0..1 at normalised frequency f.
+ * Interpolated, not nearest: a spectrum read per-pixel at nearest-bin gives 256
+ * visible vertical steps across a 2K frame, which reads as a bar chart however
+ * pretty the colouring is (art direction \xA73.2).
+ */
+fn fftAt(f: f32) -> f32 {
+  let s = fftStereoAt(f);
+  return (s.x + s.y) * 0.5;
+}
+
+/** Peak-hold magnitude at normalised frequency f. */
+fn peakAt(f: f32) -> f32 {
+  let ix = audioIndex(f, A.specN);
+  return mix(audioPeak[u32(ix.x)], audioPeak[u32(ix.y)], ix.z);
+}
+
+/** Pan of the content at normalised frequency f, -1..1. Places an effect at the screen-x of its own frequency. */
+fn panAt(f: f32) -> f32 {
+  let ix = audioIndex(f, A.specN);
+  return mix(audioPan[u32(ix.x)], audioPan[u32(ix.y)], ix.z);
+}
+
+/** L,R sample at normalised position t through the waveform window. Lissajous wants both. */
+fn waveAt(t: f32) -> vec2<f32> {
+  let ix = audioIndex(t, A.waveN);
+  let a = u32(ix.x) * 2u;
+  let b = u32(ix.y) * 2u;
+  return vec2<f32>(
+    mix(audioWave[a],      audioWave[b],      ix.z),
+    mix(audioWave[a + 1u], audioWave[b + 1u], ix.z),
+  );
+}
+
+/**
+ * Spectrogram history. uv.x is normalised frequency; uv.y is AGE \u2014 0 is now,
+ * 1 is the oldest row still held.
+ *
+ * The ring offset is the entire point of this function. Sampling the buffer
+ * directly makes the history JUMP once per full lap, because row 0 of the
+ * buffer is not the oldest row, it is wherever the writer happened to be. Every
+ * spectrogram that scrolls with a seam has skipped this. Rows are addressed
+ * relative to the write head and wrapped, so the image scrolls smoothly and
+ * forever.
+ */
+fn spectrogramAt(uv: vec2<f32>) -> f32 {
+  let rows = A.specRows;
+  // specRow is the NEXT row to be written, so the newest data is one behind it.
+  let newest = A.specRow - 1.0;
+  let age = clamp(uv.y, 0.0, 1.0) * (rows - 1.0);
+  var r = newest - age;
+  // Positive modulo. r is routinely negative here (newest is often near row 0),
+  // and WGSL's % keeps the sign of the dividend, which would index backwards.
+  r = r - floor(r / rows) * rows;
+
+  let r0 = floor(r);
+  var r1 = r0 + 1.0;
+  if (r1 >= rows) { r1 = r1 - rows; }
+  let rt = r - r0;
+
+  let ix = audioIndex(uv.x, A.specN);
+  let n = u32(A.specN);
+  let base0 = u32(r0) * n;
+  let base1 = u32(r1) * n;
+  let c0 = u32(ix.x);
+  let c1 = u32(ix.y);
+
+  let a = mix(audioGram[base0 + c0], audioGram[base0 + c1], ix.z);
+  let b = mix(audioGram[base1 + c0], audioGram[base1 + c1], ix.z);
+  return mix(a, b, rt);
+}
+
+/** Band energy by index 0..4 (sub, low, mid, high, air). */
+fn bandAt(i: u32) -> f32 {
+  if (i >= 4u) { return A.air; }
+  return A.bands[i];
+}
+// ---- end audio ------------------------------------------------------------
+`
+);
+
+// src/blend.ts
+var SRC_ONLY = { operation: "add", srcFactor: "one", dstFactor: "zero" };
+var ONE_ONE = { operation: "add", srcFactor: "one", dstFactor: "one" };
+var KEEP_DST = { operation: "add", srcFactor: "zero", dstFactor: "one" };
+var CONSTANT_MIX = {
+  operation: "add",
+  srcFactor: "constant",
+  dstFactor: "one-minus-constant"
+};
+function minMax(operation) {
+  return { operation, srcFactor: "one", dstFactor: "one" };
+}
+var BLEND_ORDER = [
+  "replace",
+  "add",
+  "max",
+  "min",
+  "50/50",
+  "subtract",
+  "multiply",
+  "xor",
+  "adjustable",
+  "alpha"
+];
+var BLEND_INFO = {
+  replace: {
+    mode: "replace",
+    label: "Replace",
+    description: "Overwrites everything underneath.",
+    implementation: "fixed",
+    state: { color: SRC_ONLY, alpha: SRC_ONLY },
+    needsShader: false,
+    readsDestination: false,
+    wgslFn: "blendReplace",
+    id: 0,
+    wgslIsPerceptual: false,
+    // Scaling the source towards black is not a fade-out here, it is a fade to
+    // BLACK — the destination has already been discarded. In practice a layer
+    // never reaches a pass at progress 0 (`layers.ts` drops it), so this is a
+    // statement about the mode rather than a bug waiting to happen.
+    opacityByScale: false,
+    note: "Source only. The destination is discarded."
+  },
+  add: {
+    mode: "add",
+    label: "Add",
+    description: "Accumulates light. The default for anything glowing.",
+    implementation: "fixed",
+    state: { color: ONE_ONE, alpha: ONE_ONE },
+    needsShader: false,
+    readsDestination: false,
+    wgslFn: "blendAdd",
+    id: 1,
+    wgslIsPerceptual: false,
+    opacityByScale: true,
+    note: "S + D. On rgba16float this genuinely accumulates instead of clipping at 1.0, which is the whole reason for the float targets (\xA73.2)."
+  },
+  max: {
+    mode: "max",
+    label: "Lighten",
+    description: "Keeps whichever side is brighter. Adds without blowing out.",
+    implementation: "fixed",
+    state: { color: minMax("max"), alpha: minMax("max") },
+    needsShader: false,
+    readsDestination: false,
+    wgslFn: "blendMax",
+    id: 2,
+    wgslIsPerceptual: false,
+    // max(D, S*o) -> max(D, 0) = D for non-negative D, which every target is
+    // unless a `subtract` layer ran first.
+    opacityByScale: true,
+    note: "max(S, D). A real GPUBlendOperation, not something to emulate. Blend factors are ignored for min/max."
+  },
+  min: {
+    mode: "min",
+    label: "Darken",
+    description: "Keeps whichever side is darker. Cuts holes in what is underneath.",
+    implementation: "fixed",
+    state: { color: minMax("min"), alpha: minMax("min") },
+    needsShader: false,
+    readsDestination: false,
+    wgslFn: "blendMin",
+    id: 3,
+    wgslIsPerceptual: false,
+    opacityByScale: false,
+    note: "min(S, D). A real GPUBlendOperation. Blend factors are ignored for min/max."
+  },
+  "50/50": {
+    mode: "50/50",
+    label: "50/50",
+    description: "Equal parts layer and frame.",
+    implementation: "constant",
+    state: { color: CONSTANT_MIX, alpha: CONSTANT_MIX },
+    needsShader: false,
+    readsDestination: false,
+    wgslFn: "blendMixPerceptual",
+    id: 4,
+    wgslIsPerceptual: true,
+    opacityByScale: false,
+    note: "c*S + (1-c)*D with c = 0.5. Requires setBlendConstant({r:.5,g:.5,b:.5,a:.5}); the default constant is zero and would render the layer invisible. The fixed path mixes in linear light, the WGSL through OKLab."
+  },
+  subtract: {
+    mode: "subtract",
+    label: "Subtract",
+    description: "Darkens the frame by the layer.",
+    implementation: "fixed",
+    state: {
+      color: { operation: "reverse-subtract", srcFactor: "one", dstFactor: "one" },
+      alpha: KEEP_DST
+    },
+    needsShader: false,
+    readsDestination: false,
+    wgslFn: "blendSubtract",
+    id: 5,
+    wgslIsPerceptual: false,
+    opacityByScale: true,
+    note: "D - S: the source darkens what is underneath (AVS semantics). `reverse-subtract`, NOT `subtract`, which is S - D and reads as an inverted layer. Alpha is left alone."
+  },
+  multiply: {
+    mode: "multiply",
+    label: "Multiply",
+    description: "Uses the layer as a mask on the frame.",
+    implementation: "fixed",
+    state: {
+      color: { operation: "add", srcFactor: "dst", dstFactor: "zero" },
+      // `dst-alpha` rather than `dst` purely to be unambiguous about which
+      // channel is meant in the alpha component. The value is identical.
+      alpha: { operation: "add", srcFactor: "dst-alpha", dstFactor: "zero" }
+    },
+    needsShader: false,
+    readsDestination: false,
+    wgslFn: "blendMultiply",
+    id: 6,
+    wgslIsPerceptual: false,
+    opacityByScale: false,
+    note: "S * D, via the destination as the SOURCE factor. This is the mode that most looks like it needs a destination read and does not: a dst FACTOR is free, a dst READ costs a target."
+  },
+  xor: {
+    mode: "xor",
+    label: "XOR",
+    description: "Bitwise interference between layer and frame.",
+    implementation: "shader",
+    needsShader: true,
+    readsDestination: true,
+    wgslFn: "blendXor",
+    id: 7,
+    wgslIsPerceptual: false,
+    // The composite crossfades against the destination, so opacity is correct
+    // for free — but not by SCALING the source, which is what this flag asks.
+    opacityByScale: false,
+    note: "The one mode fixed-function blending cannot express. WebGPU has no logic-op blending \u2014 there is no equivalent of GL glLogicOp or D3D LogicOp in the API surface and no GPUBlendOperation performs a bitwise operation. Even if there were, every target is rgba16float (\xA73.2) and a bitwise XOR of two floats is not a defined image operation. It needs a shader that quantises both sides, XORs, and converts back \u2014 which means reading the destination, which forces a scratch target, because a render pass may not sample its own attachment."
+  },
+  adjustable: {
+    mode: "adjustable",
+    label: "Adjustable",
+    description: "Crossfade with the amount exposed as a parameter.",
+    implementation: "constant",
+    state: { color: CONSTANT_MIX, alpha: CONSTANT_MIX },
+    needsShader: false,
+    readsDestination: false,
+    wgslFn: "blendMixPerceptual",
+    id: 8,
+    wgslIsPerceptual: true,
+    opacityByScale: false,
+    note: "The same equation as 50/50 with the mix exposed. Not a separate blend equation. setBlendConstant is an ENCODER command, so two adjustable layers with different amounts can still share one render pass \u2014 call it between the draws."
+  },
+  alpha: {
+    mode: "alpha",
+    label: "Alpha",
+    description: "Normal source-over compositing.",
+    implementation: "fixed",
+    state: {
+      color: { operation: "add", srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" },
+      alpha: { operation: "add", srcFactor: "one", dstFactor: "one-minus-src-alpha" }
+    },
+    needsShader: false,
+    readsDestination: false,
+    wgslFn: "blendAlpha",
+    id: 9,
+    wgslIsPerceptual: false,
+    // Scaling a straight-alpha source by opacity scales its colour but not its
+    // alpha, which darkens the layer rather than fading it. Correct fading here
+    // means scaling `a` too — which is what a pass that multiplies its whole
+    // vec4 by C.opacity does, so this holds as long as passes follow the
+    // PASS_COMMON_WGSL contract literally.
+    opacityByScale: true,
+    note: "Straight (non-premultiplied) source-over. Alpha uses `one` so compositing two partly transparent layers accumulates coverage correctly instead of saturating."
+  }
+};
+var OPACITY_NEEDS_CROSSFADE = BLEND_ORDER.filter((m) => !BLEND_INFO[m].opacityByScale);
+
+// src/layers.ts
+var BLEND_PLANS = BLEND_INFO;
+function blendConstantFor(spec) {
+  if (spec.blend === "50/50") return 0.5;
+  if (spec.blend === "adjustable") {
+    const raw = spec.params["mix"];
+    return typeof raw === "number" ? clamp01(raw) : 0.5;
+  }
+  return null;
+}
+function euclid2(k, n) {
+  if (n <= 0) return [];
+  if (k <= 0) return new Array(n).fill(false);
+  if (k >= n) return new Array(n).fill(true);
+  let head = [];
+  let tail = [];
+  for (let i = 0; i < k; i++) head.push([true]);
+  for (let i = 0; i < n - k; i++) tail.push([false]);
+  while (tail.length > 1) {
+    const pairs = Math.min(head.length, tail.length);
+    const merged = [];
+    for (let i = 0; i < pairs; i++) merged.push([...head[i], ...tail[i]]);
+    const rest = head.length > pairs ? head.slice(pairs) : tail.slice(pairs);
+    head = merged;
+    tail = rest;
+  }
+  const out = [];
+  for (const group of head) out.push(...group);
+  for (const group of tail) out.push(...group);
+  return out;
+}
+var ENV_CURVE = 5;
+function attackCurve(u) {
+  return (1 - Math.exp(-ENV_CURVE * u)) / (1 - Math.exp(-ENV_CURVE));
+}
+function releaseCurve(u) {
+  return (Math.exp(-ENV_CURVE * u) - Math.exp(-ENV_CURVE)) / (1 - Math.exp(-ENV_CURVE));
+}
+function evalEnvelope(env, sinceBeats) {
+  if (sinceBeats < 0) return 0;
+  const a = Math.max(0, env.attackBeats);
+  const h = Math.max(0, env.holdBeats);
+  const r = Math.max(0, env.releaseBeats);
+  if (sinceBeats < a) return attackCurve(sinceBeats / a);
+  if (sinceBeats < a + h) return 1;
+  if (r <= 0) return 0;
+  const u = (sinceBeats - a - h) / r;
+  return u >= 1 ? 0 : releaseCurve(u);
+}
+function layerSeed(presetSeed, id) {
+  return hashU32(presetSeed ^ hashString(id));
+}
+var Layer = class {
+  spec;
+  /** Seeded from the preset and the layer ID. Every hashed decision this layer makes uses it. */
+  seed;
+  /** Slots between pulses for this layer's division. Cached; it is a table lookup, but it is read every frame. */
+  strideSlots;
+  pattern;
+  /** Beat position of the last trigger. `-Infinity` means "never fired", which evaluates to an envelope of 0. */
+  triggeredAtBeats = -Infinity;
+  /** Last pulse index examined, so a pulse cannot fire twice. Pulses CAN be skipped, but only via the explicit catch-up clamp in `update`. */
+  lastPulse = -Infinity;
+  /** Runtime overrides. Not serialised — solo/mute are a mixing-desk gesture, not part of the preset. */
+  muted = false;
+  constructor(spec, presetSeed) {
+    this.spec = spec;
+    this.seed = layerSeed(presetSeed, spec.id);
+    this.strideSlots = DIVISIONS[spec.trigger.division];
+    this.pattern = euclid2(spec.trigger.euclidK, spec.trigger.euclidN);
+  }
+  get id() {
+    return this.spec.id;
+  }
+  get family() {
+    return this.spec.family;
+  }
+  get blend() {
+    return this.spec.blend;
+  }
+  get anchor() {
+    return this.spec.anchor;
+  }
+  /** How far ahead of the musical event this layer must fire so its payload lands on it (§4.3). */
+  get leadBeats() {
+    return anchorLeadBeats(this.spec.anchor, this.spec.envelope);
+  }
+  /**
+   * Advance to `nowBeats` and fire any pulses that have come due.
+   *
+   * The lead is applied by looking AHEAD rather than by firing late and
+   * back-dating: the trigger time recorded is the pulse's own beat position
+   * minus the lead, so the envelope's phase is exact rather than quantised to
+   * whenever this happened to be called. Two machines running at different
+   * frame rates therefore agree on the envelope value, which is the whole of
+   * §4.7 in one detail.
+   *
+   * Returns the number of pulses that fired this call — usually 0 or 1, more
+   * only after a stall or on a very fast division.
+   */
+  update(nowBeats) {
+    const lookBeats = nowBeats + this.leadBeats;
+    const pulseBeats = this.strideSlots / SLOTS_PER_BEAT2;
+    const pulse2 = Math.floor(lookBeats / pulseBeats);
+    if (!Number.isFinite(pulse2)) return 0;
+    if (!Number.isFinite(this.lastPulse)) {
+      this.lastPulse = pulse2 - 1;
+    }
+    let fired = 0;
+    const from = Math.max(this.lastPulse + 1, pulse2 - 64);
+    for (let p = from; p <= pulse2; p++) {
+      this.lastPulse = p;
+      if (!this.gate(p)) continue;
+      this.triggeredAtBeats = p * pulseBeats - this.leadBeats;
+      fired++;
+    }
+    return fired;
+  }
+  /** Does pulse `p` survive the Euclidean pattern and the probability roll? */
+  gate(p) {
+    const t = this.spec.trigger;
+    if (this.pattern.length > 0) {
+      const n = this.pattern.length;
+      const step = ((p + t.offsetSteps) % n + n) % n;
+      if (!this.pattern[step]) return false;
+    }
+    if (t.probability >= 1) return true;
+    if (t.probability <= 0) return false;
+    return hash2(this.seed, p) < t.probability;
+  }
+  /** Envelope value 0..1 at `nowBeats`. Zero before the first trigger and after the release completes. */
+  progress(nowBeats) {
+    return evalEnvelope(this.spec.envelope, nowBeats - this.triggeredAtBeats);
+  }
+  /**
+   * The half of "is this layer live" that costs nothing to ask: the flags, with
+   * no envelope evaluation. Split out because `resolve` needs the envelope value
+   * anyway, and asking `isLive` first would evaluate it twice per layer per
+   * frame — two `Math.exp` pairs times 40 layers times 120 fps, for an answer it
+   * is about to compute again. Splitting rather than inlining keeps the two
+   * callers from drifting apart about what "live" means.
+   */
+  get gateOpen() {
+    return this.spec.enabled && !this.muted && this.spec.opacity > 0;
+  }
+  /** Whether this layer contributes anything at all right now. */
+  isLive(nowBeats) {
+    return this.gateOpen && this.progress(nowBeats) > 0;
+  }
+  /**
+   * Forget the trigger history. Called on seek and track change (§4.10) — a
+   * layer that is mid-release from a passage we jumped away from is visually
+   * wrong, and its `lastPulse` is on the wrong side of the new position, which
+   * would suppress every trigger until the clock caught up.
+   */
+  reset() {
+    this.triggeredAtBeats = -Infinity;
+    this.lastPulse = -Infinity;
+  }
+};
+function planStack(resolved) {
+  const passes = [];
+  const feedbackSlots = [];
+  let scratch = 0;
+  let run = null;
+  const flush = () => {
+    if (!run) return;
+    passes.push({
+      label: `${run.kind}:${run.ids.join("+")}`,
+      kind: run.kind,
+      layerIds: run.ids.slice(),
+      swapsAccumulator: run.kind === "transform",
+      usesScratch: false,
+      resolutionScale: run.scale
+    });
+    run = null;
+  };
+  const append = (kind, id, scale) => {
+    if (run && (run.kind !== kind || run.scale !== scale)) flush();
+    if (!run) run = { kind, ids: [], scale };
+    run.ids.push(id);
+  };
+  for (const r of resolved) {
+    const { spec } = r.layer;
+    const blend = BLEND_PLANS[spec.blend];
+    const scale = spec.resolutionScale;
+    if (spec.family === "feedback") {
+      flush();
+      feedbackSlots.push(spec.id);
+      passes.push({
+        label: `feedback:${spec.id}`,
+        kind: "feedback",
+        layerIds: [spec.id],
+        swapsAccumulator: false,
+        usesScratch: false,
+        feedbackSlot: spec.id,
+        resolutionScale: scale
+      });
+      if (blend.readsDestination) {
+        passes.push({
+          label: `composite:${spec.id}`,
+          kind: "composite",
+          layerIds: [spec.id],
+          swapsAccumulator: true,
+          usesScratch: false,
+          feedbackSlot: spec.id,
+          resolutionScale: scale
+        });
+      } else {
+        append("draw", spec.id, scale);
+      }
+      continue;
+    }
+    if (blend.readsDestination) {
+      flush();
+      scratch = 1;
+      const kind = spec.family === "source" ? "draw" : "transform";
+      passes.push({
+        label: `${kind}:${spec.id}->scratch`,
+        kind,
+        layerIds: [spec.id],
+        swapsAccumulator: false,
+        usesScratch: true,
+        resolutionScale: scale
+      });
+      passes.push({
+        label: `composite:${spec.id}`,
+        kind: "composite",
+        layerIds: [spec.id],
+        swapsAccumulator: true,
+        usesScratch: true,
+        resolutionScale: scale
+      });
+      continue;
+    }
+    switch (spec.family) {
+      case "source":
+        append("draw", spec.id, scale);
+        break;
+      case "color":
+        append("transform", spec.id, scale);
+        break;
+      case "warp":
+      case "operator":
+        flush();
+        passes.push({
+          label: `${spec.family}:${spec.id}`,
+          kind: "transform",
+          layerIds: [spec.id],
+          swapsAccumulator: true,
+          usesScratch: false,
+          resolutionScale: scale
+        });
+        break;
+    }
+  }
+  flush();
+  return {
+    passes,
+    feedbackSlots,
+    scratchTargets: scratch,
+    passCount: passes.length,
+    targetCount: 2 + feedbackSlots.length * 2 + scratch
+  };
+}
+var LayerStack = class {
+  layers = [];
+  solo = /* @__PURE__ */ new Set();
+  seed = 0;
+  /** Rebuild from a preset. Existing runtime state (triggers, solo, mute) is discarded on purpose — see `Layer`. */
+  load(preset2) {
+    this.seed = preset2.seed;
+    this.layers = preset2.layers.map((spec) => new Layer(spec, preset2.seed));
+    this.solo.clear();
+  }
+  get all() {
+    return this.layers;
+  }
+  get length() {
+    return this.layers.length;
+  }
+  find(id) {
+    return this.layers.find((l) => l.id === id);
+  }
+  /** Append, or insert at `index`. */
+  add(spec, index) {
+    if (this.find(spec.id)) {
+      throw new Error(`Layer id '${spec.id}' is already in the stack. IDs seed per-layer variation and must be unique.`);
+    }
+    const layer2 = new Layer(spec, this.seed);
+    if (index === void 0 || index >= this.layers.length) this.layers.push(layer2);
+    else this.layers.splice(Math.max(0, index), 0, layer2);
+    return layer2;
+  }
+  remove(id) {
+    const i = this.layers.findIndex((l) => l.id === id);
+    if (i < 0) return false;
+    this.layers.splice(i, 1);
+    this.solo.delete(id);
+    return true;
+  }
+  /** Move `id` to `toIndex` in the stack. Clamped rather than throwing; a drag past the end is a normal gesture. */
+  reorder(id, toIndex) {
+    const from = this.layers.findIndex((l) => l.id === id);
+    if (from < 0) return false;
+    const [layer2] = this.layers.splice(from, 1);
+    if (!layer2) return false;
+    const to = Math.max(0, Math.min(this.layers.length, Math.trunc(toIndex)));
+    this.layers.splice(to, 0, layer2);
+    return true;
+  }
+  setMuted(id, muted) {
+    const layer2 = this.find(id);
+    if (layer2) layer2.muted = muted;
+  }
+  /**
+   * Solo is a filter, not a mute of everything else.
+   *
+   * Implementing solo by muting the others destroys the user's own mute states,
+   * and un-soloing then has to guess which of them to restore. Keeping the solo
+   * set separate means solo and mute compose: a soloed layer that is also muted
+   * stays silent, which is what every mixing desk does.
+   */
+  setSolo(id, soloed) {
+    if (soloed) this.solo.add(id);
+    else this.solo.delete(id);
+  }
+  clearSolo() {
+    this.solo.clear();
+  }
+  isSoloed(id) {
+    return this.solo.has(id);
+  }
+  get soloActive() {
+    return this.solo.size > 0;
+  }
+  /** §4.10. Seek, pause-to-a-new-position and track change all land here. */
+  reset() {
+    for (const layer2 of this.layers) layer2.reset();
+  }
+  /** Advance every layer's trigger state to `nowBeats`. Call once per frame, before `resolve`. */
+  update(nowBeats) {
+    for (const layer2 of this.layers) layer2.update(nowBeats);
+  }
+  /**
+   * The ordered list of layers that will actually render this frame, with their
+   * envelope values.
+   *
+   * Filtering happens HERE and not in the renderer, because "a layer at 0 is a
+   * true no-op" (Phase 5 DoD) is only true if a spent layer never reaches the
+   * pass planner — an invisible layer that still owns a pass has cost the entire
+   * pass budget for that pass and produced nothing.
+   */
+  resolve(nowBeats) {
+    const out = [];
+    for (const layer2 of this.layers) {
+      if (this.solo.size > 0 && !this.solo.has(layer2.id)) continue;
+      if (!layer2.gateOpen) continue;
+      const progress = layer2.progress(nowBeats);
+      if (progress <= 0) continue;
+      out.push({
+        layer: layer2,
+        progress,
+        opacity: clamp01(layer2.spec.opacity * progress),
+        blendConstant: blendConstantFor(layer2.spec)
+      });
+    }
+    return out;
+  }
+  /** Convenience: resolve and plan in one call, which is what a frame actually wants. */
+  frame(nowBeats) {
+    const resolved = this.resolve(nowBeats);
+    return { resolved, plan: planStack(resolved) };
+  }
+};
+function clamp01(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+// src/preset.ts
+var PresetError = class extends Error {
+};
+var FAMILIES = ["source", "warp", "color", "feedback", "operator"];
+var BLENDS = [
+  "replace",
+  "add",
+  "max",
+  "min",
+  "50/50",
+  "subtract",
+  "multiply",
+  "xor",
+  "adjustable",
+  "alpha"
+];
+var ANCHORS = ["start", "peak", "end"];
+var SLOTS = ["bg", "primary", "secondary", "accent"];
+var DIVISION_NAMES = Object.keys(DIVISIONS);
+function obj(v, path) {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) {
+    throw new PresetError(`${path} must be an object, got ${describe(v)}.`);
+  }
+  return v;
+}
+function arr(v, path) {
+  if (!Array.isArray(v)) throw new PresetError(`${path} must be an array, got ${describe(v)}.`);
+  return v;
+}
+function str(v, path) {
+  if (typeof v !== "string") throw new PresetError(`${path} must be a string, got ${describe(v)}.`);
+  return v;
+}
+function num(v, path, lo = -Infinity, hi = Infinity) {
+  if (typeof v !== "number" || !Number.isFinite(v)) {
+    throw new PresetError(`${path} must be a finite number, got ${describe(v)}.`);
+  }
+  if (v < lo || v > hi) {
+    throw new PresetError(`${path} must be within [${lo}, ${hi}], got ${v}.`);
+  }
+  return v;
+}
+function int(v, path, lo = -Infinity, hi = Infinity) {
+  const n = num(v, path, lo, hi);
+  if (!Number.isInteger(n)) throw new PresetError(`${path} must be an integer, got ${n}.`);
+  return n;
+}
+function bool(v, path) {
+  if (typeof v !== "boolean") throw new PresetError(`${path} must be a boolean, got ${describe(v)}.`);
+  return v;
+}
+function oneOf(v, path, allowed) {
+  const s = str(v, path);
+  if (!allowed.includes(s)) {
+    throw new PresetError(
+      `${path} is '${s}', which this build does not know. Expected one of: ${allowed.join(", ")}.`
+    );
+  }
+  return s;
+}
+function describe(v) {
+  if (v === null) return "null";
+  if (Array.isArray(v)) return "an array";
+  if (typeof v === "number" && !Number.isFinite(v)) return String(v);
+  if (typeof v === "string") return `'${v}'`;
+  return typeof v;
+}
+function readEnvelope(v, path) {
+  const o = obj(v, path);
+  return {
+    attackBeats: num(o["attackBeats"], `${path}.attackBeats`, 0, 256),
+    holdBeats: num(o["holdBeats"], `${path}.holdBeats`, 0, 256),
+    releaseBeats: num(o["releaseBeats"], `${path}.releaseBeats`, 0, 256)
+  };
+}
+function readTrigger(v, path) {
+  const o = obj(v, path);
+  const division = oneOf(o["division"], `${path}.division`, DIVISION_NAMES);
+  const euclidN = int(o["euclidN"], `${path}.euclidN`, 1, 256);
+  const euclidK = int(o["euclidK"], `${path}.euclidK`, 0, 256);
+  if (euclidK > euclidN) {
+    throw new PresetError(
+      `${path}.euclidK (${euclidK}) exceeds euclidN (${euclidN}). E(k, n) cannot place more onsets than it has steps.`
+    );
+  }
+  return {
+    division,
+    euclidK,
+    euclidN,
+    probability: num(o["probability"], `${path}.probability`, 0, 1),
+    offsetSteps: int(o["offsetSteps"], `${path}.offsetSteps`, -1024, 1024)
+  };
+}
+function emptyParams() {
+  return /* @__PURE__ */ Object.create(null);
+}
+function readParams(v, path) {
+  const o = obj(v, path);
+  const out = emptyParams();
+  for (const key of Object.keys(o).sort()) {
+    const value = o[key];
+    const t = typeof value;
+    if (t === "number") {
+      out[key] = num(value, `${path}.${key}`);
+    } else if (t === "boolean" || t === "string") {
+      out[key] = value;
+    } else {
+      throw new PresetError(
+        `${path}.${key} must be a number, boolean or string \u2014 preset params are flat so presets stay JSON. Got ${describe(value)}.`
+      );
+    }
+  }
+  return out;
+}
+function readLayer(v, path) {
+  const o = obj(v, path);
+  const id = str(o["id"], `${path}.id`);
+  if (id.length === 0) {
+    throw new PresetError(`${path}.id is empty. IDs seed per-layer variation and must be stable and unique (\xA74.7).`);
+  }
+  return {
+    id,
+    type: str(o["type"], `${path}.type`),
+    family: oneOf(o["family"], `${path}.family`, FAMILIES),
+    params: readParams(o["params"], `${path}.params`),
+    blend: oneOf(o["blend"], `${path}.blend`, BLENDS),
+    opacity: num(o["opacity"], `${path}.opacity`, 0, 1),
+    envelope: readEnvelope(o["envelope"], `${path}.envelope`),
+    trigger: readTrigger(o["trigger"], `${path}.trigger`),
+    anchor: oneOf(o["anchor"], `${path}.anchor`, ANCHORS),
+    palette: oneOf(o["palette"], `${path}.palette`, SLOTS),
+    enabled: bool(o["enabled"], `${path}.enabled`),
+    // Upper bound is 1: a layer cannot render above the global render scale,
+    // which is itself the one knob that degrades 2K120 gracefully (§4.11).
+    resolutionScale: num(o["resolutionScale"], `${path}.resolutionScale`, 0.05, 1)
+  };
+}
+function readColor(v, path) {
+  const o = obj(v, path);
+  return {
+    l: num(o["l"], `${path}.l`, 0, 1),
+    c: num(o["c"], `${path}.c`, 0, 0.5),
+    h: num(o["h"], `${path}.h`, -360, 720),
+    // Above 1.0 is HDR headroom and is what bloom finds. Capped low on purpose:
+    // if three layers all exceed 1.0 the frame has no focal point at all
+    // (art direction §2.4), so a preset asking for 40x is a mistake, not intent.
+    intensity: num(o["intensity"], `${path}.intensity`, 0, 8)
+  };
+}
+function readPalette(v, path) {
+  const o = obj(v, path);
+  const rawRamp = arr(o["ramp"], `${path}.ramp`);
+  const ramp = rawRamp.map((stop, i) => {
+    const so = obj(stop, `${path}.ramp[${i}]`);
+    return {
+      at: num(so["at"], `${path}.ramp[${i}].at`, 0, 1),
+      color: readColor(so["color"], `${path}.ramp[${i}].color`)
+    };
+  });
+  ramp.sort((a, b) => a.at - b.at);
+  return {
+    name: str(o["name"], `${path}.name`),
+    bg: readColor(o["bg"], `${path}.bg`),
+    primary: readColor(o["primary"], `${path}.primary`),
+    secondary: readColor(o["secondary"], `${path}.secondary`),
+    accent: readColor(o["accent"], `${path}.accent`),
+    ramp
+  };
+}
+function validate(raw) {
+  const o = obj(raw, "preset");
+  const layers = arr(o["layers"], "preset.layers").map((l, i) => readLayer(l, `preset.layers[${i}]`));
+  const seen = /* @__PURE__ */ new Set();
+  for (const layer2 of layers) {
+    if (seen.has(layer2.id)) {
+      throw new PresetError(`preset.layers has two layers with id '${layer2.id}'. IDs seed per-layer variation and must be unique.`);
+    }
+    seen.add(layer2.id);
+  }
+  return {
+    version: PRESET_VERSION,
+    name: str(o["name"], "preset.name"),
+    seed: int(o["seed"], "preset.seed", 0, 4294967295),
+    layers,
+    palette: readPalette(o["palette"], "preset.palette")
+  };
+}
+function serialise(preset2, pretty = false) {
+  const canonical = canonicalise(preset2);
+  return pretty ? JSON.stringify(canonical, null, 2) : JSON.stringify(canonical);
+}
+function canonicalise(p) {
+  return {
+    version: PRESET_VERSION,
+    name: p.name,
+    seed: p.seed,
+    layers: p.layers.map((l) => ({
+      id: l.id,
+      type: l.type,
+      family: l.family,
+      params: sortedParams(l.params),
+      blend: l.blend,
+      opacity: l.opacity,
+      envelope: {
+        attackBeats: l.envelope.attackBeats,
+        holdBeats: l.envelope.holdBeats,
+        releaseBeats: l.envelope.releaseBeats
+      },
+      trigger: {
+        division: l.trigger.division,
+        euclidK: l.trigger.euclidK,
+        euclidN: l.trigger.euclidN,
+        probability: l.trigger.probability,
+        offsetSteps: l.trigger.offsetSteps
+      },
+      anchor: l.anchor,
+      palette: l.palette,
+      enabled: l.enabled,
+      resolutionScale: l.resolutionScale
+    })),
+    palette: {
+      name: p.palette.name,
+      bg: colorOf(p.palette.bg),
+      primary: colorOf(p.palette.primary),
+      secondary: colorOf(p.palette.secondary),
+      accent: colorOf(p.palette.accent),
+      // Sorted here as well as in `readPalette`, so that `serialise` is
+      // idempotent: `serialise(p)` must equal `serialise(deserialise(serialise(p)))`
+      // for a preset that was built in memory and never went through a load.
+      // Normalising in only one of the two paths is how a round-trip test passes
+      // while the actual save/share path still produces two different strings
+      // for the same preset.
+      ramp: [...p.palette.ramp].sort((a, b) => a.at - b.at).map((s) => ({ at: s.at, color: colorOf(s.color) }))
+    }
+  };
+}
+function colorOf(c) {
+  return { l: c.l, c: c.c, h: c.h, intensity: c.intensity };
+}
+function sortedParams(params) {
+  const out = emptyParams();
+  for (const key of Object.keys(params).sort()) {
+    const v = params[key];
+    if (v !== void 0) out[key] = v;
+  }
+  return out;
+}
+function deserialise(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err2) {
+    throw new PresetError(`Preset is not valid JSON: ${err2.message}`);
+  }
+  return validate(migrate(parsed));
+}
+function encodeHash(preset2) {
+  const json = serialise(preset2);
+  const bytes = new TextEncoder().encode(json);
+  let binary = "";
+  const CHUNK = 32768;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function decodeHash(hash) {
+  const clean = hash.replace(/^#/, "").trim();
+  if (clean.length === 0) throw new PresetError("No preset in the URL hash.");
+  const b64 = clean.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = b64 + "=".repeat((4 - b64.length % 4) % 4);
+  let binary;
+  try {
+    binary = atob(padded);
+  } catch {
+    throw new PresetError("URL hash is not valid base64url \u2014 it was probably truncated in transit.");
+  }
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  let json;
+  try {
+    json = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new PresetError("URL hash did not decode to text.");
+  }
+  return deserialise(json);
+}
+function presetFromLocation(hash) {
+  const clean = hash.replace(/^#/, "").trim();
+  if (clean.length === 0) return null;
+  return decodeHash(clean);
+}
+
+// src/director.ts
+var DYNAMIC_HOLDS = [2, 3, 4, 6, 8, 12];
+var PresetDirector = class {
+  bank;
+  scheduler = new Scheduler();
+  /** Index into `bank`, not into the caller's list. */
+  current = 0;
+  cycle = 0;
+  /** Recently played, newest first. Prevents an immediate repeat. */
+  recent = [];
+  /** The next planned change boundary. `null` means auto has not started yet. */
+  nextBar = null;
+  lastChangeBar = -Infinity;
+  lastEnergy = 0;
+  /** Strongest onset since the most recent bar decision. */
+  pendingImpact = 0;
+  enabled;
+  every;
+  dynamic;
+  minBars;
+  maxBars;
+  mode;
+  seed;
+  defaultTransition;
+  constructor(bank, opts = {}) {
+    if (bank.length === 0) throw new Error("PresetDirector needs at least one preset");
+    this.bank = bank;
+    this.every = opts.every ?? 8;
+    this.dynamic = opts.dynamic ?? true;
+    this.minBars = Math.max(1, Math.round(opts.minBars ?? 2));
+    this.maxBars = Math.max(this.minBars, Math.round(opts.maxBars ?? 12));
+    this.mode = opts.mode ?? "shuffle";
+    this.seed = opts.seed ?? 24301;
+    this.enabled = opts.enabled ?? false;
+    this.defaultTransition = opts.defaultTransition ?? CUT;
+  }
+  /** Output latency compensation, mirroring the layer scheduler. */
+  set outputLatency(v) {
+    this.scheduler.outputLatency = v;
+  }
+  get currentIndex() {
+    return this.current;
+  }
+  get currentPreset() {
+    return this.bank[this.current].preset;
+  }
+  get size() {
+    return this.bank.length;
+  }
+  /** Replace the bank, keeping the current preset selected if it is still present. */
+  setBank(bank) {
+    if (bank.length === 0) throw new Error("PresetDirector needs at least one preset");
+    const keep = this.bank[this.current]?.preset.name;
+    this.bank = bank;
+    const found = bank.findIndex((e) => e.preset.name === keep);
+    this.current = found >= 0 ? found : 0;
+    this.recent.length = 0;
+  }
+  /**
+   * Poll once per frame. Returns a change only on the frame a boundary fires.
+   *
+   * `energy` is 0..1 and gates entries with min/maxEnergy — pass the tension
+   * score or a smoothed level. Omit it and the gates are ignored.
+   */
+  update(timeline2, now, energy, impact = 0) {
+    if (!this.enabled || this.mode === "hold" || this.bank.length < 2) return null;
+    this.pendingImpact = Math.max(this.pendingImpact, clamp012(impact));
+    const fired = this.scheduler.due(timeline2, now, {
+      key: "director",
+      // euclidK/N = 1/1 is "every tick" — the Euclidean generator's identity.
+      // Not optional on TriggerSpec, and 0/0 would silently produce no ticks.
+      trigger: { division: "bar", probability: 1, euclidK: 1, euclidN: 1, offsetSteps: 0 },
+      anchor: "start",
+      envelope: { attackBeats: 0, holdBeats: 0, releaseBeats: 0 },
+      seed: this.seed
+    });
+    if (fired.length === 0) return null;
+    const last2 = fired[fired.length - 1];
+    const bar = Math.floor(last2.tick);
+    const level = clamp012(energy ?? this.lastEnergy);
+    if (!this.dynamic) {
+      if (bar % this.every !== 0) return null;
+      return this.advance(now, last2.time, "phrase", level);
+    }
+    if (this.nextBar === null) {
+      this.lastChangeBar = bar;
+      this.nextBar = bar + this.nextHold(bar, level, this.pendingImpact);
+      this.lastEnergy = level;
+      this.pendingImpact = 0;
+      return null;
+    }
+    const heldBars = bar - this.lastChangeBar;
+    const rise = level - this.lastEnergy;
+    const earlyDrop = heldBars >= this.minBars && this.pendingImpact >= 0.72 && level >= 0.38 && rise >= 0.08;
+    if (bar < this.nextBar && !earlyDrop) {
+      this.lastEnergy = level;
+      this.pendingImpact = 0;
+      return null;
+    }
+    const change = this.advance(now, last2.time, "phrase", level);
+    this.lastChangeBar = bar;
+    this.nextBar = bar + this.nextHold(bar, level, this.pendingImpact);
+    this.lastEnergy = level;
+    this.pendingImpact = 0;
+    return change;
+  }
+  /** Change now, outside the grid. For a key press or a detected drop. */
+  jump(now, reason = "manual", energy) {
+    return this.advance(now, now, reason, energy);
+  }
+  /** Step by hand without disturbing the automatic cycle's determinism. */
+  step(delta, now) {
+    const from = this.current;
+    this.current = (this.current + delta + this.bank.length) % this.bank.length;
+    this.remember(this.current);
+    return {
+      preset: this.currentPreset,
+      index: this.current,
+      time: now,
+      cycle: this.cycle,
+      reason: "manual",
+      transition: this.transitionFor(from, this.current)
+    };
+  }
+  advance(now, time, reason, energy) {
+    this.cycle++;
+    const from = this.current;
+    const next = this.mode === "sequential" ? (this.current + 1) % this.bank.length : this.pickWeighted(energy);
+    this.current = next;
+    this.remember(next);
+    void now;
+    return {
+      preset: this.currentPreset,
+      index: next,
+      time,
+      cycle: this.cycle,
+      reason,
+      transition: this.transitionFor(from, next)
+    };
+  }
+  /**
+   * Explicit entry override, else a suggestion from the two looks, else the
+   * bank default. Deterministic — no hashing here, because a transition that
+   * varies run to run makes two otherwise identical shows diverge visually
+   * while the golden harness still calls them equal.
+   */
+  transitionFor(from, to) {
+    const entry = this.bank[to];
+    if (entry?.transition) return entry.transition;
+    const fromEntry = this.bank[from];
+    if (fromEntry?.cost === "heavy" || entry?.cost === "heavy") return { kind: "cut", beats: 0 };
+    const suggested = suggestTransition(this.bank[from]?.look, entry?.look);
+    return suggested.kind === "cut" ? this.defaultTransition : suggested;
+  }
+  /**
+   * Seeded weighted pick, excluding anything played recently.
+   *
+   * Deterministic by construction: the only inputs are the seed, the cycle
+   * counter and the bank. No Math.random anywhere (§4.7) — a show must replay
+   * identically, and the golden harness compares byte-for-byte.
+   */
+  pickWeighted(energy) {
+    const window2 = Math.min(this.recent.length, Math.max(0, this.bank.length - 2));
+    const banned = new Set(this.recent.slice(0, window2));
+    const eligible = [];
+    const weights = [];
+    for (let i = 0; i < this.bank.length; i++) {
+      if (banned.has(i)) continue;
+      const e = this.bank[i];
+      const w = e.weight ?? 1;
+      if (w <= 0) continue;
+      if (energy !== void 0) {
+        if (e.minEnergy !== void 0 && energy < e.minEnergy) continue;
+        if (e.maxEnergy !== void 0 && energy > e.maxEnergy) continue;
+      }
+      eligible.push(i);
+      weights.push(w);
+    }
+    if (eligible.length === 0) {
+      const alt = (this.current + 1) % this.bank.length;
+      return alt;
+    }
+    let total = 0;
+    for (const w of weights) total += w;
+    let r = hash2(this.seed, this.cycle) * total;
+    for (let i = 0; i < eligible.length; i++) {
+      r -= weights[i];
+      if (r <= 0) return eligible[i];
+    }
+    return eligible[eligible.length - 1];
+  }
+  remember(i) {
+    this.recent.unshift(i);
+    if (this.recent.length > 8) this.recent.length = 8;
+  }
+  /** After a seek or a track change: forget fire state so nothing back-fires. */
+  reset() {
+    this.scheduler.reset();
+    this.recent.length = 0;
+    this.cycle = 0;
+    this.nextBar = null;
+    this.lastChangeBar = -Infinity;
+    this.lastEnergy = 0;
+    this.pendingImpact = 0;
+  }
+  /** Choose the next hold from musical states, never from elapsed seconds. */
+  nextHold(bar, energy, impact) {
+    let candidates;
+    if (impact >= 0.7) candidates = [2, 3, 4];
+    else if (energy >= 0.72) candidates = [2, 3, 4, 4, 6];
+    else if (energy <= 0.26) candidates = [4, 6, 8, 8, 12];
+    else candidates = [3, 4, 4, 6, 8];
+    const allowed = candidates.filter((bars) => bars >= this.minBars && bars <= this.maxBars);
+    const pool = allowed.length > 0 ? allowed : DYNAMIC_HOLDS.filter((bars) => bars >= this.minBars && bars <= this.maxBars);
+    const fallback = Math.max(this.minBars, Math.min(this.maxBars, 4));
+    if (pool.length === 0) return fallback;
+    const index = Math.min(pool.length - 1, Math.floor(hash2(this.seed, bar + this.cycle * 97) * pool.length));
+    return pool[index] ?? fallback;
+  }
+};
+function clamp012(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+var TRANSITION_ID = {
+  cut: 0,
+  build: 1,
+  crossfade: 2,
+  dissolve: 3,
+  wipe: 4,
+  radial: 5,
+  iris: 6,
+  panelWipe: 7,
+  panelFlip: 8,
+  slice: 9
+};
+function transitionWgslConstants() {
+  return Object.entries(TRANSITION_ID).map(([k, v]) => "const TR_" + k.toUpperCase() + " : f32 = " + v.toFixed(1) + ";").join("\n");
+}
+var TWO_CHAIN = /* @__PURE__ */ new Set([
+  "crossfade",
+  "dissolve",
+  "wipe",
+  "radial",
+  "iris",
+  "panelWipe",
+  "panelFlip",
+  "slice"
+]);
+var CUT = { kind: "cut", beats: 0 };
+var Transition = class {
+  spec = CUT;
+  startTime = 0;
+  endTime = 0;
+  running = false;
+  /** 0 = fully the outgoing preset, 1 = fully the incoming one. */
+  mix = 1;
+  /** Set for `dissolve`; the shader uses it to offset its threshold hash. */
+  seed = 0;
+  get active() {
+    return this.running;
+  }
+  get kind() {
+    return this.spec.kind;
+  }
+  get current() {
+    return this.spec;
+  }
+  /**
+   * Begin at `atTime` on the audio clock. `bpm` converts the beat duration —
+   * captured once at the start rather than tracked, so a tempo wobble mid-fade
+   * cannot stretch or truncate a transition that is already underway.
+   */
+  begin(spec, atTime, bpm, seed = 0) {
+    this.spec = spec;
+    this.seed = seed;
+    if (spec.kind === "cut" || spec.beats <= 0 || !(bpm > 0)) {
+      this.running = false;
+      this.mix = 1;
+      return;
+    }
+    this.startTime = atTime;
+    this.endTime = atTime + spec.beats * (60 / bpm);
+    this.running = true;
+    this.mix = 0;
+  }
+  /** Call once per frame with the audio clock. Returns true while blending. */
+  update(now) {
+    if (!this.running) {
+      this.mix = 1;
+      return false;
+    }
+    const span = this.endTime - this.startTime;
+    const t = span > 0 ? (now - this.startTime) / span : 1;
+    if (t >= 1) {
+      this.running = false;
+      this.mix = 1;
+      return false;
+    }
+    this.mix = curveAt(Math.max(0, t), this.spec.curve ?? "linear");
+    return true;
+  }
+  /** Seek, track change, or a manual override mid-fade. */
+  cancel() {
+    this.running = false;
+    this.mix = 1;
+  }
+};
+function curveAt(t, curve) {
+  switch (curve) {
+    case "equalPower":
+      return Math.sin(t * Math.PI / 2);
+    case "smooth":
+      return t * t * (3 - 2 * t);
+    default:
+      return t;
+  }
+}
+function needsBothChains(kind) {
+  return TWO_CHAIN.has(kind);
+}
+function packTransition(spec, mix, seed, aspect, out) {
+  out[0] = TRANSITION_ID[spec.kind];
+  out[1] = mix;
+  out[2] = spec.angle ?? 0;
+  out[3] = spec.softness ?? 0.04;
+  out[4] = Math.max(1, Math.round(spec.panels ?? 8));
+  out[5] = seed;
+  out[6] = aspect;
+  out[7] = spec.grow === false ? 0 : 1;
+}
+function suggestTransition(fromLook, toLook) {
+  if (!fromLook || !toLook) return CUT;
+  if (fromLook === toLook) return { kind: "crossfade", beats: 1, curve: "equalPower" };
+  return { kind: "build", beats: 2 };
+}
+
+// src/presets/visual-v2.ts
+function gate(division, euclidK = 1, euclidN = 1, offsetSteps = 0) {
+  return { division, euclidK, euclidN, probability: 1, offsetSteps };
+}
+function fade(attackBeats, holdBeats, releaseBeats) {
+  return { attackBeats, holdBeats, releaseBeats };
+}
+function base(spec) {
+  return {
+    family: "source",
+    params: {},
+    blend: "add",
+    opacity: 1,
+    // Safe continuous default. A recurring trigger with a non-zero attack
+    // hard-resets the subject; V2 rhythms live in shape/treatments instead.
+    envelope: fade(0, 16.5, 2),
+    trigger: gate("4bar"),
+    anchor: "start",
+    palette: "primary",
+    enabled: true,
+    resolutionScale: 0.5,
+    ...spec
+  };
+}
+var sustain = (division, holdBeats) => ({
+  trigger: gate(division),
+  envelope: fade(0, holdBeats, 2),
+  anchor: "start"
+});
+var accentPulse = (division, attackBeats, holdBeats, releaseBeats) => ({
+  trigger: gate(division),
+  envelope: fade(attackBeats, holdBeats, releaseBeats),
+  anchor: "peak"
+});
+var phraseRest = () => ({
+  trigger: gate("bar", 1, 4, 1),
+  envelope: fade(0, 4, 0),
+  anchor: "start"
+});
+var source = (id, type, palette, params = {}, extra = {}) => base({ id, type, palette, params, ...extra });
+var effect = (id, type, palette, params = {}, extra = {}) => base({ id, type, family: "operator", blend: "replace", palette, params, ...extra });
+var memory = (id, type, palette, params = {}, extra = {}) => base({ id, type, family: "feedback", blend: "add", palette, params, ...extra });
+var scene = (name, seed, palette, layers) => ({ version: 1, name, seed, palette, layers });
+var V2_LAB = {
+  name: "v2-lab",
+  bg: { l: 0.01, c: 6e-3, h: 205, intensity: 1 },
+  primary: { l: 0.84, c: 0.14, h: 158, intensity: 1.85 },
+  secondary: { l: 0.62, c: 0.085, h: 188, intensity: 0.72 },
+  accent: { l: 0.9, c: 0.13, h: 82, intensity: 2.35 },
+  ramp: []
+};
+var V2_GRID = {
+  name: "v2-grid",
+  bg: { l: 8e-3, c: 0.01, h: 252, intensity: 1 },
+  primary: { l: 0.76, c: 0.18, h: 205, intensity: 2.15 },
+  secondary: { l: 0.64, c: 0.22, h: 322, intensity: 1.42 },
+  accent: { l: 0.91, c: 0.16, h: 62, intensity: 2.85 },
+  ramp: []
+};
+var V2_INK = {
+  name: "v2-ink",
+  bg: { l: 0.018, c: 8e-3, h: 44, intensity: 1 },
+  primary: { l: 0.88, c: 0.025, h: 72, intensity: 1 },
+  secondary: { l: 0.62, c: 0.025, h: 48, intensity: 0.76 },
+  accent: { l: 0.62, c: 0.2, h: 30, intensity: 1.75 },
+  ramp: []
+};
+var V2_RAVE = {
+  name: "v2-rave",
+  bg: { l: 0.01, c: 0.018, h: 300, intensity: 1 },
+  primary: { l: 0.7, c: 0.25, h: 326, intensity: 2.15 },
+  secondary: { l: 0.77, c: 0.17, h: 198, intensity: 1.65 },
+  accent: { l: 0.92, c: 0.19, h: 96, intensity: 3 },
+  ramp: []
+};
+var cathodeOrbit = scene("cathode-orbit", 2162689, V2_LAB, [
+  source(
+    "orbit",
+    "phosphor-orbit",
+    "primary",
+    { scale: 1.1, detail: 1.25, spread: 0.75, rate: 0.125, focusX: -0.24, focusY: 0.07, thickness: 0.75 },
+    { resolutionScale: 1, ...sustain("2bar", 8.5) }
+  )
+]);
+var fluxCartography = scene("flux-cartography", 2162690, V2_LAB, [
+  source(
+    "field",
+    "magnetic-flux",
+    "primary",
+    { scale: 1.05, density: 1.18, spread: 1.15, rate: 0.125, focusX: 0.18, focusY: 0.02, thickness: 0.72 },
+    { resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  )
+]);
+var harmonicSpecimen = scene("harmonic-specimen", 2162691, V2_LAB, [
+  source(
+    "knot",
+    "harmonic-knot",
+    "primary",
+    { scale: 1.18, detail: 1.2, spread: 0.7, rate: 0.125, focusX: -0.12, focusY: 0.02, thickness: 0.8 },
+    { resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  )
+]);
+var quasicrystalScan = scene("quasicrystal-scan", 2162692, V2_LAB, [
+  source(
+    "specimen",
+    "quasicrystal",
+    "secondary",
+    { scale: 1.18, density: 0.78, detail: 0.8, rate: 0.0625, focusX: 0.24, focusY: -0.04, thickness: 0.65, bias: 0.42 },
+    { opacity: 0.78, resolutionScale: 0.5, ...sustain("4bar", 16.5) }
+  )
+]);
+var cathedralDrive = scene("cathedral-drive", 2228225, V2_GRID, [
+  source(
+    "architecture",
+    "spectral-cathedral",
+    "primary",
+    { scale: 1.1, density: 1, detail: 1.25, rate: 0.5, focusX: 0, focusY: -0.03, thickness: 0.8 },
+    { resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  effect(
+    "horizon-diffraction",
+    "diffraction",
+    "accent",
+    { amount: 0.38, strength: 0.72, radius: 1.2, detail: 0.7, threshold: 0.58, angle: 0 },
+    { opacity: 0.34, resolutionScale: 1, ...accentPulse("bar", 0.05, 0.45, 2.4) }
+  )
+]);
+var eclipseTransit = scene("eclipse-transit", 2228226, V2_GRID, [
+  source(
+    "eclipse",
+    "eclipse-corona",
+    "accent",
+    { scale: 1.12, density: 1.05, detail: 0.9, rate: 0.25, spread: 0.8, focusX: 0.34, focusY: 0.18, thickness: 0.75 },
+    { resolutionScale: 1, ...sustain("2bar", 8.5) }
+  ),
+  source(
+    "distant-arches",
+    "spectral-cathedral",
+    "secondary",
+    { scale: 0.92, density: 0.6, detail: 0.7, rate: 0.25, focusX: 0, focusY: -0.12, thickness: 0.58 },
+    { opacity: 0.3, resolutionScale: 0.5, ...sustain("4bar", 16.5) }
+  ),
+  effect(
+    "optic",
+    "lensfield",
+    "primary",
+    { amount: 0.28, strength: 0.52, radius: 0.75, detail: 1, focusX: 0.34, focusY: 0.18, mix: 0.7 },
+    { opacity: 0.28, resolutionScale: 1, ...accentPulse("bar", 0.05, 0.35, 2.2) }
+  )
+]);
+var moireTerminal = scene("moire-terminal", 2228227, V2_GRID, [
+  source(
+    "portal",
+    "moire-portal",
+    "primary",
+    { scale: 1.08, density: 0.86, detail: 0.85, rate: 0.25, focusX: -0.3, focusY: 0.08, thickness: 0.62 },
+    { resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  source(
+    "terminal-horizon",
+    "spectral-cathedral",
+    "secondary",
+    { scale: 1.08, density: 0.52, detail: 0.62, rate: 0.125, focusX: 0, focusY: -0.16, thickness: 0.5 },
+    { opacity: 0.16, resolutionScale: 0.5, ...sustain("4bar", 16.5) }
+  )
+]);
+var signalArchitecture = scene("signal-architecture", 2228228, V2_GRID, [
+  source(
+    "facade",
+    "spectral-loom",
+    "primary",
+    { scale: 1.12, density: 0.9, detail: 0.72, rate: 0.25, focusX: 0.22, focusY: 0, thickness: 0.64 },
+    { resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  source(
+    "facade-horizon",
+    "spectral-cathedral",
+    "secondary",
+    { scale: 1.12, density: 0.46, detail: 0.56, rate: 0.125, focusX: 0, focusY: -0.18, thickness: 0.46 },
+    { opacity: 0.14, resolutionScale: 0.5, ...sustain("4bar", 16.5) }
+  )
+]);
+var vortexManuscript = scene("vortex-manuscript", 2293761, V2_INK, [
+  source(
+    "vortex",
+    "ink-vortex",
+    "primary",
+    { scale: 1.2, density: 0.74, detail: 1.15, rate: 0.0625, focusX: -0.34, focusY: 0.08, thickness: 0.8 },
+    { opacity: 0.88, resolutionScale: 0.5, ...sustain("4bar", 16.5) }
+  ),
+  memory(
+    "wash-memory",
+    "slit-memory",
+    "secondary",
+    { tauBeats: 7.2, gain: 0.18, driftY: 0.012, splitPx: 0.7, rate: 0.03125, detail: 0.3, clipKnee: 0.56, clipCeiling: 0.84 },
+    { opacity: 0.13, resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  )
+]);
+var botanicalSignal = scene("botanical-signal", 2293762, V2_INK, [
+  source(
+    "garden",
+    "signal-garden",
+    "primary",
+    { scale: 1.05, density: 0.72, detail: 0.7, rate: 0.125, spread: 0.7, focusX: 0.16, focusY: -0.02, thickness: 0.75 },
+    { resolutionScale: 0.5, ...sustain("4bar", 16.5) }
+  ),
+  memory(
+    "garden-memory",
+    "slit-memory",
+    "secondary",
+    { tauBeats: 5.6, gain: 0.2, driftX: 0.01, splitPx: 0.65, rate: 0.03125, detail: 0.28, clipKnee: 0.58, clipCeiling: 0.86 },
+    { opacity: 0.12, resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  )
+]);
+var paperAttractor = scene("paper-attractor", 2293763, V2_INK, [
+  source(
+    "ink-map",
+    "clifford",
+    "primary",
+    {
+      aBase: -1.4,
+      aHigh: 0.08,
+      aPulse: 0.04,
+      brightBase: 0.046,
+      brightLevel: 0.105,
+      brightEnv: 0.03,
+      thickness: 18e-4,
+      spinBars: 96,
+      hueBars: 160
+    },
+    { opacity: 0.7, resolutionScale: 1, ...sustain("4bar", 16.5) }
+  ),
+  memory(
+    "paper-age",
+    "slit-memory",
+    "secondary",
+    { tauBeats: 6.4, gain: 0.22, splitPx: 0.8, rate: 0.03125, detail: 0.35, clipKnee: 0.58, clipCeiling: 0.88 },
+    { opacity: 0.16, resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  )
+]);
+var blackWaterLoom = scene("black-water-loom", 2293764, V2_INK, [
+  source(
+    "loom",
+    "spectral-loom",
+    "primary",
+    { scale: 1.18, density: 0.62, detail: 0.58, rate: 0.0625, spread: 0.65, focusX: -0.2, focusY: 0.03, thickness: 0.65 },
+    { opacity: 0.74, resolutionScale: 1, ...sustain("4bar", 16.5) }
+  ),
+  memory(
+    "old-ink",
+    "slit-memory",
+    "secondary",
+    { tauBeats: 3.2, gain: 0.3, splitPx: 1.4, rate: 0.0625, detail: 0.5, clipKnee: 0.62, clipCeiling: 0.94 },
+    { opacity: 0.22, resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  )
+]);
+var prismOverload = scene("prism-overload", 2359297, V2_RAVE, [
+  source(
+    "wings",
+    "butterfly",
+    "primary",
+    { gain: 1.35, gamma: 0.58, span: 0.28, spread: 0.96, centreY: 0.52, bodyLevel: 0.34, capLevel: 1.2, stereo: 1, weightVar: 1.7 },
+    { resolutionScale: 1, ...sustain("4bar", 16.5) }
+  ),
+  memory(
+    "prism-memory",
+    "temporal-prism",
+    "secondary",
+    { tauBeats: 1, gain: 0.62, driftX: 0.02, splitPx: 3.2, rate: 0.5, detail: 1, focusX: -0.24, focusY: 0.08 },
+    { opacity: 0.46, resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  effect(
+    "phrase-rest",
+    "drop-rest",
+    "accent",
+    { amount: 1, strength: 1 },
+    { opacity: 1, resolutionScale: 1, ...phraseRest() }
+  )
+]);
+var foldEngine = scene("fold-engine", 2359298, V2_RAVE, [
+  source(
+    "spiral-array",
+    "radialbars",
+    "primary",
+    { bars: 56, gain: 1.15, gamma: 0.58, gap: 0.24, innerRadius: 0.18, reach: 0.42, centreX: 0.2, centreY: -0.06, bodyLevel: 0.48, capLevel: 1.25, sweep: 0.86, spinBars: 8 },
+    { resolutionScale: 1, ...sustain("4bar", 16.5) }
+  ),
+  effect(
+    "fold",
+    "foldglass",
+    "secondary",
+    { amount: 0.62, strength: 0.9, radius: 1.15, detail: 1, rate: 0.5, focusX: 0.26, focusY: 0.02, angle: 0.18 },
+    { opacity: 0.64, resolutionScale: 1, ...accentPulse("half", 0.04, 0.18, 0.7) }
+  ),
+  effect(
+    "phrase-rest",
+    "drop-rest",
+    "accent",
+    { amount: 1, strength: 1 },
+    { opacity: 1, resolutionScale: 1, ...phraseRest() }
+  )
+]);
+var temporalArray = scene("temporal-array", 2359299, V2_RAVE, [
+  source(
+    "three-lobe",
+    "halvorsen",
+    "secondary",
+    { trajectories: 24e3, substeps: 8, simPerBeat: 0.2, spinBars: 12, hueBars: 24, brightBase: 0.07, brightLevel: 0.15, brightEnv: 0.02, fit: 0.082, thickness: 22e-4 },
+    { resolutionScale: 0.5, ...sustain("4bar", 16.5) }
+  ),
+  memory(
+    "slits",
+    "slit-memory",
+    "primary",
+    { tauBeats: 1.15, gain: 0.72, driftY: 0.025, splitPx: 3.5, rate: 0.5, detail: 1.3, clipKnee: 0.78, clipCeiling: 1.18 },
+    { opacity: 0.52, resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  effect(
+    "phrase-rest",
+    "drop-rest",
+    "accent",
+    { amount: 1, strength: 1 },
+    { opacity: 1, resolutionScale: 1, ...phraseRest() }
+  )
+]);
+var eclipseDrop = scene("eclipse-drop", 2359300, V2_RAVE, [
+  source(
+    "black-sun",
+    "eclipse-corona",
+    "accent",
+    { scale: 1.28, density: 1.5, detail: 1.25, rate: 0.5, spread: 1.35, focusX: -0.32, focusY: 0.12, thickness: 0.95 },
+    { resolutionScale: 1, ...sustain("4bar", 16.5) }
+  ),
+  memory(
+    "corona-memory",
+    "temporal-prism",
+    "secondary",
+    { tauBeats: 0.85, gain: 0.58, driftX: 0.03, splitPx: 4, rate: 1, detail: 1.2, focusX: -0.32, focusY: 0.12 },
+    { opacity: 0.42, resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  effect(
+    "phrase-rest",
+    "drop-rest",
+    "primary",
+    { amount: 1, strength: 1 },
+    { opacity: 1, resolutionScale: 1, ...phraseRest() }
+  )
+]);
+var V2_PRESET_BANK = [
+  { preset: cathodeOrbit, look: "lab", cost: "light", weight: 1, maxEnergy: 0.46 },
+  { preset: fluxCartography, look: "lab", cost: "light", weight: 0.95, maxEnergy: 0.58 },
+  { preset: harmonicSpecimen, look: "lab", cost: "light", weight: 0.9, maxEnergy: 0.62 },
+  { preset: quasicrystalScan, look: "lab", cost: "light", weight: 0.8, maxEnergy: 0.52 },
+  { preset: cathedralDrive, look: "grid", cost: "medium", weight: 1, minEnergy: 0.18 },
+  { preset: eclipseTransit, look: "grid", cost: "medium", weight: 0.9, minEnergy: 0.14 },
+  { preset: moireTerminal, look: "grid", cost: "medium", weight: 0.9, minEnergy: 0.2 },
+  { preset: signalArchitecture, look: "grid", cost: "medium", weight: 0.95, minEnergy: 0.22 },
+  { preset: vortexManuscript, look: "ink", cost: "light", weight: 0.9, maxEnergy: 0.48 },
+  { preset: botanicalSignal, look: "ink", cost: "light", weight: 0.95, maxEnergy: 0.58 },
+  { preset: paperAttractor, look: "ink", cost: "heavy", weight: 0.82, maxEnergy: 0.46 },
+  { preset: blackWaterLoom, look: "ink", cost: "medium", weight: 0.88, maxEnergy: 0.62 },
+  { preset: prismOverload, look: "rave", cost: "heavy", weight: 1.05, minEnergy: 0.42 },
+  { preset: foldEngine, look: "rave", cost: "heavy", weight: 1, minEnergy: 0.38 },
+  { preset: temporalArray, look: "rave", cost: "heavy", weight: 1, minEnergy: 0.36 },
+  { preset: eclipseDrop, look: "rave", cost: "heavy", weight: 1.1, minEnergy: 0.46 }
+];
+
+// src/presets/index.ts
+function layer(spec) {
+  return {
+    family: "source",
+    params: {},
+    blend: "add",
+    opacity: 1,
+    envelope: { attackBeats: 0.3, holdBeats: 2, releaseBeats: 4 },
+    trigger: { division: "bar", euclidK: 1, euclidN: 1, probability: 1, offsetSteps: 0 },
+    anchor: "peak",
+    palette: "primary",
+    enabled: true,
+    resolutionScale: 1,
+    ...spec
+  };
+}
+var gate2 = (division, euclidK = 1, euclidN = 1) => ({ division, euclidK, euclidN, probability: 1, offsetSteps: 0 });
+var fade2 = (attackBeats, holdBeats, releaseBeats) => ({ attackBeats, holdBeats, releaseBeats });
+var source2 = (id, type, palette, params = {}, extra = {}) => layer({ id, type, palette, params, ...extra });
+var effect2 = (id, type, palette, params = {}, extra = {}) => layer({ id, type, family: "operator", palette, params, ...extra });
+var trail = (id, palette, params = {}, extra = {}) => layer({ id, type: "feedback", family: "feedback", palette, params, ...extra });
+var scene2 = (name, seed, palette, layers) => ({ version: 1, name, seed, palette, layers });
+var LAB = {
+  name: "lab",
+  bg: { l: 0.025, c: 8e-3, h: 205, intensity: 1 },
+  primary: { l: 0.82, c: 0.15, h: 158, intensity: 1.8 },
+  secondary: { l: 0.62, c: 0.1, h: 190, intensity: 0.8 },
+  accent: { l: 0.88, c: 0.14, h: 82, intensity: 2.4 },
+  ramp: []
+};
+var GRID = {
+  name: "grid",
+  bg: { l: 0.012, c: 8e-3, h: 250, intensity: 1 },
+  primary: { l: 0.78, c: 0.18, h: 205, intensity: 2.45 },
+  secondary: { l: 0.66, c: 0.23, h: 320, intensity: 2 },
+  accent: { l: 0.9, c: 0.18, h: 58, intensity: 3 },
+  ramp: []
+};
+var RAVE = {
+  name: "rave",
+  bg: { l: 0.018, c: 0.018, h: 318, intensity: 1 },
+  primary: { l: 0.66, c: 0.25, h: 18, intensity: 2 },
+  secondary: { l: 0.75, c: 0.16, h: 200, intensity: 1.1 },
+  accent: { l: 0.93, c: 0.18, h: 104, intensity: 3 },
+  ramp: []
+};
+var PRISM = {
+  name: "prism",
+  bg: { l: 0.02, c: 0.02, h: 260, intensity: 1 },
+  primary: { l: 0.75, c: 0.17, h: 205, intensity: 1.9 },
+  secondary: { l: 0.64, c: 0.17, h: 282, intensity: 1.15 },
+  accent: { l: 0.9, c: 0.12, h: 75, intensity: 2.6 },
+  ramp: []
+};
+var ABYSS = {
+  name: "abyss",
+  bg: { l: 0.014, c: 0.012, h: 235, intensity: 1 },
+  primary: { l: 0.68, c: 0.15, h: 192, intensity: 1.8 },
+  secondary: { l: 0.47, c: 0.11, h: 235, intensity: 0.85 },
+  accent: { l: 0.83, c: 0.14, h: 165, intensity: 2.3 },
+  ramp: []
+};
+var SIGNAL = {
+  name: "signal",
+  bg: { l: 0.021, c: 0.015, h: 35, intensity: 1 },
+  primary: { l: 0.79, c: 0.14, h: 56, intensity: 1.8 },
+  secondary: { l: 0.58, c: 0.1, h: 28, intensity: 0.9 },
+  accent: { l: 0.91, c: 0.12, h: 88, intensity: 2.5 },
+  ramp: []
+};
+var lab = scene2("lab", 427, LAB, [
+  source2("plate", "chladni", "secondary", { contrast: 0.72 }, { opacity: 0.3, trigger: gate2("2bar"), envelope: fade2(1.4, 5, 6) }),
+  source2("trace", "scope", "primary", { mode: "line", gain: 2.05, thickness: 55e-4 }, { trigger: gate2("beat"), envelope: fade2(0.08, 1, 3) }),
+  effect2("phosphor-grade", "grade", "primary", { amount: 0.34, strength: 0.5, mix: 0.58 }, { opacity: 0.45, trigger: gate2("bar"), envelope: fade2(0.3, 3, 5) }),
+  effect2("tube", "crt", "secondary", { amount: 0.32, strength: 0.35, detail: 0.9, mix: 0.58 }, { opacity: 0.38, trigger: gate2("2bar"), envelope: fade2(1, 5, 6) })
+]);
+var grid = scene2("grid", 157, GRID, [
+  source2("foreground-terrain", "heightmesh", "primary", { scale: 0.92, density: 1.55, detail: 1.65, speed: 0.58 }, { opacity: 1, trigger: gate2("bar"), envelope: fade2(0.2, 5, 7) }),
+  source2("dome-stage", "dometunnel", "secondary", { scale: 1, density: 0.92, detail: 0.95, speed: 0.46 }, { opacity: 0.78, trigger: gate2("2bar"), envelope: fade2(0.45, 6, 8) }),
+  source2("horizon-pylons", "pylons", "accent", { density: 1.2, detail: 1.45, speed: 0.75 }, { opacity: 0.74, trigger: gate2("beat"), envelope: fade2(0.04, 1.8, 3.4) }),
+  effect2("electric-halo", "neon", "primary", { amount: 0.68, strength: 0.96, radius: 1.35, detail: 1, mix: 0.24 }, { opacity: 0.66, trigger: gate2("bar"), envelope: fade2(0.2, 4, 6), resolutionScale: 0.5 })
+]);
+var rave = scene2("rave", 659918, RAVE, [
+  source2("vector-stage", "gridtunnel", "primary", { density: 1.25, detail: 1.05, spread: 1.15, speed: 1.35 }, { trigger: gate2("beat"), envelope: fade2(0.04, 1, 2.5) }),
+  source2("meter", "spectrum", "accent", { bars: 72, gain: 1.05, gamma: 0.62 }, { opacity: 0.58, trigger: gate2("beat"), envelope: fade2(0.04, 1.2, 2.4) }),
+  trail("heat", "primary", { tauBeats: 1.2, gain: 0.55, zoomPerBeat: 1.018, clipKnee: 0.72, clipCeiling: 1.12 }, { opacity: 0.48, trigger: gate2("beat"), envelope: fade2(0.08, 2, 4), resolutionScale: 0.5 }),
+  effect2("rolling-scan", "scanwarp", "secondary", { amount: 0.42, strength: 0.68, radius: 1.2, detail: 1.1, speed: 1.4, mix: 0.7 }, { opacity: 0.48, trigger: gate2("bar"), envelope: fade2(0.04, 1.4, 2) })
+]);
+var prism = scene2("prism", 659804, PRISM, [
+  source2("flow-map", "flowfield", "primary", { scale: 1.05, density: 0.88, detail: 1.3, spread: 1.05, speed: 0.52 }, { trigger: gate2("beat"), envelope: fade2(0.1, 1.5, 3.5), resolutionScale: 0.5 }),
+  source2("facets", "voronoi", "secondary", { density: 0.78, scale: 1.2, spread: 0.8, speed: 0.5 }, { opacity: 0.3, trigger: gate2("2bar"), envelope: fade2(0.8, 5, 6) }),
+  effect2("inked-bands", "contour", "secondary", { amount: 0.56, strength: 0.72, radius: 1, detail: 0.9, mix: 0.35 }, { opacity: 0.54, trigger: gate2("4bar"), envelope: fade2(1, 6, 8) }),
+  effect2("halo", "bloom", "accent", { amount: 0.52, strength: 0.9, radius: 1.4 }, { opacity: 0.58, trigger: gate2("bar"), envelope: fade2(0.4, 3, 5), resolutionScale: 0.5 })
+]);
+var abyss = scene2("abyss", 700757, ABYSS, [
+  source2("depth", "waterfall", "secondary", { gain: 0.92, speed: 0.42 }, { opacity: 0.56, trigger: gate2("bar"), envelope: fade2(0.8, 4, 7) }),
+  source2("tide", "reaction", "primary", { scale: 0.85, density: 0.85, detail: 1.25, speed: 0.36 }, { opacity: 0.76, trigger: gate2("beat"), envelope: fade2(0.2, 2, 5), resolutionScale: 0.5 }),
+  trail("undertow", "secondary", { tauBeats: 2.3, gain: 0.42, zoomPerBeat: 0.996, clipKnee: 0.7, clipCeiling: 1.05 }, { opacity: 0.42, trigger: gate2("2bar"), envelope: fade2(0.4, 5, 8), resolutionScale: 0.5 }),
+  effect2("blue-hour", "grade", "primary", { amount: 0.42, strength: 0.46, mix: 0.72 }, { opacity: 0.42, trigger: gate2("4bar"), envelope: fade2(1, 6, 8) })
+]);
+var signal = scene2("signal", 5339809, SIGNAL, [
+  source2("main-trace", "scope", "primary", { mode: "line", gain: 1.85, thickness: 5e-3 }, { trigger: gate2("beat"), envelope: fade2(0.05, 1.1, 2.8) }),
+  source2("dial", "radialbars", "accent", { bars: 44, gain: 0.9, gamma: 0.7, reach: 0.28 }, { opacity: 0.5, trigger: gate2("bar"), envelope: fade2(0.4, 3, 5) }),
+  source2("ghost-trace", "scope", "secondary", { mode: "dots", gain: 1.2, thickness: 3e-3 }, { opacity: 0.34, trigger: gate2("2bar"), envelope: fade2(0.7, 4, 6) }),
+  effect2("display", "crt", "secondary", { amount: 0.46, strength: 0.46, detail: 1.1, mix: 0.76 }, { opacity: 0.54, trigger: gate2("2bar"), envelope: fade2(0.7, 5, 6) })
+]);
+var bloom = scene2("bloom", 45312, PRISM, [
+  source2("pollen", "particles", "primary", { density: 0.78, scale: 1.4, spread: 1.35, speed: 0.62 }, { trigger: gate2("beat"), envelope: fade2(0.12, 2, 4) }),
+  source2("plate", "chladni", "secondary", { contrast: 0.6 }, { opacity: 0.28, trigger: gate2("2bar"), envelope: fade2(1, 5, 7) }),
+  effect2("soft-light", "bloom", "accent", { amount: 0.72, strength: 1.1, radius: 1.7 }, { opacity: 0.7, trigger: gate2("bar"), envelope: fade2(0.3, 3, 5), resolutionScale: 0.5 }),
+  effect2("wash", "grade", "primary", { amount: 0.3, strength: 0.25, mix: 0.5 }, { opacity: 0.3, trigger: gate2("4bar"), envelope: fade2(1, 6, 8) })
+]);
+var lattice = scene2("lattice", 27750862, GRID, [
+  source2("floor", "wavegrid", "secondary", { gain: 0.74, density: 1.2 }, { trigger: gate2("bar"), envelope: fade2(0.5, 4, 6) }),
+  source2("cells", "voronoi", "primary", { density: 1.1, scale: 0.94, spread: 0.75, speed: 0.44 }, { opacity: 0.48, trigger: gate2("2bar"), envelope: fade2(0.7, 5, 7) }),
+  effect2("panels", "tile", "accent", { amount: 0.32, mix: 0.3, detail: 1.1 }, { opacity: 0.36, trigger: gate2("4bar"), envelope: fade2(1, 6, 8) }),
+  effect2("shear", "displace", "secondary", { amount: 0.28, strength: 0.46, radius: 0.9, detail: 1.3, speed: 0.65 }, { opacity: 0.38, trigger: gate2("bar"), envelope: fade2(0.25, 2.5, 4) })
+]);
+var rotor = scene2("rotor", 459015, SIGNAL, [
+  source2("sweep", "radialbars", "primary", { bars: 52, gain: 1, gamma: 0.64, reach: 0.34, spinBars: 20 }, { trigger: gate2("beat"), envelope: fade2(0.06, 1.5, 3) }),
+  source2("coil", "spiral", "secondary", { turns: 4.5, thickness: 3e-3, spinBars: 18 }, { opacity: 0.42, trigger: gate2("bar"), envelope: fade2(0.4, 3, 5) }),
+  effect2("orbit", "polar", "accent", { amount: 0.4, mix: 0.34, radius: 1.2 }, { opacity: 0.43, trigger: gate2("2bar"), envelope: fade2(0.8, 5, 7) }),
+  effect2("split-beam", "chromatic", "secondary", { amount: 0.28, strength: 0.45, radius: 1.1, speed: 0.4 }, { opacity: 0.34, trigger: gate2("4bar"), envelope: fade2(1, 6, 8) })
+]);
+var velocity = scene2("velocity", 14748695, ABYSS, [
+  source2("warp-cage", "hypercylinder", "primary", { density: 1.05, detail: 1.15, spread: 1.05, speed: 1.15 }, { trigger: gate2("beat"), envelope: fade2(0.06, 1.3, 3) }),
+  source2("tunnel", "gridtunnel", "secondary", { density: 0.85, detail: 0.9, spread: 0.8, speed: 0.66 }, { opacity: 0.48, trigger: gate2("bar"), envelope: fade2(0.5, 4, 6) }),
+  trail("wake", "primary", { tauBeats: 1.6, gain: 0.45, zoomPerBeat: 1.012, clipKnee: 0.7, clipCeiling: 1.08 }, { opacity: 0.43, trigger: gate2("beat"), envelope: fade2(0.08, 2, 4), resolutionScale: 0.5 }),
+  effect2("beam-warp", "scanwarp", "secondary", { amount: 0.28, strength: 0.42, radius: 0.9, detail: 0.75, speed: 0.55, mix: 0.45 }, { opacity: 0.36, trigger: gate2("2bar"), envelope: fade2(0.6, 4, 6) })
+]);
+var flora = scene2("flora", 987162, PRISM, [
+  source2("petals", "butterfly", "primary", { gain: 1.18, spread: 1.28 }, { trigger: gate2("beat"), envelope: fade2(0.12, 2, 4.5) }),
+  source2("plate", "chladni", "secondary", { contrast: 0.55 }, { opacity: 0.24, trigger: gate2("2bar"), envelope: fade2(0.8, 5, 7) }),
+  effect2("nectar", "bloom", "accent", { amount: 0.56, strength: 0.82, radius: 1.5 }, { opacity: 0.6, trigger: gate2("bar"), envelope: fade2(0.4, 3, 5), resolutionScale: 0.5 }),
+  effect2("petal-tone", "grade", "primary", { amount: 0.26, strength: 0.4, mix: 0.48 }, { opacity: 0.32, trigger: gate2("4bar"), envelope: fade2(1, 6, 8) })
+]);
+var ghost = scene2("ghost", 434263, ABYSS, [
+  source2("map", "clifford", "primary", { brightBase: 0.08, brightLevel: 0.16, thickness: 2e-3 }, { trigger: gate2("beat"), envelope: fade2(0.1, 1.7, 4) }),
+  source2("memory", "waterfall", "secondary", { gain: 0.68, speed: 0.32 }, { opacity: 0.4, trigger: gate2("2bar"), envelope: fade2(0.8, 5, 7) }),
+  trail("residue", "secondary", { tauBeats: 2.8, gain: 0.35, zoomPerBeat: 0.994, clipKnee: 0.66, clipCeiling: 1.03 }, { opacity: 0.38, trigger: gate2("bar"), envelope: fade2(0.5, 4, 8), resolutionScale: 0.5 }),
+  effect2("monitor", "crt", "secondary", { amount: 0.4, strength: 0.38, detail: 0.7, mix: 0.68 }, { opacity: 0.4, trigger: gate2("4bar"), envelope: fade2(1, 6, 8) })
+]);
+var atlas = scene2("atlas", 684453, GRID, [
+  source2("map", "dejong", "primary", { brightBase: 0.06, brightLevel: 0.14, thickness: 2e-3 }, { trigger: gate2("beat"), envelope: fade2(0.12, 1.8, 4) }),
+  source2("longitude", "wavegrid", "secondary", { gain: 0.5, density: 0.65 }, { opacity: 0.45, trigger: gate2("2bar"), envelope: fade2(0.8, 5, 7) }),
+  effect2("folds", "tile", "accent", { amount: 0.26, mix: 0.3, detail: 0.8 }, { opacity: 0.3, trigger: gate2("4bar"), envelope: fade2(1, 6, 8) }),
+  effect2("map-ink", "grade", "primary", { amount: 0.38, strength: 0.55, mix: 0.35 }, { opacity: 0.4, trigger: gate2("bar"), envelope: fade2(0.4, 3, 5) })
+]);
+var ember = scene2("ember", 953314, SIGNAL, [
+  source2("cinder-flow", "halvorsen", "primary", { brightBase: 0.08, brightLevel: 0.18, thickness: 2e-3 }, { trigger: gate2("beat"), envelope: fade2(0.08, 1.5, 3.5) }),
+  source2("sparks", "particles", "accent", { density: 1.45, scale: 0.82, spread: 0.75, speed: 1 }, { opacity: 0.48, trigger: gate2("beat"), envelope: fade2(0.04, 1, 2.4) }),
+  effect2("firelight", "bloom", "accent", { amount: 0.66, strength: 1, radius: 1.2 }, { opacity: 0.62, trigger: gate2("bar"), envelope: fade2(0.3, 3, 5), resolutionScale: 0.5 }),
+  effect2("scan", "crt", "secondary", { amount: 0.22, strength: 0.25, detail: 0.85, mix: 0.42 }, { opacity: 0.25, trigger: gate2("4bar"), envelope: fade2(1, 6, 8) })
+]);
+var pulse = scene2("pulse", 987486, RAVE, [
+  source2("meter", "spectrum", "accent", { bars: 64, gain: 1, gamma: 0.64, height: 0.42 }, { trigger: gate2("beat"), envelope: fade2(0.04, 1.1, 2.4) }),
+  source2("ring", "radialbars", "secondary", { bars: 36, gain: 0.82, gamma: 0.74, reach: 0.28 }, { opacity: 0.45, trigger: gate2("bar"), envelope: fade2(0.4, 3, 5) }),
+  trail("echo", "primary", { tauBeats: 1.3, gain: 0.58, zoomPerBeat: 1.022, clipKnee: 0.72, clipCeiling: 1.14 }, { opacity: 0.5, trigger: gate2("beat"), envelope: fade2(0.08, 2, 4), resolutionScale: 0.5 }),
+  effect2("dropout", "glitch", "secondary", { amount: 0.34, strength: 0.64, detail: 1.35, speed: 1.4, mix: 0.76 }, { opacity: 0.42, trigger: gate2("bar"), envelope: fade2(0.04, 1.2, 2) })
+]);
+var veins = scene2("veins", 778661, LAB, [
+  source2("flow", "lorenz", "primary", { brightBase: 0.07, brightLevel: 0.15, thickness: 2e-3 }, { trigger: gate2("beat"), envelope: fade2(0.1, 1.6, 4) }),
+  source2("filament", "spiral", "secondary", { turns: 5.5, thickness: 25e-4, spinBars: 28 }, { opacity: 0.35, trigger: gate2("2bar"), envelope: fade2(0.7, 5, 7) }),
+  effect2("reflection", "mirror", "secondary", { amount: 0.26, mix: 0.28, softenPx: 1.2 }, { opacity: 0.3, trigger: gate2("4bar"), envelope: fade2(1, 6, 8) }),
+  effect2("ink", "grade", "primary", { amount: 0.3, strength: 0.52, mix: 0.45 }, { opacity: 0.34, trigger: gate2("bar"), envelope: fade2(0.4, 3, 5) })
+]);
+var kinetic = scene2("kinetic", 452380, PRISM, [
+  source2("emitter", "particles", "primary", { density: 1.28, scale: 0.88, spread: 1, speed: 1.25 }, { trigger: gate2("beat"), envelope: fade2(0.04, 1.2, 2.8) }),
+  source2("trail-ribbon", "ribbon", "secondary", { gain: 0.82, thickness: 9e-3, speed: 1.2 }, { opacity: 0.4, trigger: gate2("bar"), envelope: fade2(0.35, 3, 5) }),
+  effect2("lens", "chromatic", "secondary", { amount: 0.42, strength: 0.68, radius: 1.4, speed: 0.7 }, { opacity: 0.45, trigger: gate2("2bar"), envelope: fade2(0.7, 5, 7) }),
+  effect2("lift", "bloom", "accent", { amount: 0.54, strength: 0.95, radius: 1.35 }, { opacity: 0.6, trigger: gate2("bar"), envelope: fade2(0.3, 3, 5), resolutionScale: 0.5 })
+]);
+var vector = scene2("vector", 60528, LAB, [
+  source2("warp-cylinder", "hypercylinder", "primary", { density: 0.82, detail: 1.4, spread: 1.1, speed: 0.58 }, { trigger: gate2("beat"), envelope: fade2(0.06, 1.4, 3.2) }),
+  source2("carrier", "lissajous", "accent", { scale: 1.3, detail: 1.7, spread: 1.1, speed: 0.58 }, { opacity: 0.3, trigger: gate2("beat"), envelope: fade2(0.05, 1.1, 2.5) }),
+  effect2("vector-halo", "neon", "primary", { amount: 0.5, strength: 0.7, radius: 1.2, detail: 0.9, mix: 0.62 }, { opacity: 0.48, trigger: gate2("bar"), envelope: fade2(0.3, 3, 5), resolutionScale: 0.5 }),
+  effect2("tube", "crt", "secondary", { amount: 0.36, strength: 0.45, detail: 1.1, mix: 0.72 }, { opacity: 0.42, trigger: gate2("2bar"), envelope: fade2(0.7, 5, 7) })
+]);
+var organism = scene2("organism", 682513, ABYSS, [
+  source2("skin", "reaction", "primary", { scale: 1, density: 0.9, detail: 1.45, speed: 0.48 }, { trigger: gate2("beat"), envelope: fade2(0.18, 2, 5), resolutionScale: 0.5 }),
+  source2("membrane", "voronoi", "secondary", { density: 0.72, scale: 1.25, spread: 0.75, speed: 0.36 }, { opacity: 0.4, trigger: gate2("2bar"), envelope: fade2(0.8, 5, 7) }),
+  effect2("membrane-warp", "displace", "secondary", { amount: 0.28, strength: 0.42, radius: 0.9, detail: 1.15, speed: 0.45 }, { opacity: 0.32, trigger: gate2("bar"), envelope: fade2(0.4, 3, 5) }),
+  effect2("biolume", "bloom", "accent", { amount: 0.54, strength: 0.75, radius: 1.65 }, { opacity: 0.56, trigger: gate2("2bar"), envelope: fade2(0.7, 5, 7), resolutionScale: 0.5 })
+]);
+var fracture = scene2("fracture", 993991, RAVE, [
+  source2("shards", "voronoi", "primary", { density: 1.4, scale: 0.85, spread: 1.1, speed: 1.1 }, { trigger: gate2("beat"), envelope: fade2(0.06, 1.4, 3) }),
+  source2("pressure", "reaction", "secondary", { scale: 0.75, density: 1.55, detail: 1.6, speed: 1.3 }, { opacity: 0.32, trigger: gate2("bar"), envelope: fade2(0.35, 3, 5), resolutionScale: 0.5 }),
+  effect2("fracture-warp", "displace", "secondary", { amount: 0.42, strength: 0.74, radius: 1.15, detail: 1.6, speed: 1.2 }, { opacity: 0.5, trigger: gate2("beat", 3, 4), envelope: fade2(0.04, 0.8, 2) }),
+  effect2("loss", "glitch", "accent", { amount: 0.44, strength: 0.82, detail: 1.3, speed: 1.7, mix: 0.75 }, { opacity: 0.52, trigger: gate2("bar", 1, 2), envelope: fade2(0.04, 0.9, 1.8) })
+]);
+var PRESET_BANK = V2_PRESET_BANK;
+
+// src/gputimer.ts
+var MAX_PASSES = 48;
+var STAGING_SLOTS = 3;
+var WINDOW2 = 32;
+var ALIGN = 256;
+var Rolling = class {
+  buf = new Float64Array(WINDOW2);
+  i = 0;
+  n = 0;
+  sum = 0;
+  push(v) {
+    this.sum += v - (this.buf[this.i] ?? 0);
+    this.buf[this.i] = v;
+    this.i = (this.i + 1) % WINDOW2;
+    if (this.n < WINDOW2) this.n++;
+  }
+  get avg() {
+    return this.n ? this.sum / this.n : 0;
+  }
+};
+var GpuTimer = class {
+  /** False when the adapter lacks `timestamp-query`. Every method is then a no-op. */
+  enabled;
+  device;
+  querySet = null;
+  resolveBuf = null;
+  slots = [];
+  /**
+   * Insertion-ordered so the overlay lists passes in the order they run.
+   * Rebuilt (not merely appended to) whenever the pass list changes, because a
+   * Map that only ever grows keeps reporting a layer that was deleted three
+   * presets ago, and it reports it in the order it was FIRST seen rather than
+   * the order the passes now run in.
+   */
+  averages = /* @__PURE__ */ new Map();
+  /** Rebuilt only when a readback lands, so the per-frame read allocates nothing. */
+  cached = [];
+  /** Label list `averages` was last built from, for the change check above. */
+  averagesFor = [];
+  /** Set by `destroy`. A map in flight resolves against a buffer that is gone. */
+  disposed = false;
+  /** Pairs claimed this frame. Reset by `beginFrame`. */
+  used = 0;
+  frameLabels = [];
+  constructor(device2, hasTimestamp) {
+    this.device = device2;
+    this.enabled = hasTimestamp;
+    if (!hasTimestamp) return;
+    this.querySet = device2.createQuerySet({
+      label: "gputimer-queries",
+      type: "timestamp",
+      count: MAX_PASSES * 2
+    });
+    const bytes = align(MAX_PASSES * 2 * 8);
+    this.resolveBuf = device2.createBuffer({
+      label: "gputimer-resolve",
+      size: bytes,
+      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC
+    });
+    for (let i = 0; i < STAGING_SLOTS; i++) {
+      this.slots.push({
+        buffer: device2.createBuffer({
+          label: `gputimer-staging-${i}`,
+          size: bytes,
+          usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        }),
+        state: "free",
+        labels: [],
+        count: 0,
+        awaitingMap: false
+      });
+    }
+  }
+  /** Call once per frame before encoding anything. Cheap; safe when disabled. */
+  beginFrame() {
+    this.used = 0;
+    if (this.frameLabels.length) this.frameLabels = [];
+  }
+  /**
+   * Timed replacement for `beginPass` in `gpu.ts` — same signature deliberately,
+   * so instrumenting a pass is a one-word edit and un-instrumenting it is too.
+   */
+  beginPass(encoder, view, label, load = "clear") {
+    const pair = this.claim(label);
+    return encoder.beginRenderPass({
+      label,
+      colorAttachments: [{
+        view,
+        loadOp: load,
+        storeOp: "store",
+        clearValue: { r: 0, g: 0, b: 0, a: 1 }
+      }],
+      ...pair === null || this.querySet === null ? {} : {
+        timestampWrites: {
+          querySet: this.querySet,
+          beginningOfPassWriteIndex: pair * 2,
+          endOfPassWriteIndex: pair * 2 + 1
+        }
+      }
+    });
+  }
+  beginComputePass(encoder, label) {
+    const pair = this.claim(label);
+    return encoder.beginComputePass({
+      label,
+      ...pair === null || this.querySet === null ? {} : {
+        timestampWrites: {
+          querySet: this.querySet,
+          beginningOfPassWriteIndex: pair * 2,
+          endOfPassWriteIndex: pair * 2 + 1
+        }
+      }
+    });
+  }
+  /**
+   * Symmetry with `beginPass`. It only calls `end()` today, but every call site
+   * going through here means a future change (nested timers, pass merging per
+   * §4.11) needs no edits at the call sites.
+   */
+  endPass(pass6) {
+    pass6.end();
+  }
+  /**
+   * Encode the resolve and the copy. Must be the last thing on the encoder,
+   * before `finish()`.
+   */
+  endFrame(encoder) {
+    if (!this.enabled || this.used === 0) return;
+    const querySet = this.querySet;
+    const resolve = this.resolveBuf;
+    if (!querySet || !resolve) return;
+    const count = this.used * 2;
+    encoder.resolveQuerySet(querySet, 0, count, resolve, 0);
+    const slot2 = this.slots.find((s) => s.state === "free");
+    if (!slot2) return;
+    encoder.copyBufferToBuffer(resolve, 0, slot2.buffer, 0, count * 8);
+    slot2.state = "busy";
+    slot2.count = count;
+    slot2.labels = this.frameLabels;
+    this.frameLabels = [];
+    slot2.awaitingMap = true;
+  }
+  /**
+   * Call AFTER `queue.submit()`. This is not stylistic: `mapAsync` marks the
+   * buffer pending immediately, and submitting a command buffer that writes to
+   * a pending-map buffer is a validation error. Mapping before the submit
+   * therefore breaks the very copy it is trying to read.
+   */
+  poll() {
+    if (!this.enabled) return;
+    for (const slot2 of this.slots) {
+      if (!slot2.awaitingMap || slot2.state !== "busy") continue;
+      slot2.awaitingMap = false;
+      const bytes = slot2.count * 8;
+      slot2.buffer.mapAsync(GPUMapMode.READ, 0, bytes).then(
+        () => {
+          if (this.disposed || slot2.state !== "busy") return;
+          try {
+            this.consume(slot2, bytes);
+          } finally {
+            slot2.buffer.unmap();
+            slot2.state = "free";
+          }
+        },
+        () => {
+          slot2.state = "dead";
+        }
+      );
+    }
+  }
+  /** Rolling averages, one per pass label, in the order the passes were encoded. */
+  get timings() {
+    return this.cached;
+  }
+  /** Sum of the averages. What to compare against the 8.33 ms budget. */
+  get totalMs() {
+    let ms = 0;
+    for (const t of this.cached) ms += t.ms;
+    return ms;
+  }
+  destroy() {
+    this.disposed = true;
+    for (const slot2 of this.slots) {
+      if (slot2.state !== "dead") slot2.buffer.destroy();
+      slot2.state = "dead";
+    }
+    this.slots.length = 0;
+    this.resolveBuf?.destroy();
+    this.querySet?.destroy();
+    this.resolveBuf = null;
+    this.querySet = null;
+    this.averages.clear();
+    this.averagesFor = [];
+    this.cached = [];
+  }
+  // -- internals ----------------------------------------------------------
+  /** Returns the query-pair index for a pass, or null when untimed. */
+  claim(label) {
+    if (!this.enabled || this.used >= MAX_PASSES) return null;
+    const pair = this.used++;
+    let key = label;
+    for (let n = 2; this.frameLabels.includes(key); n++) key = `${label}#${n}`;
+    this.frameLabels.push(key);
+    return pair;
+  }
+  consume(slot2, bytes) {
+    const raw = new BigUint64Array(slot2.buffer.getMappedRange(0, bytes));
+    if (!sameLabels(this.averagesFor, slot2.labels)) {
+      const next = /* @__PURE__ */ new Map();
+      for (const label of slot2.labels) next.set(label, this.averages.get(label) ?? new Rolling());
+      this.averages = next;
+      this.averagesFor = slot2.labels;
+    }
+    for (let i = 0; i < slot2.labels.length; i++) {
+      const a = raw[i * 2];
+      const b = raw[i * 2 + 1];
+      const label = slot2.labels[i];
+      if (a === void 0 || b === void 0 || label === void 0) continue;
+      if (b < a) continue;
+      const ms = Number(b - a) / 1e6;
+      if (!Number.isFinite(ms) || ms > 1e3) continue;
+      this.averages.get(label)?.push(ms);
+    }
+    this.cached = [];
+    for (const [label, roll] of this.averages) this.cached.push({ label, ms: roll.avg });
+  }
+};
+function align(bytes) {
+  return Math.ceil(bytes / ALIGN) * ALIGN;
+}
+function sameLabels(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+// src/debug.ts
+var FONT = '11px ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace';
+var FONT_BOLD = '600 11px ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace';
+var FG = "#e9e9f2";
+var DIM = "#8a8aa0";
+var LINE = "rgba(255,255,255,.12)";
+var PANEL_BG = "rgba(10,10,18,.82)";
+var ACCENT = "#ff3d81";
+var LEFT_CH = "#6ee7ff";
+var RIGHT_CH = "#ff3d81";
+var CLASS_COLOUR = {
+  kick: "#ff3d81",
+  snare: "#ffd166",
+  hat: "#6ee7ff",
+  tonal: "#a78bfa"
+};
+var BAND_ORDER2 = ["sub", "low", "mid", "high", "air"];
+var BAND_HZ = {
+  sub: "20-80",
+  low: "80-250",
+  mid: "250-2k",
+  high: "2k-8k",
+  air: "8k-20k"
+};
+var PLOT_SEC = 4;
+var HISTORY = 1024;
+var ONSET_HISTORY = 128;
+var F_MIN = 30;
+var GRAM_ROWS = 128;
+var PAD = 10;
+var GAP = 8;
+var COL_W = 330;
+var TITLE_H = 15;
+var DebugOverlay = class {
+  canvas;
+  ctx;
+  vis = false;
+  // Flux history is recorded only while visible. Toggling on therefore starts
+  // with an empty plot that fills over PLOT_SEC, which is the price of the
+  // overlay costing nothing when hidden — and it is the right trade, because a
+  // ring being written every frame forever is exactly the kind of "small"
+  // constant cost that the 8.33 ms budget cannot afford.
+  hist = [];
+  onsets = [];
+  lastTime = 0;
+  // Spectrogram scratch. Sized once, reused; rebuilt per frame because the ring
+  // rotates under us and a shift-and-append would have to reorder anyway.
+  gram = null;
+  gramCtx = null;
+  gramImg = null;
+  /** Output row -> source bin, for the log-frequency y axis. Rebuilt when the shape changes. */
+  gramBins = null;
+  gramKey = "";
+  constructor(host = document.body) {
+    const c = document.createElement("canvas");
+    c.id = "debug-overlay";
+    c.style.cssText = "position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none;display:none;z-index:10";
+    host.appendChild(c);
+    const ctx = c.getContext("2d");
+    if (!ctx) throw new Error("Could not acquire a 2d context for the debug overlay.");
+    this.canvas = c;
+    this.ctx = ctx;
+  }
+  get visible() {
+    return this.vis;
+  }
+  setVisible(v) {
+    this.vis = v;
+    this.canvas.style.display = v ? "block" : "none";
+    if (!v) {
+      this.hist.length = 0;
+    }
+  }
+  toggle() {
+    this.setVisible(!this.vis);
+  }
+  /**
+   * Wire to `AudioEngine.onOnset`. Kept even while hidden — it is a handful of
+   * writes a second, and it means the markers are already there the moment the
+   * overlay comes up, which is when you want them.
+   */
+  pushOnset(o) {
+    this.onsets.push(o);
+    if (this.onsets.length > ONSET_HISTORY) this.onsets.shift();
+  }
+  destroy() {
+    this.canvas.remove();
+  }
+  draw(d) {
+    if (!this.vis) return;
+    const a = d.audio;
+    if (a.time < this.lastTime - 1e-3) {
+      this.hist.length = 0;
+      this.onsets.length = 0;
+    }
+    this.lastTime = a.time;
+    this.hist.push({ t: a.time, flux: d.flux, thresh: d.threshold });
+    if (this.hist.length > HISTORY) this.hist.shift();
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    const pw = Math.round(w * dpr);
+    const ph = Math.round(h * dpr);
+    if (this.canvas.width !== pw || this.canvas.height !== ph) {
+      this.canvas.width = pw;
+      this.canvas.height = ph;
+    }
+    const ctx = this.ctx;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.font = FONT;
+    ctx.textBaseline = "top";
+    const specN = a.spectrum.length >> 1;
+    const nyquist = d.sampleRate / 2;
+    let x = PAD;
+    let y = PAD;
+    const panel = (title, ph2, body) => {
+      if (y + ph2 + TITLE_H > h - PAD && y > PAD) {
+        x += COL_W + GAP;
+        y = PAD;
+      }
+      if (x + COL_W > w) return;
+      const total = ph2 + TITLE_H;
+      ctx.fillStyle = PANEL_BG;
+      ctx.strokeStyle = LINE;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(x + 0.5, y + 0.5, COL_W - 1, total - 1, 6);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = DIM;
+      ctx.font = FONT_BOLD;
+      ctx.fillText(title, x + 8, y + 4);
+      ctx.font = FONT;
+      body(x + 8, y + TITLE_H, COL_W - 16, ph2 - 6);
+      y += total + GAP;
+    };
+    panel("state", 74, (bx, by, bw) => this.drawScalars(bx, by, bw, d));
+    panel("waveform  L / R", 92, (bx, by, bw, bh) => this.drawWaveform(bx, by, bw, bh, a));
+    panel("spectrum  L up / R down  (log f)", 108, (bx, by, bw, bh) => this.drawSpectrum(bx, by, bw, bh, a, specN, nyquist));
+    panel("spectrogram  (oldest left, log f)", 116, (bx, by, bw, bh) => this.drawSpectrogram(bx, by, bw, bh, a, specN, nyquist));
+    panel("bands", 78, (bx, by, bw, bh) => this.drawBands(bx, by, bw, bh, a));
+    panel("stereo field  (per-bin pan)", 74, (bx, by, bw, bh) => this.drawStereoField(bx, by, bw, bh, a, specN, nyquist));
+    panel("flux vs threshold  +  onsets", 132, (bx, by, bw, bh) => this.drawFlux(bx, by, bw, bh, a.time));
+    const rows = Math.max(1, d.timings.length) + 1;
+    panel("gpu passes  (rolling avg)", 6 + rows * 13, (bx, by, bw, bh) => this.drawTimings(bx, by, bw, bh, d.timings));
+  }
+  // -- panels ---------------------------------------------------------------
+  drawScalars(x, y, w, d) {
+    const a = d.audio;
+    const rows = [
+      ["clock", `${a.time.toFixed(2)}s`],
+      ["fps", d.fps.toFixed(0)],
+      ["bpm", d.tempoLocked ? `${d.bpm.toFixed(1)} (${d.confidence * 100 | 0}%)` : "listening"],
+      ["level", a.level.toFixed(3)],
+      ["beat", a.beat.toFixed(3)],
+      ["pan", signed(a.pan)],
+      ["width", a.width.toFixed(3)],
+      ["crest", a.crest.toFixed(2)],
+      ["centroid", a.centroid.toFixed(3)],
+      ["flatness", a.flatness.toFixed(3)]
+    ];
+    const ctx = this.ctx;
+    const half = w / 2;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const cx = x + i % 2 * half;
+      const cy = y + Math.floor(i / 2) * 13;
+      ctx.fillStyle = DIM;
+      ctx.fillText(row[0], cx, cy);
+      ctx.fillStyle = FG;
+      ctx.fillText(row[1], cx + 62, cy);
+    }
+  }
+  drawWaveform(x, y, w, h, a) {
+    const ctx = this.ctx;
+    const n = a.waveform.length >> 1;
+    const half = h / 2;
+    for (let ch = 0; ch < 2; ch++) {
+      const mid = y + half * ch + half / 2;
+      ctx.strokeStyle = LINE;
+      ctx.beginPath();
+      ctx.moveTo(x, mid + 0.5);
+      ctx.lineTo(x + w, mid + 0.5);
+      ctx.stroke();
+      ctx.strokeStyle = ch === 0 ? LEFT_CH : RIGHT_CH;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let i = 0; i < w; i++) {
+        const s = a.waveform[(i / w * n | 0) * 2 + ch] ?? 0;
+        const py = mid - clampSigned2(s) * (half / 2 - 2);
+        if (i === 0) ctx.moveTo(x + i, py);
+        else ctx.lineTo(x + i, py);
+      }
+      ctx.stroke();
+      ctx.fillStyle = DIM;
+      ctx.fillText(ch === 0 ? "L" : "R", x + 2, mid - half / 2 + 1);
+    }
+  }
+  drawSpectrum(x, y, w, h, a, specN, nyquist) {
+    const ctx = this.ctx;
+    const mid = y + h / 2;
+    const half = h / 2 - 7;
+    this.freqGrid(x, y, w, h, nyquist);
+    for (let i = 0; i < specN; i++) {
+      const f0 = i * nyquist / specN;
+      const f1 = (i + 1) * nyquist / specN;
+      const x0 = x + logX(f0, nyquist) * w;
+      const x1 = x + logX(f1, nyquist) * w;
+      const bw = Math.max(1, x1 - x0);
+      const L = a.spectrum[i * 2] ?? 0;
+      const R = a.spectrum[i * 2 + 1] ?? 0;
+      ctx.fillStyle = LEFT_CH;
+      ctx.fillRect(x0, mid - L * half, bw, L * half);
+      ctx.fillStyle = RIGHT_CH;
+      ctx.fillRect(x0, mid, bw, R * half);
+      const p = a.peaks[i] ?? 0;
+      if (p > 0.01) {
+        ctx.fillStyle = FG;
+        ctx.fillRect(x0, mid - p * half - 1, bw, 1);
+      }
+    }
+    ctx.strokeStyle = LINE;
+    ctx.beginPath();
+    ctx.moveTo(x, mid + 0.5);
+    ctx.lineTo(x + w, mid + 0.5);
+    ctx.stroke();
+  }
+  drawSpectrogram(x, y, w, h, a, specN, nyquist) {
+    const rows = specN > 0 ? Math.floor(a.spectrogram.length / specN) : 0;
+    if (rows < 2) return;
+    const ctx = this.ctx;
+    const img = this.ensureGram(rows, specN, nyquist);
+    if (!img || !this.gram || !this.gramCtx || !this.gramBins) return;
+    const bins = this.gramBins;
+    const px = img.data;
+    const start = a.spectrogramRow;
+    for (let c = 0; c < rows; c++) {
+      const srcRow = (start + c) % rows * specN;
+      for (let r = 0; r < GRAM_ROWS; r++) {
+        const v = a.spectrogram[srcRow + (bins[r] ?? 0)] ?? 0;
+        const o = (r * rows + c) * 4;
+        heat(v, px, o);
+      }
+    }
+    this.gramCtx.putImageData(img, 0, 0);
+    ctx.save();
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(this.gram, x, y, w, h);
+    ctx.restore();
+    ctx.strokeStyle = LINE;
+    ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+  }
+  drawBands(x, y, w, h, a) {
+    const ctx = this.ctx;
+    const rowH = h / BAND_ORDER2.length;
+    for (let i = 0; i < BAND_ORDER2.length; i++) {
+      const name = BAND_ORDER2[i];
+      const v = a.bands[name];
+      const by = y + i * rowH;
+      ctx.fillStyle = DIM;
+      ctx.fillText(name, x, by);
+      ctx.fillText(BAND_HZ[name], x + 34, by);
+      const barX = x + 96;
+      const barW = w - 96 - 34;
+      ctx.fillStyle = LINE;
+      ctx.fillRect(barX, by + 1, barW, rowH - 4);
+      ctx.fillStyle = ACCENT;
+      ctx.fillRect(barX, by + 1, barW * clamp013(v), rowH - 4);
+      ctx.fillStyle = FG;
+      ctx.fillText(v.toFixed(2), barX + barW + 4, by);
+    }
+  }
+  drawStereoField(x, y, w, h, a, specN, nyquist) {
+    const ctx = this.ctx;
+    const mid = y + h / 2;
+    const half = h / 2 - 2;
+    this.freqGrid(x, y, w, h, nyquist);
+    ctx.strokeStyle = LINE;
+    ctx.beginPath();
+    ctx.moveTo(x, mid + 0.5);
+    ctx.lineTo(x + w, mid + 0.5);
+    ctx.stroke();
+    for (let i = 0; i < specN; i++) {
+      const L = a.spectrum[i * 2] ?? 0;
+      const R = a.spectrum[i * 2 + 1] ?? 0;
+      const mag = (L + R) * 0.5;
+      if (mag < 0.02) continue;
+      const f = (i + 0.5) * nyquist / specN;
+      const px = x + logX(f, nyquist) * w;
+      const py = mid - clampSigned2(a.bandPan[i] ?? 0) * half;
+      ctx.fillStyle = `rgba(233,233,242,${(0.25 + mag * 0.75).toFixed(3)})`;
+      ctx.fillRect(px, py - 1, 2, 2);
+    }
+    ctx.fillStyle = DIM;
+    ctx.fillText("L", x + 2, y);
+    ctx.fillText("R", x + 2, y + h - 12);
+  }
+  /**
+   * The panel the kick bug is diagnosed in. Flux, its adaptive threshold, and
+   * the onsets that actually fired, on one time axis — so "it fired here, and
+   * it was classified as that" is a single glance rather than an inference from
+   * two counters.
+   */
+  drawFlux(x, y, w, h, now) {
+    const ctx = this.ctx;
+    const t0 = now - PLOT_SEC;
+    const laneH = 16;
+    const plotY = y + laneH;
+    const plotH = h - laneH - 12;
+    let peak = 0.02;
+    for (const s of this.hist) {
+      if (s.t < t0) continue;
+      if (s.flux > peak) peak = s.flux;
+      if (s.thresh > peak) peak = s.thresh;
+    }
+    peak *= 1.15;
+    const px = (t) => x + (t - t0) / PLOT_SEC * w;
+    const py = (v) => plotY + plotH - clamp013(v / peak) * plotH;
+    ctx.strokeStyle = LINE;
+    ctx.strokeRect(x + 0.5, plotY + 0.5, w - 1, plotH - 1);
+    for (const o of this.onsets) {
+      if (o.time < t0) continue;
+      const ox = px(o.time);
+      ctx.strokeStyle = CLASS_COLOUR[o.klass];
+      ctx.globalAlpha = 0.35 + o.strength * 0.5;
+      ctx.beginPath();
+      ctx.moveTo(ox + 0.5, plotY);
+      ctx.lineTo(ox + 0.5, plotY + plotH);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = CLASS_COLOUR[o.klass];
+      ctx.fillRect(ox - 1, y + laneH - 6 - o.strength * 8, 3, 4 + o.strength * 8);
+    }
+    for (const [key, colour] of [["thresh", ACCENT], ["flux", FG]]) {
+      ctx.strokeStyle = colour;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      let started = false;
+      for (const s of this.hist) {
+        if (s.t < t0) continue;
+        const vy = py(key === "flux" ? s.flux : s.thresh);
+        if (!started) {
+          ctx.moveTo(px(s.t), vy);
+          started = true;
+        } else ctx.lineTo(px(s.t), vy);
+      }
+      ctx.stroke();
+    }
+    const counts = { kick: 0, snare: 0, hat: 0, tonal: 0 };
+    for (const o of this.onsets) if (o.time >= t0) counts[o.klass]++;
+    let lx = x;
+    const legendY = plotY + plotH + 1;
+    for (const k of ["kick", "snare", "hat", "tonal"]) {
+      ctx.fillStyle = CLASS_COLOUR[k];
+      ctx.fillRect(lx, legendY + 4, 6, 6);
+      ctx.fillStyle = counts[k] ? FG : DIM;
+      const label = `${k} ${counts[k]}`;
+      ctx.fillText(label, lx + 9, legendY);
+      lx += 12 + ctx.measureText(label).width;
+    }
+    ctx.fillStyle = DIM;
+    ctx.textAlign = "right";
+    ctx.fillText(`peak ${peak.toFixed(3)} \xB7 ${PLOT_SEC}s`, x + w, legendY);
+    ctx.textAlign = "left";
+  }
+  drawTimings(x, y, w, h, timings) {
+    void h;
+    const ctx = this.ctx;
+    if (timings.length === 0) {
+      ctx.fillStyle = DIM;
+      ctx.fillText("no timestamp-query, or no samples yet", x, y);
+      return;
+    }
+    let total = 0;
+    for (const t of timings) total += t.ms;
+    const scale = Math.max(total, 8.33);
+    const barX = x + 110;
+    const barW = w - 110 - 46;
+    for (let i = 0; i < timings.length; i++) {
+      const t = timings[i];
+      const ty2 = y + i * 13;
+      ctx.fillStyle = DIM;
+      ctx.fillText(t.label.slice(0, 16), x, ty2);
+      ctx.fillStyle = LINE;
+      ctx.fillRect(barX, ty2 + 2, barW, 7);
+      ctx.fillStyle = LEFT_CH;
+      ctx.fillRect(barX, ty2 + 2, barW * clamp013(t.ms / scale), 7);
+      ctx.fillStyle = FG;
+      ctx.textAlign = "right";
+      ctx.fillText(t.ms.toFixed(3), x + w, ty2);
+      ctx.textAlign = "left";
+    }
+    const ty = y + timings.length * 13;
+    ctx.fillStyle = total > 8.33 ? ACCENT : DIM;
+    ctx.fillText("total / budget", x, ty);
+    ctx.textAlign = "right";
+    ctx.fillText(`${total.toFixed(3)} / 8.33 ms`, x + w, ty);
+    ctx.textAlign = "left";
+  }
+  // -- helpers --------------------------------------------------------------
+  /** Octave-ish gridlines, so a log axis is readable as frequencies rather than as a smear. */
+  freqGrid(x, y, w, h, nyquist) {
+    const ctx = this.ctx;
+    ctx.strokeStyle = "rgba(255,255,255,.06)";
+    ctx.fillStyle = "rgba(138,138,160,.7)";
+    for (const f of [100, 1e3, 1e4]) {
+      if (f >= nyquist) continue;
+      const gx = Math.round(x + logX(f, nyquist) * w) + 0.5;
+      ctx.beginPath();
+      ctx.moveTo(gx, y);
+      ctx.lineTo(gx, y + h);
+      ctx.stroke();
+      ctx.fillText(f >= 1e3 ? `${f / 1e3}k` : `${f}`, gx + 2, y + h - 12);
+    }
+  }
+  ensureGram(rows, specN, nyquist) {
+    const key = `${rows}:${specN}:${nyquist}`;
+    if (this.gramKey === key && this.gramImg) return this.gramImg;
+    const c = this.gram ?? document.createElement("canvas");
+    c.width = rows;
+    c.height = GRAM_ROWS;
+    const cx = c.getContext("2d");
+    if (!cx) return null;
+    this.gram = c;
+    this.gramCtx = cx;
+    this.gramImg = cx.createImageData(rows, GRAM_ROWS);
+    const bins = new Int32Array(GRAM_ROWS);
+    for (let r = 0; r < GRAM_ROWS; r++) {
+      const u = 1 - r / (GRAM_ROWS - 1);
+      const f = F_MIN * Math.pow(nyquist / F_MIN, u);
+      bins[r] = Math.min(specN - 1, Math.max(0, Math.round(f / nyquist * specN)));
+    }
+    this.gramBins = bins;
+    this.gramKey = key;
+    return this.gramImg;
+  }
+};
+function logX(freq, nyquist) {
+  if (freq <= F_MIN) return 0;
+  return Math.min(1, Math.log(freq / F_MIN) / Math.log(nyquist / F_MIN));
+}
+var RAMP = [
+  [0, 6, 6, 16],
+  [0.3, 52, 22, 84],
+  [0.6, 255, 61, 129],
+  [0.85, 255, 209, 102],
+  [1, 255, 255, 240]
+];
+function heat(v, out, o) {
+  const t = clamp013(v);
+  let i = 0;
+  while (i < RAMP.length - 2 && t > RAMP[i + 1][0]) i++;
+  const a = RAMP[i];
+  const b = RAMP[i + 1];
+  const span = b[0] - a[0];
+  const k = span > 0 ? (t - a[0]) / span : 0;
+  out[o] = a[1] + (b[1] - a[1]) * k;
+  out[o + 1] = a[2] + (b[2] - a[2]) * k;
+  out[o + 2] = a[3] + (b[3] - a[3]) * k;
+  out[o + 3] = 255;
+}
+function clamp013(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+function clampSigned2(v) {
+  return v < -1 ? -1 : v > 1 ? 1 : v;
+}
+function signed(v) {
+  return (v >= 0 ? "+" : "") + v.toFixed(3);
+}
+
+// src/testkit.ts
+var GOLDEN_GLOBAL = "__aaavsGolden";
+var DEFAULTS = { frames: 120, seed: 1, bpm: 128, fps: 60, width: 512, height: 512 };
+function goldenConfig(search = location.search) {
+  const q = new URLSearchParams(search);
+  if (q.get("golden") !== "1") return null;
+  const num29 = (key, fallback, lo, hi) => {
+    const raw = q.get(key);
+    if (raw === null) return fallback;
+    const v = Number(raw);
+    if (!Number.isFinite(v)) return fallback;
+    return Math.min(hi, Math.max(lo, v));
+  };
+  const fps2 = num29("fps", DEFAULTS.fps, 1, 1e3);
+  const cfg = {
+    frames: Math.round(num29("frames", DEFAULTS.frames, 1, 1e5)),
+    seed: Math.round(num29("seed", DEFAULTS.seed, 0, 4294967295)),
+    bpm: num29("bpm", DEFAULTS.bpm, 20, 400),
+    dt: 1 / fps2,
+    width: Math.round(num29("w", DEFAULTS.width, 16, 8192)),
+    height: Math.round(num29("h", DEFAULTS.height, 16, 8192))
+  };
+  forbidNondeterminism();
+  publish({ ready: false, png: "", error: "", config: cfg, rendered: 0 });
+  return cfg;
+}
+function slot() {
+  const g = globalThis;
+  return g[GOLDEN_GLOBAL] ?? { ready: false, png: "", error: "", config: null, rendered: 0 };
+}
+function publish(r) {
+  globalThis[GOLDEN_GLOBAL] = r;
+}
+function goldenFail(e) {
+  const cur = slot();
+  if (cur.error) return;
+  cur.error = e instanceof Error ? `${e.name}: ${e.message}
+${e.stack ?? ""}` : String(e);
+  publish(cur);
+}
+var SyntheticAudio = class {
+  time = 0;
+  level = 0;
+  beat = 0;
+  bands = { sub: 0, low: 0, mid: 0, high: 0, air: 0 };
+  pan = 0;
+  width = 0;
+  crest = 1;
+  centroid = 0;
+  flatness = 0;
+  waveform = new Float32Array(WAVE_N * 2);
+  spectrum = new Float32Array(SPEC_N * 2);
+  bandPan = new Float32Array(SPEC_N);
+  spectrogram = new Float32Array(SPEC_N * SPECTROGRAM_ROWS);
+  spectrogramRow = 0;
+  peaks = new Float32Array(SPEC_N);
+  /** Onsets whose time fell inside the frame most recently generated. */
+  onsets = [];
+  seed;
+  bpm;
+  beatIndex = -1;
+  constructor(seed, bpm) {
+    this.seed = hashU32(seed);
+    this.bpm = bpm;
+  }
+  /**
+   * Regenerate every field for the frame ending at `time`.
+   *
+   * The scalars, the waveform and the spectrum are pure functions of
+   * `(seed, bpm, time)`, so re-running from any frame gives the same answer for
+   * those. Three things are genuinely stateful and are NOT seekable: the
+   * peak-hold fall, the spectrogram ring, and `beatIndex` — which exists so a
+   * beat straddling a frame boundary is emitted exactly once. Calling
+   * `generate` out of order, or twice for the same frame, therefore silently
+   * drops onsets. Frames must be walked forward, once each, which is what
+   * `GoldenHarness.advance()` does.
+   */
+  generate(time, dt) {
+    this.time = time;
+    const beats = time * this.bpm / 60;
+    const prevBeats = (time - dt) * this.bpm / 60;
+    this.onsets.length = 0;
+    for (let b = Math.max(0, Math.ceil(prevBeats)); b <= Math.floor(beats); b++) {
+      if (b <= this.beatIndex) continue;
+      this.beatIndex = b;
+      const klass = PATTERN[b % PATTERN.length] ?? "kick";
+      this.onsets.push({
+        time: b * 60 / this.bpm,
+        // Varied but reproducible — a constant strength makes every bar
+        // identical and hides exactly the bugs a golden image is for.
+        strength: 0.6 + 0.4 * hash2(this.seed, b),
+        klass,
+        // SIGN: `AudioEngine.pan` is (L-R)/(L+R), so POSITIVE IS LEFT — the
+        // opposite of Web Audio's `StereoPanner.pan`, where +0.6 is right.
+        // The engine's test signal pans hats +0.6 in the graph, which comes
+        // back out of the analysers as a NEGATIVE broadband pan. This was
+        // written with the Web Audio sign and so disagreed both with the
+        // engine and with `bandPan` two dozen lines below, which was derived
+        // correctly. A stand-in that inverts a field of the thing it stands in
+        // for is worse than no stand-in.
+        pan: klass === "hat" ? -0.6 : klass === "snare" ? 0.25 : 0
+      });
+    }
+    const kick = envAt(since(beats, PATTERN, "kick"), 0.02, 0.9);
+    const snare = envAt(since(beats, PATTERN, "snare"), 0.02, 0.7);
+    const hat = envAt(since(beats, PATTERN, "hat"), 0.01, 0.25);
+    const breath = 0.5 + 0.5 * Math.sin(beats / 8 * Math.PI * 2);
+    this.beat = Math.max(kick, Math.max(snare, hat));
+    this.bands.sub = clamp2(kick * 0.95 + 0.02);
+    this.bands.low = clamp2(kick * 0.8 + breath * 0.12);
+    this.bands.mid = clamp2(snare * 0.7 + breath * 0.22);
+    this.bands.high = clamp2(hat * 0.85 + snare * 0.3 + 0.03);
+    this.bands.air = clamp2(hat * 0.7 + 0.02);
+    this.level = clamp2(0.08 + 0.7 * this.beat + 0.1 * breath);
+    this.pan = 0.25 * snare - 0.6 * hat;
+    this.width = clamp2(0.18 + 0.35 * hat + 0.15 * breath);
+    this.crest = 1.4 + 4.5 * (1 - this.beat);
+    this.centroid = clamp2(0.12 + 0.55 * hat + 0.2 * snare + 0.05 * breath);
+    this.flatness = clamp2(0.05 + 0.7 * hat + 0.25 * snare);
+    const secPerBeat = 60 / this.bpm;
+    for (let i = 0; i < WAVE_N; i++) {
+      const st = time + i / WAVE_N * (dt || 1 / 60);
+      const sb = st * this.bpm / 60;
+      const kb = since(sb, PATTERN, "kick");
+      const hz = 180 * Math.pow(45 / 180, Math.min(1, kb * secPerBeat / 0.09));
+      const body = Math.sin(st * hz * Math.PI * 2) * envAt(kb, 0.02, 0.9);
+      const fizz = (hash2(this.seed ^ 1542469173, i + Math.round(st * 44100)) * 2 - 1) * hat * 0.35;
+      this.waveform[i * 2] = clampSigned3(body + fizz * 0.4);
+      this.waveform[i * 2 + 1] = clampSigned3(body + fizz);
+    }
+    for (let i = 0; i < SPEC_N; i++) {
+      const f = i / SPEC_N;
+      const shape = kick * Math.exp(-f * 26) + snare * Math.exp(-Math.pow((f - 0.22) * 5.5, 2)) + hat * Math.pow(f, 1.6) * 0.9 + breath * 0.05 * Math.exp(-f * 4);
+      const sparkle = 0.75 + 0.5 * hash2(this.seed ^ 2654435769, i);
+      const mag = clamp2(shape * sparkle);
+      const p = clampSigned3(0.6 * hat * f - 0.25 * snare * (1 - f));
+      const l = clamp2(mag * (1 - Math.max(0, p)));
+      const r = clamp2(mag * (1 + Math.min(0, p)));
+      this.spectrum[i * 2] = l;
+      this.spectrum[i * 2 + 1] = r;
+      this.bandPan[i] = l + r > 0.01 ? (l - r) / (l + r) : 0;
+      this.peaks[i] = Math.max(mag, (this.peaks[i] ?? 0) - dt * 0.6);
+      this.spectrogram[this.spectrogramRow * SPEC_N + i] = mag;
+    }
+    this.spectrogramRow = (this.spectrogramRow + 1) % SPECTROGRAM_ROWS;
+  }
+};
+var PATTERN = ["kick", "hat", "snare", "hat"];
+function since(beats, pattern, klass) {
+  if (beats < 0) return 1e6;
+  const n = pattern.length;
+  for (let back = 0; back < n; back++) {
+    const b = Math.floor(beats) - back;
+    if (b < 0) break;
+    if (pattern[(b % n + n) % n] === klass) return beats - b;
+  }
+  return 1e6;
+}
+function envAt(sinceBeats, attack, release) {
+  if (!Number.isFinite(sinceBeats) || sinceBeats < 0 || sinceBeats > 1e5) return 0;
+  if (sinceBeats < attack) return attack > 0 ? sinceBeats / attack : 1;
+  return Math.exp(-(sinceBeats - attack) / Math.max(release, 1e-4));
+}
+var GoldenHarness = class {
+  cfg;
+  audio;
+  /** Index of the frame about to be rendered. */
+  frame = 0;
+  constructor(cfg) {
+    this.cfg = cfg;
+    this.audio = new SyntheticAudio(cfg.seed, cfg.bpm);
+    this.audio.generate(0, cfg.dt);
+  }
+  /** The fixed timestep. Pass this to the renderer INSTEAD of a rAF delta. */
+  get dt() {
+    return this.cfg.dt;
+  }
+  /**
+   * Synthetic audio-clock seconds. Multiplied, not accumulated: summing `dt`
+   * ten thousand times accumulates float error, and two runs that disagree in
+   * the last bit of `t` produce two different pictures of a chaotic system.
+   */
+  get time() {
+    return this.frame * this.cfg.dt;
+  }
+  /** True once every requested frame has been rendered. Stop the loop. */
+  get done() {
+    return this.frame >= this.cfg.frames;
+  }
+  /** Call once per rendered frame, AFTER submitting that frame's work. */
+  advance() {
+    this.frame++;
+    this.audio.generate(this.time, this.cfg.dt);
+    const cur = slot();
+    cur.rendered = this.frame;
+    publish(cur);
+  }
+  /**
+   * Capture the canvas and publish the PNG for the driver.
+   *
+   * `onSubmittedWorkDone` first, because `toDataURL` reads the canvas image and
+   * the last frame's work may still be queued. The caller MUST stop rendering
+   * before awaiting this: WebGPU canvas contents live until the next
+   * `getCurrentTexture()`, so one more frame between here and the read
+   * silently captures the wrong picture — and it would look plausible, which
+   * is the worst kind of wrong.
+   */
+  async capture(device2, canvas2) {
+    try {
+      await device2.queue.onSubmittedWorkDone();
+      const png = canvas2.toDataURL("image/png");
+      if (!png.startsWith("data:image/png")) throw new Error(`toDataURL gave "${png.slice(0, 32)}"`);
+      const cur = slot();
+      cur.png = png;
+      cur.ready = true;
+      publish(cur);
+    } catch (e) {
+      goldenFail(e);
+    }
+  }
+};
+function clamp2(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+function clampSigned3(v) {
+  return v < -1 ? -1 : v > 1 ? 1 : v;
+}
+
+// src/shaders/transition.wgsl
+var transition_default = "// Transition composite \u2014 blends the OUTGOING preset's frame into the INCOMING\n// one through a spatial mask.\n//\n// Every geometric transition is the same primitive: two rendered chains plus a\n// mask(uv, mix) in 0..1, where 0 means show the old frame and 1 means the new.\n// A crossfade is that with a constant mask. Writing them as one shader rather\n// than nine means a new wipe is a new `case`, not a new pass.\n//\n// ---------------------------------------------------------------------------\n// BINDINGS ARE NOT DECLARED HERE.\n//\n// The caller prepends `PASS_COMMON_WGSL`, the `TR_*` constants emitted by\n// `transitionWgslConstants()` in src/director.ts, and:\n//   `fromTex` at PASS_BINDING.input, `toTex` at PASS_BINDING.history,\n//   `samp` at PASS_BINDING.sampler, `var<uniform> T : Trans` at PASS_BINDING.params.\n//\n// The TR_* ids are GENERATED from the TypeScript map, never hand-written here.\n// Two hand-maintained copies of the same numbers is the drift that validates\n// cleanly and then plays the wrong transition.\n// ---------------------------------------------------------------------------\n//\n// COST. Two chains run for the transition's duration. Measured, the current\n// stack is 0.16 ms of GPU against an 8.33 ms frame, so the second chain is\n// affordable with room to spare \u2014 but it IS the one place the frame budget\n// doubles, and the GPU timer will show it. A long fade between two heavy\n// presets is a budget decision, not a free one.\n\nstruct Trans {\n  kind     : f32,\n  mix      : f32,   // 0..1, already curved by Transition.update()\n  angle    : f32,   // radians\n  softness : f32,   // UV units; 0 aliases, keep a pixel or two\n  panels   : f32,\n  seed     : f32,\n  aspect   : f32,\n  grow     : f32,   // iris: 1 opens, 0 closes\n};\n\nfn hash21(p: vec2<f32>) -> f32 {\n  var p3 = fract(vec3<f32>(p.xyx) * 0.1031);\n  p3 = p3 + dot(p3, p3.yzx + 33.33);\n  return fract((p3.x + p3.y) * p3.z);\n}\n\n/**\n * Soft threshold. `edge` is where the boundary sits, `v` the field value.\n *\n * Widened by fwidth so the edge stays a constant number of PIXELS whatever the\n * geometry's gradient \u2014 a fixed UV softness looks razor-sharp on a slow sweep\n * and hopelessly blurry on a fast one.\n */\nfn softEdge(v: f32, edge: f32, soft: f32) -> f32 {\n  let w = max(soft, fwidth(v) * 1.5);\n  return smoothstep(edge - w, edge + w, v);\n}\n\n/**\n * Mask in 0..1. 0 keeps the outgoing frame, 1 shows the incoming one.\n *\n * The progress term is expanded to (-soft .. 1+soft) in the swept kinds so the\n * transition genuinely reaches both ends. Left at 0..1, a soft edge means the\n * first and last sliver never fully commit and the old frame ghosts at the end.\n */\nfn transitionMask(uv: vec2<f32>) -> f32 {\n  let k = T.kind;\n  let m = T.mix;\n  let soft = max(T.softness, 1e-4);\n\n  if (k == TR_CROSSFADE) { return m; }\n\n  if (k == TR_DISSOLVE) {\n    // Per-pixel threshold. The seed offset stops successive dissolves using an\n    // identical grain, which reads as the same \"shape\" every time.\n    let n = hash21(floor(uv * vec2<f32>(1920.0, 1080.0)) + vec2<f32>(T.seed, T.seed * 1.7));\n    return softEdge(m, n, soft * 0.5);\n  }\n\n  // Aspect-corrected, centred coordinates for everything geometric, or the\n  // circles are ellipses and the angles are sheared.\n  let p = (uv - 0.5) * vec2<f32>(T.aspect, 1.0);\n  let dir = vec2<f32>(cos(T.angle), sin(T.angle));\n  let span = m * (1.0 + 2.0 * soft) - soft;\n\n  if (k == TR_WIPE) {\n    // Project onto the sweep direction, normalised so 0..1 covers the frame\n    // corner to corner at any angle.\n    let half = 0.5 * (abs(T.aspect * dir.x) + abs(dir.y));\n    let d = (dot(p, dir) + half) / max(2.0 * half, 1e-5);\n    return softEdge(span, d, soft);\n  }\n\n  if (k == TR_RADIAL) {\n    let a = atan2(p.y, p.x) - T.angle;\n    let turn = fract(a / 6.2831853 + 1.0);   // 0..1 clockwise from `angle`\n    return softEdge(span, turn, soft);\n  }\n\n  if (k == TR_IRIS) {\n    let r = length(p);\n    // Corner distance, so a full open genuinely clears the frame.\n    let rMax = length(vec2<f32>(T.aspect, 1.0) * 0.5);\n    let d = r / rMax;\n    if (T.grow > 0.5) { return softEdge(span, 1.0 - d, soft); }\n    return softEdge(span, d, soft);\n  }\n\n  if (k == TR_PANELWIPE) {\n    // Strips perpendicular to `angle`, each starting slightly after the last.\n    let n = max(T.panels, 1.0);\n    let across = dot(p, vec2<f32>(-dir.y, dir.x)) + 0.5;\n    let idx = floor(clamp(across, 0.0, 0.9999) * n);\n    let along = dot(p, dir) + 0.5;\n    // Stagger by half a panel's worth so the sweep reads as a cascade rather\n    // than n independent wipes finishing at once.\n    let lag = (idx / n) * 0.5;\n    let local = clamp((m * 1.5) - lag, 0.0, 1.0);\n    return softEdge(local * (1.0 + 2.0 * soft) - soft, along, soft);\n  }\n\n  if (k == TR_SLICE) {\n    // Bands hand over in alternating directions \u2014 the classic slice cut.\n    let n = max(T.panels, 1.0);\n    let band = floor(clamp(dot(p, vec2<f32>(-dir.y, dir.x)) + 0.5, 0.0, 0.9999) * n);\n    let flip = select(-1.0, 1.0, (band % 2.0) < 0.5);\n    let along = (dot(p, dir) + 0.5) * flip + select(1.0, 0.0, flip > 0.0);\n    return softEdge(span, along, soft);\n  }\n\n  return m;\n}\n\n/**\n * PANEL FLIP needs the UVs, not just a mask: a card turning has to SQUEEZE.\n * Returns the sample coordinate and, in .z, which frame to read (0 = from).\n *\n * Each strip scales toward its own axis, reaching zero width at the midpoint \u2014\n * which is exactly when the content swaps, so the flip hides the cut.\n */\nfn flipSample(uv: vec2<f32>) -> vec3<f32> {\n  let n = max(T.panels, 1.0);\n  let dir = vec2<f32>(cos(T.angle), sin(T.angle));\n  let across = vec2<f32>(-dir.y, dir.x);\n\n  let a = dot(uv - 0.5, across) + 0.5;\n  let idx = floor(clamp(a, 0.0, 0.9999) * n);\n  // Stagger so panels turn in sequence rather than as one slab.\n  let lag = (idx / n) * 0.45;\n  let t = clamp((T.mix * 1.45) - lag, 0.0, 1.0);\n\n  let second = t > 0.5;\n  // 1 -> 0 -> 1. cos gives the ease-in/ease-out a real hinge has for free.\n  let squeeze = max(abs(cos(t * 3.14159265)), 0.02);\n\n  // Local coordinate within the strip, scaled about the strip's centre.\n  let centre = (idx + 0.5) / n;\n  let local = (a - centre) / squeeze + centre;\n  let outUv = uv + across * (local - a);\n\n  return vec3<f32>(outUv, select(0.0, 1.0, second));\n}\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  return fullscreenTriangle(vi);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let uv = fragUV(frag);\n\n  if (T.kind == TR_PANELFLIP) {\n    let s = flipSample(uv);\n    // Outside the strip after squeezing: nothing to show, so let the frame's\n    // own background stand rather than clamping an edge texel into a streak.\n    if (s.x < 0.0 || s.x > 1.0 || s.y < 0.0 || s.y > 1.0) {\n      return vec4<f32>(0.0, 0.0, 0.0, 1.0) * C.opacity;\n    }\n    let a = textureSampleLevel(fromTex, samp, s.xy, 0.0);\n    let b = textureSampleLevel(toTex, samp, s.xy, 0.0);\n    return mix(a, b, s.z) * C.opacity;\n  }\n\n  let a = textureSampleLevel(fromTex, samp, uv, 0.0);\n  let b = textureSampleLevel(toTex, samp, uv, 0.0);\n  return mix(a, b, transitionMask(uv)) * C.opacity;\n}\n";
+
+// src/renderer.ts
+var PASS_GROUP = 0;
+var PASS_BINDING = {
+  /** Renderer-owned frame constants. Always present. See `PASS_COMMON_WGSL`. */
+  common: 0,
+  /** The accumulated frame, when `input === 'accumulator'`. */
+  input: 1,
+  /** Linear, clamp-to-edge. Paired with `input`. */
+  sampler: 2,
+  /** This layer's own previous output, when `history` is set. */
+  history: 3,
+  /** The pass's own uniform block, when `uniformFloats > 0`. */
+  params: 4,
+  /** First storage buffer. Subsequent ones follow in declaration order. */
+  storage0: 5
+};
+var COMMON_FLOATS = 20;
+var C_RES = 0;
+var C_ASPECT = 2;
+var C_OPACITY = 3;
+var C_PROGRESS = 4;
+var C_TIME = 5;
+var C_BEATS = 6;
+var C_BARS = 7;
+var C_BPM = 8;
+var C_DT_SEC = 9;
+var C_DT_BEATS = 10;
+var C_SEED = 11;
+var C_COLOR = 12;
+var C_FRAME = 16;
+var PASS_COMMON_WGSL = (
+  /* wgsl */
+  `
+// ---- pass common (generated by renderer.ts \u2014 keep in sync) -----------------
+//
+// std140-ish, explicit about every byte:
+//   0  resolution.xy      8  aspect     12 opacity
+//   16 progress          20 time        24 beats     28 bars
+//   32 bpm               36 dtSec       40 dtBeats   44 seed
+//   48 color (vec4 \u2014 48 is the first legal 16-byte boundary past 44)
+//   64 frame             68..79 padding            -> size 80
+//
+// No vec3 anywhere, deliberately: a vec3 aligns to 16 but occupies 12, so it
+// drags four bytes of invisible padding that the TypeScript side has to know
+// about and cannot see.
+struct Common {
+  resolution : vec2<f32>,   // attachment size in PIXELS, after resolution scale
+  aspect     : f32,         // resolution.x / resolution.y
+  opacity    : f32,         // spec.opacity * envelope. MULTIPLY YOUR OUTPUT BY THIS.
+  progress   : f32,         // envelope 0..1 on its own
+  time       : f32,         // audio-clock seconds (plan 4.6). Never a wall clock.
+  beats      : f32,         // continuous beat position, fractional
+  bars       : f32,         // beats / 4
+  bpm        : f32,
+  dtSec      : f32,         // for exp(-dt/tau) decay, and nothing else
+  dtBeats    : f32,         // the correct step for anything that integrates
+  seed       : f32,         // per-layer, integral, < 2^24 so f32 holds it exactly
+  color      : vec4<f32>,   // palette slot: LINEAR rgb (may exceed 1.0) + intensity
+  frame      : f32,
+  _pad0      : f32,
+  _pad1      : f32,
+  _pad2      : f32,
+};
+
+@group(${PASS_GROUP}) @binding(${PASS_BINDING.common}) var<uniform> C : Common;
+
+/**
+ * The covering triangle. Three vertices, no vertex buffer \u2014 cheaper than a quad
+ * and it has no diagonal seam. Call it from your own @vertex fn:
+ *
+ *   @vertex fn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {
+ *     return fullscreenTriangle(vi);
+ *   }
+ */
+fn fullscreenTriangle(vi : u32) -> vec4<f32> {
+  let p = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0), vec2<f32>( 3.0, -1.0), vec2<f32>(-1.0,  3.0),
+  );
+  return vec4<f32>(p[vi], 0.0, 1.0);
+}
+
+/** Normalised 0..1 coordinate of the current fragment. */
+fn fragUV(frag : vec4<f32>) -> vec2<f32> {
+  return frag.xy / C.resolution;
+}
+// ---- end pass common ------------------------------------------------------
+`
+);
+function passBindingsWGSL(desc) {
+  const lines = [];
+  if (inputOf(desc) === "accumulator") {
+    lines.push(`@group(${PASS_GROUP}) @binding(${PASS_BINDING.input}) var src : texture_2d<f32>;`);
+  }
+  if (inputOf(desc) === "accumulator" || historyOf(desc)) {
+    lines.push(`@group(${PASS_GROUP}) @binding(${PASS_BINDING.sampler}) var samp : sampler;`);
+  }
+  if (historyOf(desc)) {
+    lines.push(`@group(${PASS_GROUP}) @binding(${PASS_BINDING.history}) var hist : texture_2d<f32>;`);
+  }
+  const storage = desc.storage ?? [];
+  for (let i = 0; i < storage.length; i++) {
+    const s = storage[i];
+    if (!s) continue;
+    lines.push(
+      `@group(${PASS_GROUP}) @binding(${PASS_BINDING.storage0 + i}) var<storage, read> ${s.label} : array<f32>;`
+    );
+  }
+  return lines.join("\n");
+}
+var nextUid = 1;
+var TargetPool = class {
+  device;
+  format;
+  free = /* @__PURE__ */ new Map();
+  all = /* @__PURE__ */ new Set();
+  constructor(device2, format) {
+    this.device = device2;
+    this.format = format;
+  }
+  acquire(width, height, label) {
+    const key = `${width}x${height}`;
+    const bucket = this.free.get(key);
+    const reused = bucket?.pop();
+    if (reused) return reused;
+    const texture = this.device.createTexture({
+      label: `pool:${label}:${key}`,
+      size: [width, height],
+      format: this.format,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST
+    });
+    const target = {
+      texture,
+      view: texture.createView(),
+      uid: nextUid++,
+      width,
+      height
+    };
+    this.all.add(target);
+    return target;
+  }
+  release(target) {
+    const key = `${target.width}x${target.height}`;
+    let bucket = this.free.get(key);
+    if (!bucket) {
+      bucket = [];
+      this.free.set(key, bucket);
+    }
+    if (!bucket.includes(target)) bucket.push(target);
+  }
+  /** Live target count. Reported by the overlay next to `StackPlan.targetCount`. */
+  get size() {
+    return this.all.size;
+  }
+  destroy() {
+    for (const t of this.all) t.texture.destroy();
+    this.all.clear();
+    this.free.clear();
+  }
+};
+var BLIT_WGSL = (
+  /* wgsl */
+  `
+${PASS_COMMON_WGSL}
+@group(${PASS_GROUP}) @binding(${PASS_BINDING.input}) var src : texture_2d<f32>;
+@group(${PASS_GROUP}) @binding(${PASS_BINDING.sampler}) var samp : sampler;
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {
+  return fullscreenTriangle(vi);
+}
+
+@fragment
+fn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {
+  let c = textureSampleLevel(src, samp, fragUV(frag), 0.0);
+  return c * C.opacity;
+}
+`
+);
+var XOR_WGSL = (
+  /* wgsl */
+  `
+${PASS_COMMON_WGSL}
+@group(${PASS_GROUP}) @binding(${PASS_BINDING.input}) var src : texture_2d<f32>;
+@group(${PASS_GROUP}) @binding(${PASS_BINDING.sampler}) var samp : sampler;
+@group(${PASS_GROUP}) @binding(${PASS_BINDING.history}) var dst : texture_2d<f32>;
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {
+  return fullscreenTriangle(vi);
+}
+
+fn q(v : vec3<f32>) -> vec3<u32> {
+  return vec3<u32>(clamp(v, vec3<f32>(0.0), vec3<f32>(1.0)) * 65535.0);
+}
+
+@fragment
+fn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {
+  let uv = fragUV(frag);
+  let s = textureSampleLevel(src, samp, uv, 0.0);
+  let d = textureSampleLevel(dst, samp, uv, 0.0);
+  let x = vec3<f32>(q(s.rgb) ^ q(d.rgb)) / 65535.0;
+  // Opacity crossfades back to the untouched destination, so the layer's
+  // opacity slider means the same thing it does for every other blend.
+  return vec4<f32>(mix(d.rgb, x, C.opacity), max(d.a, s.a));
+}
+`
+);
+var SCALABLE_DRAW_BLENDS = /* @__PURE__ */ new Set(["add", "max", "replace"]);
+var SCALE_EPSILON = 1e-3;
+var Renderer = class {
+  gpu;
+  device;
+  timer;
+  audioGpu;
+  sampler;
+  pool;
+  registry = /* @__PURE__ */ new Map();
+  // -- caches. Every one of these is keyed on everything that can change, and
+  //    that is not paranoia: a pipeline cache keyed on the descriptor alone
+  //    hands a swapchain-format pipeline to an HDR attachment, which is a
+  //    validation error, and a bind group cache keyed on the layer alone hands
+  //    the previous ping-pong side to a pass that wants the current one, which
+  //    is not an error at all and merely looks like a one-frame lag.
+  modules = /* @__PURE__ */ new Map();
+  renderPipelines = /* @__PURE__ */ new Map();
+  computePipelines = /* @__PURE__ */ new Map();
+  renderLayouts = /* @__PURE__ */ new Map();
+  computeLayouts = /* @__PURE__ */ new Map();
+  bindGroups = /* @__PURE__ */ new Map();
+  resources = /* @__PURE__ */ new Map();
+  /** Ping-pong accumulator. `cur` is the frame so far; `spare` is where the next transform lands. */
+  cur = null;
+  spare = null;
+  /** False until something has written `cur` this frame. Guards reading an undefined accumulator. */
+  accumCleared = false;
+  /**
+   * Uniform buffers for the renderer's OWN blits and composites, cycled per
+   * frame. Several blits can be in flight in one encoder with different
+   * opacities, and `queue.writeBuffer` is ordered against the whole submit
+   * rather than against individual commands — so reusing one buffer would give
+   * every blit in the frame the last opacity written to it.
+   */
+  utility = [];
+  utilityUsed = 0;
+  transitionBuffers = [];
+  transitionUsed = 0;
+  /** Staging for `Common`. Reused; 80 bytes per pass per frame is litter. */
+  commonStage = new Float32Array(COMMON_FLOATS);
+  transitionStage = new Float32Array(8);
+  /** Staging for pass params. Grown on demand, never shrunk. */
+  paramStage = new Float32Array(64);
+  /** 1x1 black, for a declared input binding that has nothing sensible to point at. */
+  blackView = null;
+  /** Types warned about once. A per-frame console message is a per-frame allocation. */
+  warned = /* @__PURE__ */ new Set();
+  constructor(deps) {
+    this.gpu = deps.gpu;
+    this.device = deps.gpu.device;
+    this.timer = deps.timer;
+    this.audioGpu = deps.audioGpu;
+    this.sampler = createSampler(deps.gpu);
+    this.pool = new TargetPool(deps.gpu.device, deps.gpu.hdrFormat);
+  }
+  // -- registration -------------------------------------------------------
+  /** Register a layer type. Re-registering the same type replaces it and drops its cached pipelines. */
+  register(...descs) {
+    for (const desc of descs) {
+      if (this.registry.has(desc.type)) this.evictType(desc.type);
+      this.registry.set(desc.type, desc);
+    }
+  }
+  get types() {
+    return this.registry;
+  }
+  // -- lifecycle ----------------------------------------------------------
+  /**
+   * The HDR frame `execute` last produced. What `present` should sample.
+   *
+   * Valid only after `execute` and only until the next one — it is a pooled
+   * target and the pool will hand it out again.
+   */
+  get output() {
+    return this.ensureAccumulator();
+  }
+  /** Live pooled targets, for the debug overlay to compare against `StackPlan.targetCount`. */
+  get targetCount() {
+    return this.pool.size;
+  }
+  /**
+   * Drop every size-dependent resource. Call after `gpu.resize` returns true.
+   *
+   * Feedback history goes with it, and that is correct rather than unfortunate:
+   * a trail buffer stretched from one resolution to another is not the trail the
+   * user was looking at, and §4.10 already establishes that stale feedback state
+   * is the thing that makes a frame look inexplicably wrong.
+   */
+  resize() {
+    this.cur = null;
+    this.spare = null;
+    for (const res of this.resources.values()) res.history = null;
+    this.bindGroups.clear();
+    this.pool.destroy();
+  }
+  /**
+   * Clear only temporal history while preserving pipelines, storage buffers and
+   * pooled render targets. A seek, source change, or deterministic test reset
+   * must never reveal pixels accumulated before the new transport origin.
+   */
+  resetHistory() {
+    for (const res of this.resources.values()) {
+      if (!res.history) continue;
+      this.pool.release(res.history.read);
+      this.pool.release(res.history.write);
+      res.history = null;
+    }
+    this.bindGroups.clear();
+  }
+  /**
+   * Reset every per-layer temporal resource while preserving shared pipelines
+   * and the target pool. This is the transport/preset boundary: feedback
+   * textures and compute storage both contain playback history, so clearing
+   * only one of them makes a seeded show depend on what was viewed beforehand.
+   */
+  resetLayerState() {
+    for (const res of this.resources.values()) this.destroyLayer(res);
+    this.resources.clear();
+    this.bindGroups.clear();
+  }
+  destroy() {
+    for (const res of this.resources.values()) this.destroyLayer(res);
+    this.resources.clear();
+    for (const b of this.utility) b.destroy();
+    this.utility.length = 0;
+    this.pool.destroy();
+    this.bindGroups.clear();
+    this.cur = null;
+    this.spare = null;
+  }
+  /**
+   * Forget per-layer state for layers no longer in the stack. Call on preset
+   * load and after removing a layer.
+   *
+   * Not optional housekeeping: a feedback layer holds two full-res
+   * `rgba16float` targets, which at 2560x1440 is 30 MB the pair. Editing a
+   * preset a dozen times without this is 350 MB of orphaned trail buffers.
+   */
+  prune(keep) {
+    const alive = new Set(keep);
+    for (const [id, res] of this.resources) {
+      if (alive.has(id)) continue;
+      this.destroyLayer(res);
+      this.resources.delete(id);
+    }
+    this.bindGroups.clear();
+  }
+  destroyLayer(res) {
+    res.common.destroy();
+    res.params?.destroy();
+    res.computeCommon?.destroy();
+    res.computeParams?.destroy();
+    for (const b of res.storage) b.destroy();
+    if (res.history) {
+      this.pool.release(res.history.read);
+      this.pool.release(res.history.write);
+      res.history = null;
+    }
+  }
+  // -- the frame ----------------------------------------------------------
+  /**
+   * Encode one frame of the plan. Returns the accumulated HDR target.
+   *
+   * Ordering, and why it is this ordering:
+   *
+   *   1. Every compute prepass, hoisted to the top. A merged draw run holds
+   *      several layers, so there is no "immediately before" that is true for
+   *      all of them; the only ordering that is the same for every member is
+   *      "before everything", and the GPU overlaps them anyway.
+   *   2. The passes, in plan order. `kind` decides the target rotation, not
+   *      `swapsAccumulator` — the scaled path legitimately writes through a
+   *      pooled target and lands back on the SAME accumulator side, so it does
+   *      not swap even though the plan says a transform does. The plan's flag
+   *      describes the logical shape; this decides the physical one.
+   *
+   * Layers whose envelope has expired never appear here at all: `resolve`
+   * dropped them before `planStack` ever saw them, which is what makes "a layer
+   * at 0 is a true no-op" (Phase 5 DoD) true. The `byId` lookup below is
+   * belt-and-braces for a plan and a resolved list that have drifted apart, and
+   * a pass with no surviving members is skipped rather than run empty. Pass
+   * count is the budget (§4.11); an invisible pass has spent it.
+   */
+  execute(encoder, plan2, frame2) {
+    const accumulator = this.ensureAccumulator();
+    this.accumCleared = false;
+    this.utilityUsed = 0;
+    this.transitionUsed = 0;
+    const byId = /* @__PURE__ */ new Map();
+    for (const r of frame2.resolved) byId.set(r.layer.id, r);
+    for (const r of frame2.resolved) {
+      const desc = this.descriptorFor(r);
+      if (desc?.compute) this.runCompute(encoder, desc, r, frame2, r.layer.spec.resolutionScale);
+    }
+    let scratch = null;
+    for (const pass6 of plan2.passes) {
+      const members = [];
+      for (const id of pass6.layerIds) {
+        const r = byId.get(id);
+        if (r) members.push(r);
+      }
+      if (members.length === 0) continue;
+      switch (pass6.kind) {
+        case "draw":
+          scratch = this.drawRun(encoder, pass6, members, frame2, scratch);
+          break;
+        case "transform":
+          scratch = this.transformRun(encoder, pass6, members, frame2, scratch);
+          break;
+        case "feedback":
+          this.feedbackPass(encoder, pass6, members, frame2);
+          break;
+        case "composite":
+          scratch = this.compositePass(encoder, pass6, members, frame2, scratch);
+          break;
+      }
+    }
+    if (scratch) this.pool.release(scratch);
+    if (!this.accumCleared) this.clearAccumulator(encoder);
+    return this.cur ?? accumulator;
+  }
+  /** Snapshot the current HDR accumulator before a preset load reuses it. */
+  captureOutput(encoder) {
+    const source3 = this.ensureAccumulator();
+    const held = this.pool.acquire(source3.width, source3.height, "transition-from");
+    encoder.copyTextureToTexture(
+      { texture: source3.texture },
+      { texture: held.texture },
+      [source3.width, source3.height]
+    );
+    return held;
+  }
+  /** Composite a held outgoing frame with the live incoming accumulator. */
+  transition(encoder, from, to, spec, mix, seed, frame2) {
+    const target = this.pool.acquire(this.gpu.width, this.gpu.height, "transition-to");
+    const code = [
+      PASS_COMMON_WGSL,
+      transitionWgslConstants(),
+      `@group(${PASS_GROUP}) @binding(${PASS_BINDING.input}) var fromTex : texture_2d<f32>;`,
+      `@group(${PASS_GROUP}) @binding(${PASS_BINDING.sampler}) var samp : sampler;`,
+      `@group(${PASS_GROUP}) @binding(${PASS_BINDING.history}) var toTex : texture_2d<f32>;`,
+      `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> T : Trans;`,
+      transition_default
+    ].join("\n");
+    const pipeline = this.utilityPipeline("transition", code, target.texture.format, "replace", true, true);
+    const common = this.nextUtilityBuffer();
+    const c = this.commonStage;
+    c.fill(0);
+    c[C_RES] = target.width;
+    c[C_RES + 1] = target.height;
+    c[C_ASPECT] = target.width / Math.max(target.height, 1);
+    c[C_OPACITY] = 1;
+    c[C_TIME] = frame2.time;
+    c[C_BEATS] = frame2.beats;
+    c[C_BARS] = frame2.beats / 4;
+    c[C_BPM] = frame2.bpm;
+    c[C_DT_SEC] = frame2.dtSeconds;
+    c[C_DT_BEATS] = frame2.dtBeats;
+    c[C_FRAME] = frame2.frame;
+    this.device.queue.writeBuffer(common, 0, c);
+    const params = this.nextTransitionBuffer();
+    packTransition(spec, mix, seed, c[C_ASPECT], this.transitionStage);
+    this.device.queue.writeBuffer(params, 0, this.transitionStage);
+    const bind = this.device.createBindGroup({
+      label: "transition",
+      layout: pipeline.getBindGroupLayout(PASS_GROUP),
+      entries: [
+        { binding: PASS_BINDING.common, resource: { buffer: common } },
+        { binding: PASS_BINDING.input, resource: from.view },
+        { binding: PASS_BINDING.sampler, resource: this.sampler },
+        { binding: PASS_BINDING.history, resource: to.view },
+        { binding: PASS_BINDING.params, resource: { buffer: params } }
+      ]
+    });
+    const pass6 = this.timer.beginPass(encoder, target.view, "transition", "clear");
+    pass6.setPipeline(pipeline);
+    pass6.setBindGroup(PASS_GROUP, bind);
+    pass6.draw(3);
+    this.timer.endPass(pass6);
+    return target;
+  }
+  /** A caller-owned snapshot or transition target is safe to return after encoding. */
+  releaseTarget(target) {
+    this.pool.release(target);
+  }
+  // -- pass kinds ---------------------------------------------------------
+  /**
+   * A run of sources (and fixed-function feedback composites) drawn into the
+   * accumulator with fixed-function blending.
+   *
+   * N sources are N draw calls into one attachment, not N passes — a source
+   * does not read the accumulator, so there is nothing to ping-pong. That is the
+   * single biggest saving available at 2K120 and it is `planStack` that found
+   * it; all this does is honour it.
+   */
+  drawRun(encoder, plan2, members, frame2, scratch) {
+    const cur = this.ensureAccumulator();
+    const scale = clampScale(plan2.resolutionScale);
+    const scalable = scale < 1 - SCALE_EPSILON && members.every((m) => SCALABLE_DRAW_BLENDS.has(m.layer.blend));
+    let target;
+    let load;
+    if (plan2.usesScratch) {
+      target = this.pool.acquire(...this.sizeFor(scale), plan2.label);
+      load = "clear";
+    } else if (scalable) {
+      target = this.pool.acquire(...this.sizeFor(scale), plan2.label);
+      load = "clear";
+    } else {
+      target = cur;
+      load = this.accumCleared ? "load" : "clear";
+      this.accumCleared = true;
+    }
+    const pass6 = this.timer.beginPass(encoder, target.view, plan2.label, load);
+    for (const m of members) {
+      if (m.layer.spec.family === "feedback") {
+        const history = this.resourcesFor(m).history;
+        if (!history) continue;
+        this.encodeBlit(pass6, history.read, target, m.layer.blend, m.opacity, frame2, m);
+        continue;
+      }
+      this.encodeLayerDraw(pass6, target, m, frame2, m.layer.blend);
+    }
+    this.timer.endPass(pass6);
+    if (plan2.usesScratch) {
+      if (scratch) this.pool.release(scratch);
+      return target;
+    }
+    if (scalable) {
+      const first = members[0];
+      if (first) {
+        this.blitPass(encoder, target, cur, first.layer.blend, 1, frame2, first, `${plan2.label}:up`);
+      }
+      this.pool.release(target);
+    }
+    return scratch;
+  }
+  /**
+   * Warps, operators and colour ops: sample the accumulator, write elsewhere.
+   *
+   * `planStack` merges consecutive colour layers into one `transform` on the
+   * grounds that a run of per-pixel functions is a chain a single shader could
+   * apply in sequence. That shader does not exist yet — composing N descriptors'
+   * fragment bodies into one module is a real feature, not a detail — so a
+   * multi-member run is executed here as N sequential passes, which is correct
+   * but does not yet collect the saving. It is the one place the plan promises
+   * more than this file delivers, and it is visible rather than silent because
+   * each member is timed under its own label.
+   */
+  transformRun(encoder, plan2, members, frame2, scratch) {
+    this.requireAccumulator(encoder);
+    const scale = clampScale(plan2.resolutionScale);
+    const scaled = scale < 1 - SCALE_EPSILON;
+    let carried = scratch;
+    for (let i = 0; i < members.length; i++) {
+      const m = members[i];
+      if (!m) continue;
+      const cur = this.ensureAccumulator();
+      const label = members.length > 1 ? `transform:${m.layer.id}` : plan2.label;
+      if (plan2.usesScratch) {
+        const target = this.pool.acquire(...this.sizeFor(scale), label);
+        const pass7 = this.timer.beginPass(encoder, target.view, label, "clear");
+        this.encodeLayerDraw(pass7, target, m, frame2, "replace", cur);
+        this.timer.endPass(pass7);
+        if (carried) this.pool.release(carried);
+        carried = target;
+        continue;
+      }
+      if (scaled) {
+        const target = this.pool.acquire(...this.sizeFor(scale), label);
+        const pass7 = this.timer.beginPass(encoder, target.view, label, "clear");
+        this.encodeLayerDraw(pass7, target, m, frame2, "replace", cur);
+        this.timer.endPass(pass7);
+        this.blitPass(encoder, target, cur, m.layer.blend, 1, frame2, m, `${label}:up`);
+        this.pool.release(target);
+        continue;
+      }
+      const spare = this.ensureSpare();
+      let load = "clear";
+      if (m.layer.blend !== "replace") {
+        encoder.copyTextureToTexture(
+          { texture: cur.texture },
+          { texture: spare.texture },
+          [cur.width, cur.height]
+        );
+        load = "load";
+      }
+      const pass6 = this.timer.beginPass(encoder, spare.view, label, load);
+      this.encodeLayerDraw(pass6, spare, m, frame2, m.layer.blend, cur);
+      this.timer.endPass(pass6);
+      this.swap();
+    }
+    return carried;
+  }
+  /**
+   * A feedback layer advancing its own history.
+   *
+   * It reads its own previous output (`hist`) and may also read the accumulator
+   * (`src`), which is what separates a trail that decays in place from one that
+   * captures the frame beneath it. It does NOT touch the accumulator — the
+   * composite is a separate plan entry, and keeping them apart is what lets a
+   * feedback layer have any blend mode at all.
+   */
+  feedbackPass(encoder, plan2, members, frame2) {
+    const m = members[0];
+    if (!m) return;
+    const desc = this.descriptorFor(m);
+    if (!desc) return;
+    const res = this.resourcesFor(m);
+    const scale = clampScale(plan2.resolutionScale);
+    const [w, h] = this.sizeFor(scale);
+    const size = `${w}x${h}`;
+    if (!res.history || res.history.size !== size) {
+      if (res.history) {
+        this.pool.release(res.history.read);
+        this.pool.release(res.history.write);
+      }
+      const pair = {
+        read: this.pool.acquire(w, h, `${m.layer.id}:fb-a`),
+        write: this.pool.acquire(w, h, `${m.layer.id}:fb-b`),
+        size
+      };
+      for (const t2 of [pair.read, pair.write]) {
+        this.timer.endPass(this.timer.beginPass(encoder, t2.view, `${m.layer.id}:fb-init`, "clear"));
+      }
+      res.history = pair;
+    }
+    let source3 = null;
+    if (inputOf(desc) === "accumulator") {
+      this.requireAccumulator(encoder);
+      source3 = this.ensureAccumulator();
+    }
+    const pass6 = this.timer.beginPass(encoder, res.history.write.view, plan2.label, "clear");
+    this.encodeLayerDraw(pass6, res.history.write, m, frame2, "replace", source3, res.history.read);
+    this.timer.endPass(pass6);
+    const t = res.history.read;
+    res.history.read = res.history.write;
+    res.history.write = t;
+  }
+  /**
+   * Resolve a `shader` blend — today `xor` alone, per `BLEND_PLANS`.
+   *
+   * Samples the source (the scratch target, or a feedback layer's own history)
+   * and the accumulator, and writes the result to the other accumulator side.
+   * Both sides are inputs, which is the entire reason this costs a pass: a
+   * render pass may not sample its own attachment.
+   */
+  compositePass(encoder, plan2, members, frame2, scratch) {
+    const m = members[0];
+    if (!m) return scratch;
+    this.requireAccumulator(encoder);
+    const cur = this.ensureAccumulator();
+    const spare = this.ensureSpare();
+    let source3 = scratch;
+    if (plan2.feedbackSlot) source3 = this.resourcesFor(m).history?.read ?? null;
+    if (!source3) return scratch;
+    const pipeline = this.utilityPipeline("xor", XOR_WGSL, this.gpu.hdrFormat, "replace", true);
+    const common = this.nextUtilityBuffer();
+    this.writeCommon(common, m, frame2, spare.width, spare.height, m.opacity);
+    const bind = this.device.createBindGroup({
+      label: plan2.label,
+      layout: pipeline.getBindGroupLayout(PASS_GROUP),
+      entries: [
+        { binding: PASS_BINDING.common, resource: { buffer: common } },
+        { binding: PASS_BINDING.input, resource: source3.view },
+        { binding: PASS_BINDING.sampler, resource: this.sampler },
+        { binding: PASS_BINDING.history, resource: cur.view }
+      ]
+    });
+    const pass6 = this.timer.beginPass(encoder, spare.view, plan2.label, "clear");
+    pass6.setPipeline(pipeline);
+    pass6.setBindGroup(PASS_GROUP, bind);
+    pass6.draw(3);
+    this.timer.endPass(pass6);
+    this.swap();
+    if (scratch) this.pool.release(scratch);
+    return null;
+  }
+  // -- encoding primitives ------------------------------------------------
+  /** Set up and issue one layer's draw inside an already-open render pass. */
+  encodeLayerDraw(pass6, target, m, frame2, blend, source3 = null, history = null) {
+    const desc = this.descriptorFor(m);
+    if (!desc) return;
+    const ctx = this.contextFor(m, frame2, target.width, target.height);
+    const res = this.resourcesFor(m);
+    this.writeCommon(res.common, m, frame2, target.width, target.height, m.opacity);
+    this.writeParams(desc, res, ctx, "render");
+    const pipeline = this.renderPipeline(desc, target.texture.format, blend);
+    const bind = this.bindGroupFor(desc, m, res, source3, history);
+    pass6.setPipeline(pipeline);
+    pass6.setBindGroup(PASS_GROUP, bind);
+    if (desc.usesAudio) pass6.setBindGroup(AUDIO_GROUP, this.audioGpu.bindGroup);
+    if (m.blendConstant !== null) {
+      const c = m.blendConstant;
+      pass6.setBlendConstant({ r: c, g: c, b: c, a: c });
+    }
+    const draw = desc.draw ?? { kind: "fullscreen" };
+    if (draw.kind === "fullscreen") {
+      pass6.draw(3);
+    } else {
+      const n = Math.max(0, Math.floor(draw.vertexCount(ctx)));
+      if (n > 0) pass6.draw(n);
+    }
+  }
+  /** A blit issued inside an already-open render pass (a member of a draw run). */
+  encodeBlit(pass6, source3, target, blend, opacity, frame2, m) {
+    const pipeline = this.utilityPipeline("blit", BLIT_WGSL, target.texture.format, blend, false);
+    const common = this.nextUtilityBuffer();
+    this.writeCommon(common, m, frame2, target.width, target.height, opacity);
+    const bind = this.device.createBindGroup({
+      label: `blit:${m.layer.id}`,
+      layout: pipeline.getBindGroupLayout(PASS_GROUP),
+      entries: [
+        { binding: PASS_BINDING.common, resource: { buffer: common } },
+        { binding: PASS_BINDING.input, resource: source3.view },
+        { binding: PASS_BINDING.sampler, resource: this.sampler }
+      ]
+    });
+    pass6.setPipeline(pipeline);
+    pass6.setBindGroup(PASS_GROUP, bind);
+    if (m.blendConstant !== null) {
+      const c = m.blendConstant;
+      pass6.setBlendConstant({ r: c, g: c, b: c, a: c });
+    }
+    pass6.draw(3);
+  }
+  /** A blit that owns its own render pass, so it gets its own timer row. */
+  blitPass(encoder, source3, target, blend, opacity, frame2, m, label) {
+    const load = target === this.cur && !this.accumCleared ? "clear" : "load";
+    if (target === this.cur) this.accumCleared = true;
+    const pass6 = this.timer.beginPass(encoder, target.view, label, load);
+    this.encodeBlit(pass6, source3, target, blend, opacity, frame2, m);
+    this.timer.endPass(pass6);
+  }
+  /** Dispatch a source's compute prepass. */
+  runCompute(encoder, desc, m, frame2, scale) {
+    const compute = desc.compute;
+    if (!compute) return;
+    const [w, h] = this.sizeFor(clampScale(scale));
+    const ctx = this.contextFor(m, frame2, w, h);
+    const res = this.resourcesFor(m);
+    if (!res.computeCommon) {
+      res.computeCommon = this.device.createBuffer({
+        label: `common:${m.layer.id}:compute`,
+        size: COMMON_FLOATS * 4,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+      });
+      this.bindGroups.clear();
+    }
+    this.writeCommon(res.computeCommon, m, frame2, w, h, m.opacity);
+    this.writeParams(desc, res, ctx, "compute");
+    const pipeline = this.computePipeline(desc);
+    const bind = this.computeBindGroup(desc, m, res);
+    const wg = compute.workgroups(ctx);
+    const [x, y, z] = typeof wg === "number" ? [wg, 1, 1] : wg;
+    if (x <= 0) return;
+    const pass6 = this.timer.beginComputePass(encoder, `compute:${m.layer.id}`);
+    pass6.setPipeline(pipeline);
+    pass6.setBindGroup(PASS_GROUP, bind);
+    if (desc.usesAudio) pass6.setBindGroup(AUDIO_GROUP, this.audioGpu.bindGroup);
+    pass6.dispatchWorkgroups(Math.ceil(x), Math.ceil(y), Math.ceil(z));
+    this.timer.endPass(pass6);
+  }
+  // -- accumulator --------------------------------------------------------
+  ensureAccumulator() {
+    if (!this.cur) this.cur = this.pool.acquire(this.gpu.width, this.gpu.height, "accum-a");
+    return this.cur;
+  }
+  ensureSpare() {
+    if (!this.spare) this.spare = this.pool.acquire(this.gpu.width, this.gpu.height, "accum-b");
+    return this.spare;
+  }
+  swap() {
+    const t = this.cur;
+    this.cur = this.spare;
+    this.spare = t;
+    this.accumCleared = true;
+  }
+  /**
+   * Guarantee the accumulator holds something before a pass SAMPLES it.
+   *
+   * Reading a target that has not been written this frame is not an error and
+   * does not warn — it silently returns whatever the pool last left there, which
+   * is usually a plausible-looking frame from a different part of the show. That
+   * is exactly the class of bug that gets diagnosed as "the warp is broken".
+   */
+  requireAccumulator(encoder) {
+    if (!this.accumCleared) this.clearAccumulator(encoder);
+  }
+  clearAccumulator(encoder) {
+    const cur = this.ensureAccumulator();
+    const pass6 = this.timer.beginPass(encoder, cur.view, "accum:clear", "clear");
+    this.timer.endPass(pass6);
+    this.accumCleared = true;
+  }
+  /** Attachment size for a resolution scale. Never zero; a 1px target is still a valid one. */
+  sizeFor(scale) {
+    if (scale >= 1 - SCALE_EPSILON) return [this.gpu.width, this.gpu.height];
+    return [
+      Math.max(1, Math.round(this.gpu.width * scale)),
+      Math.max(1, Math.round(this.gpu.height * scale))
+    ];
+  }
+  // -- resources ----------------------------------------------------------
+  descriptorFor(m) {
+    const spec = m.layer.spec;
+    const desc = this.registry.get(spec.type);
+    if (!desc) {
+      this.warnOnce(`type:${spec.type}`, `no pass registered for type '${spec.type}' \u2014 layer '${spec.id}' will not render.`);
+      return null;
+    }
+    if (desc.family !== spec.family) {
+      this.warnOnce(
+        `family:${spec.type}`,
+        `layer '${spec.id}' declares family '${spec.family}' but pass '${desc.type}' is '${desc.family}'. Refusing to render it.`
+      );
+      return null;
+    }
+    return desc;
+  }
+  resourcesFor(m) {
+    const id = m.layer.id;
+    const existing = this.resources.get(id);
+    if (existing) {
+      if (existing.type === m.layer.spec.type && existing.seed === m.layer.seed) {
+        this.syncStorage(existing, m);
+        return existing;
+      }
+      this.destroyLayer(existing);
+      this.resources.delete(id);
+      this.bindGroups.clear();
+    }
+    const created = {
+      type: m.layer.spec.type,
+      seed: m.layer.seed,
+      common: this.device.createBuffer({
+        label: `common:${id}`,
+        size: COMMON_FLOATS * 4,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+      }),
+      params: null,
+      paramFloats: 0,
+      computeCommon: null,
+      computeParams: null,
+      computeParamFloats: 0,
+      storage: [],
+      storageBytes: [],
+      history: null
+    };
+    this.resources.set(id, created);
+    this.syncStorage(created, m);
+    return created;
+  }
+  /**
+   * Allocate (or reallocate) the layer's persistent buffers.
+   *
+   * Per LAYER, not per type: two `lorenz` layers are two independent systems
+   * with different seeds, and sharing one point buffer between them would make
+   * them the same attractor drawn twice. They still share one pipeline, which is
+   * the whole point of splitting the descriptor from the instance.
+   */
+  syncStorage(res, m) {
+    const desc = this.registry.get(m.layer.spec.type);
+    const specs = desc?.storage ?? [];
+    for (let i = 0; i < specs.length; i++) {
+      const s = specs[i];
+      if (!s) continue;
+      const bytes = Math.max(4, Math.ceil(s.bytes(m.layer.spec.params) / 4) * 4);
+      if (res.storageBytes[i] === bytes && res.storage[i]) continue;
+      res.storage[i]?.destroy();
+      const buffer = this.device.createBuffer({
+        label: `${m.layer.id}:${s.label}`,
+        size: bytes,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+      });
+      res.storage[i] = buffer;
+      res.storageBytes[i] = bytes;
+      const view = new Float32Array(bytes / 4);
+      s.init?.(view, m.layer.seed, m.layer.spec.params);
+      this.device.queue.writeBuffer(buffer, 0, view);
+      this.bindGroups.clear();
+    }
+  }
+  nextUtilityBuffer() {
+    const existing = this.utility[this.utilityUsed];
+    if (existing) {
+      this.utilityUsed++;
+      return existing;
+    }
+    const buffer = this.device.createBuffer({
+      label: `common:utility-${this.utilityUsed}`,
+      size: COMMON_FLOATS * 4,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    this.utility.push(buffer);
+    this.utilityUsed++;
+    return buffer;
+  }
+  nextTransitionBuffer() {
+    const existing = this.transitionBuffers[this.transitionUsed];
+    if (existing) {
+      this.transitionUsed++;
+      return existing;
+    }
+    const buffer = this.device.createBuffer({
+      label: `params:transition-${this.transitionUsed}`,
+      size: 8 * 4,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    this.transitionBuffers.push(buffer);
+    this.transitionUsed++;
+    return buffer;
+  }
+  // -- uniforms -----------------------------------------------------------
+  contextFor(m, frame2, width, height) {
+    const spec = m.layer.spec;
+    return {
+      spec,
+      params: spec.params,
+      progress: m.progress,
+      opacity: m.opacity,
+      seed: m.layer.seed,
+      audio: frame2.audio,
+      palette: frame2.palette,
+      color: frame2.palette[spec.palette],
+      time: frame2.time,
+      beats: frame2.beats,
+      bars: frame2.beats / 4,
+      bpm: frame2.bpm,
+      dtBeats: frame2.dtBeats,
+      dtSeconds: frame2.dtSeconds,
+      width,
+      height,
+      aspect: height > 0 ? width / height : 1,
+      frame: frame2.frame
+    };
+  }
+  writeCommon(buffer, m, frame2, width, height, opacity) {
+    const s = this.commonStage;
+    s[C_RES] = width;
+    s[C_RES + 1] = height;
+    s[C_ASPECT] = height > 0 ? width / height : 1;
+    s[C_OPACITY] = opacity;
+    s[C_PROGRESS] = m.progress;
+    s[C_TIME] = frame2.time;
+    s[C_BEATS] = frame2.beats;
+    s[C_BARS] = frame2.beats / 4;
+    s[C_BPM] = frame2.bpm;
+    s[C_DT_SEC] = frame2.dtSeconds;
+    s[C_DT_BEATS] = frame2.dtBeats;
+    s[C_SEED] = m.layer.seed % 16777216;
+    const rgb = oklchToLinear(frame2.palette[m.layer.spec.palette]);
+    s[C_COLOR] = rgb[0];
+    s[C_COLOR + 1] = rgb[1];
+    s[C_COLOR + 2] = rgb[2];
+    s[C_COLOR + 3] = frame2.palette[m.layer.spec.palette].intensity;
+    s[C_FRAME] = frame2.frame;
+    this.device.queue.writeBuffer(buffer, 0, s);
+  }
+  writeParams(desc, res, ctx, stage) {
+    const floats = desc.uniformFloats ?? 0;
+    if (floats <= 0) return;
+    const padded = Math.ceil(floats / 4) * 4;
+    const held = stage === "render" ? res.params : res.computeParams;
+    const heldFloats = stage === "render" ? res.paramFloats : res.computeParamFloats;
+    let buffer = held;
+    if (!buffer || heldFloats !== padded) {
+      held?.destroy();
+      buffer = this.device.createBuffer({
+        label: `params:${ctx.spec.id}:${stage}`,
+        size: padded * 4,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+      });
+      if (stage === "render") {
+        res.params = buffer;
+        res.paramFloats = padded;
+      } else {
+        res.computeParams = buffer;
+        res.computeParamFloats = padded;
+      }
+      this.bindGroups.clear();
+    }
+    if (this.paramStage.length < padded) this.paramStage = new Float32Array(padded);
+    const view = this.paramStage.subarray(0, padded);
+    view.fill(0);
+    desc.writeUniforms?.(view.subarray(0, floats), ctx);
+    this.device.queue.writeBuffer(buffer, 0, view);
+  }
+  // -- layouts, pipelines, bind groups -------------------------------------
+  module(label, code) {
+    const existing = this.modules.get(code);
+    if (existing) return existing;
+    const created = this.device.createShaderModule({ label, code });
+    void created.getCompilationInfo().then((info) => {
+      const errors = info.messages.filter((m) => m.type === "error");
+      if (errors.length) console.error(`[aaavs] shader ${label}:`, errors.map((m) => m.message).join("\n"));
+    });
+    this.modules.set(code, created);
+    return created;
+  }
+  /** Shape key: everything that changes the bind group layout, and nothing else. */
+  shapeKey(desc) {
+    return [
+      inputOf(desc) === "accumulator" ? "i" : "-",
+      historyOf(desc) ? "h" : "-",
+      (desc.uniformFloats ?? 0) > 0 ? "p" : "-",
+      desc.storage?.length ?? 0
+    ].join("");
+  }
+  renderLayout(desc) {
+    const key = this.shapeKey(desc);
+    const existing = this.renderLayouts.get(key);
+    if (existing) return existing;
+    const vis = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
+    const entries = [
+      { binding: PASS_BINDING.common, visibility: vis, buffer: { type: "uniform" } }
+    ];
+    if (inputOf(desc) === "accumulator") {
+      entries.push({ binding: PASS_BINDING.input, visibility: vis, texture: { sampleType: "float" } });
+      entries.push({ binding: PASS_BINDING.sampler, visibility: vis, sampler: { type: "filtering" } });
+    }
+    if (historyOf(desc)) {
+      if (inputOf(desc) !== "accumulator") {
+        entries.push({ binding: PASS_BINDING.sampler, visibility: vis, sampler: { type: "filtering" } });
+      }
+      entries.push({ binding: PASS_BINDING.history, visibility: vis, texture: { sampleType: "float" } });
+    }
+    if ((desc.uniformFloats ?? 0) > 0) {
+      entries.push({ binding: PASS_BINDING.params, visibility: vis, buffer: { type: "uniform" } });
+    }
+    const storage = desc.storage ?? [];
+    for (let i = 0; i < storage.length; i++) {
+      entries.push({
+        binding: PASS_BINDING.storage0 + i,
+        visibility: vis,
+        buffer: { type: "read-only-storage" }
+      });
+    }
+    const created = this.device.createBindGroupLayout({ label: `pass:${key}`, entries });
+    this.renderLayouts.set(key, created);
+    return created;
+  }
+  computeLayout(desc) {
+    const key = `c${this.shapeKey(desc)}`;
+    const existing = this.computeLayouts.get(key);
+    if (existing) return existing;
+    const vis = GPUShaderStage.COMPUTE;
+    const entries = [
+      { binding: PASS_BINDING.common, visibility: vis, buffer: { type: "uniform" } }
+    ];
+    if ((desc.uniformFloats ?? 0) > 0) {
+      entries.push({ binding: PASS_BINDING.params, visibility: vis, buffer: { type: "uniform" } });
+    }
+    const storage = desc.storage ?? [];
+    for (let i = 0; i < storage.length; i++) {
+      entries.push({
+        binding: PASS_BINDING.storage0 + i,
+        visibility: vis,
+        buffer: { type: "storage" }
+      });
+    }
+    const created = this.device.createBindGroupLayout({ label: key, entries });
+    this.computeLayouts.set(key, created);
+    return created;
+  }
+  /**
+   * The pipeline cache. Keyed on (type, target format, blend).
+   *
+   * All three matter. Format because an HDR pipeline bound to the swapchain is a
+   * validation error; blend because the blend state is baked into the pipeline
+   * and the same layer type appears at different blends in the same preset.
+   * Nothing else about a pass varies at runtime, which is why the descriptor's
+   * WGSL can be compiled once and reused for the lifetime of the page.
+   *
+   * `layout: 'auto'` is deliberately NOT used. An auto layout is private to its
+   * pipeline, so a bind group made for one cannot be set on another — and the
+   * audio bind group (`audiogpu.ts`) is one object shared by every pass in the
+   * project. Explicit layouts are the only way that sharing works.
+   */
+  renderPipeline(desc, format, blend) {
+    const key = `${desc.type}|${format}|${blend}`;
+    const existing = this.renderPipelines.get(key);
+    if (existing) return existing;
+    const plan2 = BLEND_PLANS[blend];
+    const state = plan2.implementation === "shader" ? BLEND_PLANS.replace.state : plan2.state;
+    const module = this.module(desc.type, desc.code);
+    const layouts = [this.renderLayout(desc)];
+    if (desc.usesAudio) layouts[AUDIO_GROUP] = this.audioGpu.layout;
+    const created = this.device.createRenderPipeline({
+      label: key,
+      layout: this.device.createPipelineLayout({ label: key, bindGroupLayouts: layouts }),
+      vertex: { module, entryPoint: "vs" },
+      fragment: { module, entryPoint: "fs", targets: [{ format, blend: state }] },
+      primitive: { topology: "triangle-list" }
+    });
+    this.renderPipelines.set(key, created);
+    return created;
+  }
+  computePipeline(desc) {
+    const compute = desc.compute;
+    if (!compute) throw new Error(`pass '${desc.type}' has no compute stage`);
+    const key = `${desc.type}|compute`;
+    const existing = this.computePipelines.get(key);
+    if (existing) return existing;
+    const layouts = [this.computeLayout(desc)];
+    if (desc.usesAudio) layouts[AUDIO_GROUP] = this.audioGpu.layout;
+    const created = this.device.createComputePipeline({
+      label: key,
+      layout: this.device.createPipelineLayout({ label: key, bindGroupLayouts: layouts }),
+      compute: {
+        module: this.module(`${desc.type}:compute`, compute.code),
+        entryPoint: compute.entryPoint ?? "main"
+      }
+    });
+    this.computePipelines.set(key, created);
+    return created;
+  }
+  /**
+   * Bind groups, cached by everything they point at.
+   *
+   * The texture uids are in the key because the accumulator swaps sides every
+   * transform. A cache keyed on the layer alone hands back a group aimed at the
+   * OTHER side, which is not an error, renders happily, and shows the previous
+   * pass's picture — the single hardest bug in this file to see. In the steady
+   * state a layer produces at most a handful of entries (the accumulator
+   * alternates between exactly two targets), so this allocates nothing per frame
+   * once warmed.
+   */
+  bindGroupFor(desc, m, res, source3, history) {
+    const srcUid = source3?.uid ?? 0;
+    const histUid = history?.uid ?? 0;
+    const key = `${m.layer.id}|${desc.type}|${srcUid}|${histUid}|${res.paramFloats}`;
+    const existing = this.bindGroups.get(key);
+    if (existing) return existing;
+    const entries = [
+      { binding: PASS_BINDING.common, resource: { buffer: res.common } }
+    ];
+    const wantsInput = inputOf(desc) === "accumulator";
+    if (wantsInput) {
+      entries.push({ binding: PASS_BINDING.input, resource: source3?.view ?? this.black() });
+    }
+    if (wantsInput || historyOf(desc)) {
+      entries.push({ binding: PASS_BINDING.sampler, resource: this.sampler });
+    }
+    if (historyOf(desc)) {
+      entries.push({ binding: PASS_BINDING.history, resource: history?.view ?? this.black() });
+    }
+    if (res.params) entries.push({ binding: PASS_BINDING.params, resource: { buffer: res.params } });
+    for (let i = 0; i < res.storage.length; i++) {
+      const buffer = res.storage[i];
+      if (buffer) entries.push({ binding: PASS_BINDING.storage0 + i, resource: { buffer } });
+    }
+    const created = this.device.createBindGroup({
+      label: key,
+      layout: this.renderLayout(desc),
+      entries
+    });
+    this.cacheBindGroup(key, created);
+    return created;
+  }
+  /**
+   * Insert with a ceiling.
+   *
+   * In the steady state the cache holds a handful of entries per layer — the
+   * accumulator alternates between exactly two targets — and never grows. It
+   * only climbs when the set of targets churns, which happens when a resolution
+   * scale is being dragged: every intermediate size mints new pooled targets
+   * with new uids and therefore new keys. Bind groups keep their textures alive,
+   * so an unbounded cache there is an unbounded texture leak. Dropping the lot
+   * costs one frame of rebuilds and is invisible.
+   */
+  cacheBindGroup(key, group) {
+    if (this.bindGroups.size >= 512) this.bindGroups.clear();
+    this.bindGroups.set(key, group);
+  }
+  computeBindGroup(desc, m, res) {
+    const common = res.computeCommon;
+    if (!common) throw new Error(`compute uniforms missing for layer '${m.layer.id}'`);
+    const key = `c|${m.layer.id}|${desc.type}|${res.computeParamFloats}`;
+    const existing = this.bindGroups.get(key);
+    if (existing) return existing;
+    const entries = [
+      { binding: PASS_BINDING.common, resource: { buffer: common } }
+    ];
+    if (res.computeParams) entries.push({ binding: PASS_BINDING.params, resource: { buffer: res.computeParams } });
+    for (let i = 0; i < res.storage.length; i++) {
+      const buffer = res.storage[i];
+      if (buffer) entries.push({ binding: PASS_BINDING.storage0 + i, resource: { buffer } });
+    }
+    const created = this.device.createBindGroup({
+      label: key,
+      layout: this.computeLayout(desc),
+      entries
+    });
+    this.cacheBindGroup(key, created);
+    return created;
+  }
+  /** Blit and composite pipelines. Same cache, distinct key space. */
+  utilityPipeline(name, code, format, blend, readsDst, withParams = false) {
+    const key = `~${name}|${format}|${blend}`;
+    const existing = this.renderPipelines.get(key);
+    if (existing) return existing;
+    const vis = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
+    const entries = [
+      { binding: PASS_BINDING.common, visibility: vis, buffer: { type: "uniform" } },
+      { binding: PASS_BINDING.input, visibility: vis, texture: { sampleType: "float" } },
+      { binding: PASS_BINDING.sampler, visibility: vis, sampler: { type: "filtering" } }
+    ];
+    if (readsDst) {
+      entries.push({ binding: PASS_BINDING.history, visibility: vis, texture: { sampleType: "float" } });
+    }
+    if (withParams) {
+      entries.push({ binding: PASS_BINDING.params, visibility: vis, buffer: { type: "uniform" } });
+    }
+    const layout = this.device.createBindGroupLayout({ label: key, entries });
+    const plan2 = BLEND_PLANS[blend];
+    const created = this.device.createRenderPipeline({
+      label: key,
+      layout: this.device.createPipelineLayout({ label: key, bindGroupLayouts: [layout] }),
+      vertex: { module: this.module(name, code), entryPoint: "vs" },
+      fragment: {
+        module: this.module(name, code),
+        entryPoint: "fs",
+        targets: [{ format, blend: plan2.implementation === "shader" ? BLEND_PLANS.replace.state : plan2.state }]
+      },
+      primitive: { topology: "triangle-list" }
+    });
+    this.renderPipelines.set(key, created);
+    return created;
+  }
+  /** Drop everything compiled for a type. Called when a descriptor is replaced (hot reload). */
+  evictType(type) {
+    for (const key of [...this.renderPipelines.keys()]) {
+      if (key.startsWith(`${type}|`)) this.renderPipelines.delete(key);
+    }
+    this.computePipelines.delete(`${type}|compute`);
+    this.bindGroups.clear();
+  }
+  black() {
+    if (this.blackView) return this.blackView;
+    const texture = this.device.createTexture({
+      label: "black-1x1",
+      size: [1, 1],
+      format: this.gpu.hdrFormat,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+    });
+    this.device.queue.writeTexture(
+      { texture },
+      new Uint16Array([0, 0, 0, 0]),
+      { bytesPerRow: 8 },
+      [1, 1]
+    );
+    this.blackView = texture.createView();
+    return this.blackView;
+  }
+  warnOnce(key, message) {
+    if (this.warned.has(key)) return;
+    this.warned.add(key);
+    console.warn(`[renderer] ${message}`);
+  }
+};
+function inputOf(desc) {
+  if (desc.input) return desc.family === "source" && desc.input === "accumulator" ? "none" : desc.input;
+  return desc.family === "source" ? "none" : "accumulator";
+}
+function historyOf(desc) {
+  return desc.history ?? desc.family === "feedback";
+}
+function clampScale(scale) {
+  if (!Number.isFinite(scale) || scale <= 0) return 1;
+  return scale > 1 ? 1 : scale;
+}
+function oklchToLinear(c) {
+  const h = c.h * Math.PI / 180;
+  const a = c.c * Math.cos(h);
+  const b = c.c * Math.sin(h);
+  const l_ = c.l + 0.3963377774 * a + 0.2158037573 * b;
+  const m_ = c.l - 0.1055613458 * a - 0.0638541728 * b;
+  const s_ = c.l - 0.0894841775 * a - 1.291485548 * b;
+  const l = l_ * l_ * l_;
+  const m = m_ * m_ * m_;
+  const s = s_ * s_ * s_;
+  const k = c.intensity;
+  return [
+    (4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s) * k,
+    (-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s) * k,
+    (-0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s) * k
+  ];
+}
+
+// src/shaders/lorenz.wgsl
+var lorenz_default = "// Lorenz attractor \u2014 compute prepass body.\n//\n// A trajectory is p[n+1] = f(p[n]): inherently SERIAL. It cannot be split\n// across GPU threads. So we run M *independent* trajectories with different\n// seeds \u2014 parallel across trajectories, serial along each \u2014 and advance every\n// one by K steps per dispatch.\n//\n// This is why the project is WebGPU (plan \xA74.5). On WebGL2 the same thing needs\n// transform feedback and a vertex shader pretending to be a compute kernel.\n//\n// ---------------------------------------------------------------------------\n// BINDINGS ARE NOT DECLARED HERE.\n//\n// `sources/lorenz.ts` prepends `PASS_COMMON_WGSL` (struct Common as `C`), the\n// shared `struct Lorenz` + its `var<uniform> P` at `PASS_BINDING.params`, and\n// the `var<storage, read_write> points` declaration at `PASS_BINDING.storage0`.\n// Every one of those numbers comes from `PASS_BINDING` in renderer.ts. This file\n// used to hand-write `@binding(0)` / `@binding(1)`, which is exactly the drift\n// that validates cleanly and then reads the wrong resource.\n// ---------------------------------------------------------------------------\n//\n// BUFFER LAYOUT \u2014 unchanged, and it is a contract with `points.wgsl`:\n// 8 floats per trajectory, i.e. two vec4s' worth.\n//   [i*8 + 0..2] = xyz current position\n//   [i*8 + 3]    = seeded flag (0 = never seeded)\n//   [i*8 + 4..6] = xyz previous position (start of this frame's step)\n//   [i*8 + 7]    = unused\n//\n// It is declared as `array<f32>` rather than `array<vec4<f32>>` because\n// `passBindingsWGSL` generates the render-side declaration and generates it as\n// `array<f32>`. The memory is identical either way \u2014 a vec4 array has a 16-byte\n// stride, which is these same four floats \u2014 but the two stages must AGREE about\n// the element type they index or the arithmetic silently diverges by a factor of\n// four. So both sides index floats.\n//\n// Keeping the previous position is what lets the renderer draw a *segment*\n// rather than a dot. Dots from 24k trajectories average into fog; segments\n// resolve into the filaments the attractor is actually made of.\n\nfn hash11(p: f32) -> f32 {\n  var x = fract(p * 0.1031);\n  x = x * (x + 33.33);\n  return fract((x + x) * x);\n}\n\n/**\n * The seeded scatter. A pure function of the trajectory INDEX, which is what\n * makes the first frame reproducible without a CPU-side init hook: the renderer\n * zero-fills a new storage buffer, `w == 0` fails the seeded test below, and\n * every thread scatters itself to the same place it did last run (\xA74.7).\n */\nfn seedPoint(i: f32) -> vec3<f32> {\n  return vec3<f32>(\n    (hash11(i + 0.13) - 0.5) * 24.0,\n    (hash11(i + 7.71) - 0.5) * 30.0,\n     hash11(i + 3.31) * 45.0 + 2.0,\n  );\n}\n\nfn storePoint(base: u32, cur: vec3<f32>, flag: f32, prev: vec3<f32>) {\n  points[base + 0u] = cur.x;\n  points[base + 1u] = cur.y;\n  points[base + 2u] = cur.z;\n  points[base + 3u] = flag;\n  points[base + 4u] = prev.x;\n  points[base + 5u] = prev.y;\n  points[base + 6u] = prev.z;\n  points[base + 7u] = 0.0;\n}\n\n@compute @workgroup_size(64)\nfn main(@builtin(global_invocation_id) gid : vec3<u32>) {\n  let i = gid.x;\n  if (f32(i) >= P.count) { return; }\n\n  let base = i * 8u;\n\n  if (points[base + 3u] < 0.5 || P.reseed > 0.5) {\n    let s = seedPoint(f32(i));\n    storePoint(base, s, 1.0, s);\n    return;\n  }\n\n  let start = vec3<f32>(points[base + 0u], points[base + 1u], points[base + 2u]);\n\n  // Forward Euler is enough: the step is tiny and the attractor is\n  // structurally stable, so integration error reads as texture, not as the\n  // wrong shape.\n  //\n  // P.dt is Lorenz time per SUBSTEP, and it was derived on the CPU from\n  // `dtBeats` \u2014 the ribbons therefore travel a fixed distance per BEAT at any\n  // refresh rate, which is the whole of art-direction \xA73.1. A fixed step per\n  // frame ran the attractor faster at 165 fps than at 60 and meant nothing\n  // musically.\n  var q = start;\n  let n = i32(P.steps);\n  for (var s = 0; s < n; s = s + 1) {\n    let d = vec3<f32>(\n      P.sigma * (q.y - q.x),\n      q.x * (P.rho - q.z) - q.y,\n      q.x * q.y - P.beta * q.z,\n    );\n    q = q + d * P.dt;\n  }\n\n  // Divergence guard. Driving rho from audio can push the system unstable, and\n  // without this one NaN poisons the buffer permanently. Written as `!(all(...))`\n  // rather than `any(... >= limit)` deliberately: a NaN compares false against\n  // everything, so only the negated form catches it.\n  if (!(all(abs(q) < vec3<f32>(1000.0)))) {\n    let s = seedPoint(f32(i) + 91.7);\n    storePoint(base, s, 1.0, s);\n    return;\n  }\n\n  storePoint(base, q, 1.0, start);\n}\n";
+
+// src/shaders/points.wgsl
+var points_default = "// Draws each trajectory's step as an additive line SEGMENT \u2014 the render body of\n// the `lorenz` source.\n//\n// No vertex buffer \u2014 the vertex shader indexes the same storage buffer the\n// compute prepass just wrote. In WebGL2 this needs transform feedback and a real\n// VBO; here it is one binding.\n//\n// Segments, not points, is the whole visual argument. 24k gaussian dots average\n// into a nebula; 24k short segments resolve into the filaments the attractor is\n// actually made of. Each segment is a quad (6 verts) built from prev -> cur,\n// which also gives it area to antialias across.\n//\n// ---------------------------------------------------------------------------\n// BINDINGS ARE NOT DECLARED HERE.\n//\n// `sources/lorenz.ts` prepends `PASS_COMMON_WGSL` (struct Common as `C`,\n// `fullscreenTriangle`, `fragUV`), the shared `struct Lorenz` + `var<uniform> P`\n// at `PASS_BINDING.params`, and `passBindingsWGSL` supplies\n// `var<storage, read> points : array<f32>` at `PASS_BINDING.storage0`.\n//\n// `points` is `array<f32>`, not `array<vec4<f32>>`: the renderer generates that\n// declaration and generates it as floats. Same bytes, but see the layout note in\n// `lorenz.wgsl` \u2014 both stages must index the same element type.\n//   [i*8 + 0..2] current xyz, [i*8 + 3] seeded flag,\n//   [i*8 + 4..6] previous xyz, [i*8 + 7] unused.\n//\n// The aspect ratio comes from `C.aspect` rather than from a param, because the\n// renderer already knows the attachment size and a second copy of it is a second\n// thing that can disagree with the attachment this pass is actually writing.\n// ---------------------------------------------------------------------------\n\nstruct VsOut {\n  @builtin(position) pos : vec4<f32>,\n  @location(0) across : f32,        // -1..1 across the segment's width\n  @location(1) tint   : vec3<f32>,\n};\n\nfn posAt(i : u32) -> vec3<f32> {\n  let b = i * 8u;\n  return vec3<f32>(points[b + 0u], points[b + 1u], points[b + 2u]);\n}\n\nfn prevAt(i : u32) -> vec3<f32> {\n  let b = i * 8u;\n  return vec3<f32>(points[b + 4u], points[b + 5u], points[b + 6u]);\n}\n\n// OKLab -> linear sRGB. Perceptual mixing matters even for two stops:\n// interpolating in sRGB passes through a grey dead-zone (art-direction \xA72.1).\nfn oklabToLinear(c: vec3<f32>) -> vec3<f32> {\n  let l_ = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;\n  let m_ = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;\n  let s_ = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;\n  let l = l_ * l_ * l_;\n  let m = m_ * m_ * m_;\n  let s = s_ * s_ * s_;\n  return vec3<f32>(\n    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,\n   -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,\n   -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,\n  );\n}\n\n/** World -> clip. Returns xy in NDC and the depth factor used for shading. */\nfn project(p: vec3<f32>) -> vec3<f32> {\n  // Centre on the attractor and view the x-z plane \u2014 the classic butterfly.\n  // Lorenz y becomes depth, so the spin below reveals its 3D structure.\n  var q = vec3<f32>(p.x, p.z - 25.0, p.y);\n  let c = cos(P.spin);\n  let s = sin(P.spin);\n  q = vec3<f32>(q.x * c - q.z * s, q.y, q.x * s + q.z * c);\n\n  let depth = 1.0 / (1.0 + max(q.z, -55.0) * 0.012);\n  var ndc = vec2<f32>(q.x, q.y) * P.scale * depth;\n  ndc.x = ndc.x / C.aspect;\n  return vec3<f32>(ndc, depth);\n}\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> VsOut {\n  let idx = vi / 6u;\n  let corner = vi % 6u;\n\n  let a = project(prevAt(idx));\n  let b = project(posAt(idx));\n\n  // Perpendicular to the segment, in NDC. A degenerate segment (a == b, which\n  // happens on the frame after a reseed) would produce NaN from normalize, so\n  // fall back to a fixed direction.\n  var dir = b.xy - a.xy;\n  let len = length(dir);\n  if (len < 1e-7) { dir = vec2<f32>(1.0, 0.0); } else { dir = dir / len; }\n  let nrm = vec2<f32>(-dir.y, dir.x);\n\n  let w = P.halfWidth;\n  let off = nrm * vec2<f32>(w / C.aspect, w);\n\n  // Two triangles: a-, a+, b-, b-, a+, b+\n  var pos : vec2<f32>;\n  var across : f32;\n  switch (corner) {\n    case 0u: { pos = a.xy - off; across = -1.0; }\n    case 1u: { pos = a.xy + off; across =  1.0; }\n    case 2u: { pos = b.xy - off; across = -1.0; }\n    case 3u: { pos = b.xy - off; across = -1.0; }\n    case 4u: { pos = a.xy + off; across =  1.0; }\n    default: { pos = b.xy + off; across =  1.0; }\n  }\n\n  // Hue walks with depth so the two lobes separate. Low chroma on purpose \u2014\n  // three hues maximum, and this is one of them (art-direction \xA72.2).\n  let h = P.hueShift + b.z * 0.9;\n  let lab = vec3<f32>(0.80, 0.10 * cos(h), 0.10 * sin(h));\n\n  // Fade very long segments. A trajectory crossing between lobes moves fast,\n  // and drawing that jump at full brightness paints a bright chord straight\n  // across the middle of the butterfly.\n  let speed = clamp(1.0 - len * 22.0, 0.05, 1.0);\n\n  var out : VsOut;\n  out.pos = vec4<f32>(pos, 0.0, 1.0);\n  out.across = across;\n  out.tint = max(oklabToLinear(lab), vec3<f32>(0.0)) * P.bright * b.z * speed;\n  return out;\n}\n\n@fragment\nfn fs(in : VsOut) -> @location(0) vec4<f32> {\n  // Gaussian across the width, so the segment has soft edges instead of a hard\n  // 1px ribbon. Additive hard edges band visibly where segments overlap.\n  let a = exp(-in.across * in.across * 3.0);\n  // C.opacity is the one obligation PASS_COMMON_WGSL imposes: fixed-function\n  // blending has no per-draw multiplier, so a pass that ignores it is a pass\n  // whose opacity slider does nothing.\n  return vec4<f32>(in.tint * a, a) * C.opacity;\n}\n";
+
+// src/sources/lorenz.ts
+var UNIFORM_FLOATS = 12;
+var U_DT = 0;
+var U_STEPS = 1;
+var U_RHO = 2;
+var U_SIGMA = 3;
+var U_BETA = 4;
+var U_COUNT = 5;
+var U_RESEED = 6;
+var U_SPIN = 7;
+var U_SCALE = 8;
+var U_HALF_WIDTH = 9;
+var U_BRIGHT = 10;
+var U_HUE_SHIFT = 11;
+var TAU = Math.PI * 2;
+var PARAMS_WGSL = (
+  /* wgsl */
+  `
+struct Lorenz {
+  dt        : f32,   // Lorenz time per SUBSTEP. Derived from dtBeats on the CPU.
+  steps     : f32,   // substeps per dispatch
+  rho       : f32,   // bifurcation parameter \u2014 audio drives this
+  sigma     : f32,
+  beta      : f32,
+  count     : f32,   // trajectories
+  reseed    : f32,   // > 0.5 scatters every trajectory again
+  spin      : f32,   // radians about the vertical
+  scale     : f32,   // world -> NDC fit
+  halfWidth : f32,   // half-width of a segment, NDC
+  bright    : f32,   // per-frame contribution. Tiny; see below.
+  hueShift  : f32,   // radians
+};
+
+@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Lorenz;
+`
+);
+var STORAGE_RW_WGSL = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.storage0}) var<storage, read_write> points : array<f32>;`;
+var LORENZ_DEFAULTS = {
+  /** Independent trajectories. 24k segments is ~144k vertices — trivial for the GPU, and the buffer is 768 KB. */
+  trajectories: 24e3,
+  /** Euler substeps per dispatch. More substeps buy a smoother curve, not a faster one. */
+  substeps: 6,
+  /** Lorenz time units advanced per BEAT. The whole reason the ribbons travel with the music. */
+  simPerBeat: 0.85,
+  /** Classic Lorenz constants. `rho` is the one audio moves. */
+  sigma: 10,
+  beta: 8 / 3,
+  rhoBase: 28,
+  /** How far the low band pushes rho. Pushing rho changes the attractor's SHAPE, not just its brightness. */
+  rhoLow: 14,
+  /** How far the layer's envelope pushes rho. */
+  rhoPulse: 6,
+  /** Bars per full revolution. Bars, not seconds — the spin phrases with the music. */
+  spinBars: 16,
+  /** Bars per full hue rotation. Slow: three hues maximum (art-direction §2.2). */
+  hueBars: 48,
+  /**
+   * Per-frame brightness floor. TINY on purpose: with a trail of retention k the
+   * accumulator settles at B/(1-k), which at a 1-beat tau and 165 fps is ~50x.
+   * Tuning this as though each frame stood alone is what blew the first attempt
+   * out to white in about a second.
+   */
+  brightBase: 0.06,
+  /** Added per unit of broadband level. */
+  brightLevel: 0.12,
+  /** Added per unit of envelope. The old chain's `pulse` and `env` terms, summed — see the header. */
+  brightEnv: 0.08,
+  /**
+   * World -> NDC fit. The attractor spans x in [-20,20] and z in [0,50] (so
+   * +/-25 once centred), and weak perspective widens that by up to ~1.4x.
+   * 25 * s * 1.4 should land near 0.85 NDC, hence ~0.022.
+   */
+  fit: 0.022,
+  /** Half-width of a segment in NDC. Below ~0.001 the gaussian has nothing to fall across. */
+  thickness: 16e-4
+};
+var MAX_TRAJECTORIES = 262144;
+var BYTES_PER_TRAJECTORY = 8 * 4;
+var MAX_DT_BEATS = 0.5;
+function num2(params, key, lo, hi) {
+  const fallback = LORENZ_DEFAULTS[key];
+  const raw = params[key] ?? fallback;
+  const v = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(v)) return typeof fallback === "number" ? fallback : lo;
+  return v < lo ? lo : v > hi ? hi : v;
+}
+function trajectoryCount(params) {
+  return Math.max(1, Math.floor(num2(params, "trajectories", 1, MAX_TRAJECTORIES)));
+}
+function fract(v) {
+  return v - Math.floor(v);
+}
+var POINTS = {
+  label: "points",
+  bytes: (params) => trajectoryCount(params) * BYTES_PER_TRAJECTORY
+};
+var SHAPE = {
+  type: "lorenz",
+  family: "source",
+  input: "none",
+  uniformFloats: UNIFORM_FLOATS,
+  storage: [POINTS]
+};
+var lorenzPass = {
+  ...SHAPE,
+  code: [
+    PASS_COMMON_WGSL,
+    PARAMS_WGSL,
+    passBindingsWGSL({ ...SHAPE, code: "" }),
+    points_default
+  ].join("\n"),
+  compute: {
+    code: [
+      PASS_COMMON_WGSL,
+      PARAMS_WGSL,
+      STORAGE_RW_WGSL,
+      lorenz_default
+    ].join("\n"),
+    entryPoint: "main",
+    // `@workgroup_size(64)` in the shader. `Math.ceil` is applied by the
+    // renderer, so a count that is not a multiple of 64 dispatches one partial
+    // group and the shader's `i >= P.count` guard retires the excess threads.
+    workgroups: (ctx) => trajectoryCount(ctx.params) / 64
+  },
+  draw: {
+    kind: "vertices",
+    // Six vertices per segment quad, and ZERO at progress 0 — a spent layer is a
+    // true no-op (Phase 5 DoD), not a draw that happens to be transparent.
+    vertexCount: (ctx) => ctx.progress > 0 ? 6 * trajectoryCount(ctx.params) : 0
+  },
+  /**
+   * Full resolution. The segments are ~1.6e-3 NDC half-width — thinner than two
+   * pixels at 1440p — and their antialiasing is defined in attachment pixels, so
+   * a half-res pass is a half-res line smeared bilinearly back up. Advisory only;
+   * §4.11 says the scale is a budget decision and the budget belongs to the show.
+   */
+  defaultResolutionScale: 1,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    const count = trajectoryCount(p);
+    const substeps = Math.max(1, Math.floor(num2(p, "substeps", 1, 64)));
+    const dtRaw = Number.isFinite(ctx.dtBeats) ? ctx.dtBeats : 0;
+    const dtBeats = dtRaw <= 0 ? 0 : Math.min(dtRaw, MAX_DT_BEATS);
+    out[U_DT] = num2(p, "simPerBeat", 0, 64) * dtBeats / substeps;
+    out[U_STEPS] = substeps;
+    out[U_RHO] = num2(p, "rhoBase", 0, 200) + ctx.audio.bands.low * num2(p, "rhoLow", -64, 64) + ctx.progress * num2(p, "rhoPulse", -64, 64);
+    out[U_SIGMA] = num2(p, "sigma", 0, 100);
+    out[U_BETA] = num2(p, "beta", 0, 100);
+    out[U_COUNT] = count;
+    out[U_RESEED] = 0;
+    out[U_SPIN] = fract(ctx.bars / Math.max(num2(p, "spinBars", 1e-3, 4096), 1e-3)) * TAU;
+    out[U_HUE_SHIFT] = fract(ctx.bars / Math.max(num2(p, "hueBars", 1e-3, 4096), 1e-3)) * TAU;
+    out[U_SCALE] = num2(p, "fit", 0, 1) * Math.min(1, ctx.aspect * 1.15);
+    out[U_HALF_WIDTH] = num2(p, "thickness", 0, 0.1);
+    out[U_BRIGHT] = num2(p, "brightBase", 0, 1) + ctx.audio.level * num2(p, "brightLevel", 0, 1) + ctx.progress * num2(p, "brightEnv", 0, 1);
+  }
+};
+
+// src/shaders/attractor-common.wgsl
+var attractor_common_default = '// Shared compute-side helper for the strange-attractor family (plan \xA78.3).\n//\n// Prepended by every attractor source AFTER its params block and its\n// `var<storage, read_write> points` declaration, and BEFORE the per-attractor\n// body \u2014 WGSL resolves module-scope identifiers in declaration order, so the\n// concatenation order in the TypeScript descriptor is load-bearing.\n//\n// One function, deliberately. Anything that touches the storage buffer differs\n// between the two halves of the family: the continuous flows keep 8 floats per\n// trajectory (current xyz, flag, previous xyz) because they draw SEGMENTS, and\n// the iterated maps keep 4 (xy, flag, iteration count) because they draw POINTS.\n// A "shared" store function would have to know which, which is one branch more\n// than either case needs.\n//\n// This is byte-identical to `lorenz.wgsl`\'s hash on purpose. The seeded scatter\n// is what makes the first frame reproducible without a CPU init hook (\xA74.7), and\n// two hashes that are nearly the same is how two sources that should agree\n// quietly stop agreeing.\n\nfn hash11(p: f32) -> f32 {\n  var x = fract(p * 0.1031);\n  x = x * (x + 33.33);\n  return fract((x + x) * x);\n}\n';
+
+// src/shaders/attr-rossler.wgsl
+var attr_rossler_default = "// Rossler attractor \u2014 the vector field and the seeded scatter. Everything else\n// (storage layout, per-beat step, divergence guard, entry point) comes from\n// `attractor-flow-main.wgsl`, concatenated after this.\n//\n//   dx/dt = -y - z\n//   dy/dt =  x + a*y\n//   dz/dt =  b + z*(x - c)\n//\n// CANONICAL VALUES: a = 0.2, b = 0.2, c = 5.7. That is the classic single-scroll\n// band, and it is the one every published picture of this system uses.\n//\n// `c` is the bifurcation parameter and the one audio drives. The period-doubling\n// cascade is legible in it and lands inside a range a band meter can reach:\n//\n//   c = 2.5   a single closed loop (period 1)\n//   c = 3.5   period 2\n//   c = 4.0   period 4\n//   c = 4.23  chaos begins\n//   c = 5.7   the canonical attractor\n//   c = 9-18  a progressively wider, flatter chaotic band\n//\n// So pushing `c` genuinely changes the figure's SHAPE \u2014 a loop opening into a\n// ribbon and then into a broad band \u2014 rather than merely making it brighter,\n// which is what art-direction \xA73.3 asks an audio driver to do.\n//\n// P.pa = a, P.pb = b, P.pc = c.\n\nfn deriv(q : vec3<f32>) -> vec3<f32> {\n  return vec3<f32>(\n    -q.y - q.z,\n     q.x + P.pa * q.y,\n     P.pb + q.z * (q.x - P.pc),\n  );\n}\n\n/**\n * The scatter. Rossler at these parameters is globally attracting from a wide\n * neighbourhood of the origin, so a loose cloud is safe \u2014 every trajectory\n * spirals onto the band within a couple of turns and there is no basin edge to\n * fall off.\n *\n * `z` is kept small and positive because the z excursion is the fast part of the\n * orbit; seeding into it starts trajectories mid-spike and briefly draws a\n * curtain of long segments.\n */\nfn seedPoint(i : f32) -> vec3<f32> {\n  return vec3<f32>(\n    (hash11(i + 0.13) - 0.5) * 16.0,\n    (hash11(i + 7.71) - 0.5) * 16.0,\n     hash11(i + 3.31) * 3.0,\n  );\n}\n";
+
+// src/shaders/attractor-flow-main.wgsl
+var attractor_flow_main_default = "// The compute entry point shared by every CONTINUOUS attractor (Rossler,\n// Thomas, Halvorsen \u2014 and structurally the same thing `lorenz.wgsl` writes out\n// longhand).\n//\n// Concatenated LAST, after `attractor-common.wgsl` (hash11) and after the\n// per-attractor body, which supplies exactly two functions:\n//\n//   fn deriv(q : vec3<f32>) -> vec3<f32>   the vector field, dp/dt\n//   fn seedPoint(i : f32)   -> vec3<f32>   a scatter inside the basin\n//\n// Splitting it this way is the whole reason the family is cheap: a new flow is\n// ~15 lines of arithmetic plus a parameter table, and it inherits the storage\n// layout, the per-beat step, the divergence guard and the segment renderer\n// without restating any of them.\n//\n// BUFFER LAYOUT \u2014 a contract with `attractor-flow.wgsl`:\n//   [i*8 + 0..2] current xyz\n//   [i*8 + 3]    seeded flag (0 = never seeded)\n//   [i*8 + 4..6] previous xyz \u2014 the START of this dispatch's step\n//   [i*8 + 7]    unused\n//\n// Keeping the previous position is what lets the draw emit a SEGMENT rather\n// than a dot, and that single choice is most of the visual quality in the whole\n// family: N gaussian dots average into fog, N short segments resolve into the\n// filaments the attractor is actually made of.\n\nfn storePoint(base: u32, cur: vec3<f32>, flag: f32, prev: vec3<f32>) {\n  points[base + 0u] = cur.x;\n  points[base + 1u] = cur.y;\n  points[base + 2u] = cur.z;\n  points[base + 3u] = flag;\n  points[base + 4u] = prev.x;\n  points[base + 5u] = prev.y;\n  points[base + 6u] = prev.z;\n  points[base + 7u] = 0.0;\n}\n\n@compute @workgroup_size(64)\nfn main(@builtin(global_invocation_id) gid : vec3<u32>) {\n  let i = gid.x;\n  if (f32(i) >= P.count) { return; }\n\n  let base = i * 8u;\n\n  // A zero-filled buffer fails the seeded test, so the first dispatch after\n  // allocation scatters every trajectory from a pure function of its index \u2014\n  // no CPU seeding step, and identical on every run (\xA74.7).\n  if (points[base + 3u] < 0.5 || P.reseed > 0.5) {\n    let s = seedPoint(f32(i));\n    storePoint(base, s, 1.0, s);\n    return;\n  }\n\n  let start = vec3<f32>(points[base + 0u], points[base + 1u], points[base + 2u]);\n\n  // Forward Euler. The step is tiny and these systems are structurally stable,\n  // so integration error reads as texture rather than as the wrong shape.\n  //\n  // `P.dt` is simulation time per SUBSTEP and was derived on the CPU from\n  // `dtBeats`, so a ribbon travels a fixed distance per BEAT at any refresh\n  // rate (art-direction \xA73.1). A fixed step per frame runs the attractor faster\n  // at 165 fps than at 60 and means nothing musically.\n  var q = start;\n  let n = i32(P.steps);\n  for (var s = 0; s < n; s = s + 1) {\n    q = q + deriv(q) * P.dt;\n  }\n\n  // Divergence guard. Audio drives a bifurcation parameter, which can and does\n  // push these systems outside their attracting set; without this, one NaN\n  // poisons the storage buffer permanently. Written as `!(all(...))` rather\n  // than `any(... >= limit)` deliberately \u2014 a NaN compares false against\n  // everything, so only the negated form catches it.\n  //\n  // The reseed offset differs from the initial one so a trajectory that keeps\n  // escaping does not land on the same doomed point every frame and strobe.\n  if (!(all(abs(q) < vec3<f32>(1000.0)))) {\n    let s = seedPoint(f32(i) + 91.7);\n    storePoint(base, s, 1.0, s);\n    return;\n  }\n\n  storePoint(base, q, 1.0, start);\n}\n";
+
+// src/shaders/attractor-flow.wgsl
+var attractor_flow_default = "// The draw shared by every CONTINUOUS attractor in the family. One additive\n// line SEGMENT per trajectory per frame, no vertex buffer \u2014 the vertex stage\n// indexes the same storage buffer the compute prepass just wrote.\n//\n// This is `points.wgsl` generalised. The only thing that file hard-codes and\n// this one does not is the projection: Lorenz wants its y axis as depth (the\n// butterfly lives in x-z), whereas Rossler, Thomas and Halvorsen all read\n// correctly with x-y as the picture plane and z as depth. Rather than carry an\n// axis-permutation mode, the centring offset is a uniform and each source names\n// its own \u2014 a wrong constant here is a blob, not an attractor.\n//\n// ---------------------------------------------------------------------------\n// BINDINGS ARE NOT DECLARED HERE.\n//\n// The source module prepends `PASS_COMMON_WGSL` (struct Common as `C`), its own\n// params struct at `PASS_BINDING.params`, and `passBindingsWGSL` supplies\n// `var<storage, read> points : array<f32>` at `PASS_BINDING.storage0`. Every\n// number comes from `PASS_BINDING` in renderer.ts.\n//\n// `points` is `array<f32>`, matching the generated declaration. Same bytes as a\n// vec4 array, but both stages must index the same element type or the\n// arithmetic silently diverges by a factor of four. Layout is in\n// `attractor-flow-main.wgsl`.\n//\n// The params struct must expose these fields, identically named, in every\n// source that uses this body: spin, scale, halfWidth, bright, hueShift,\n// centreX, centreY, centreZ, depthK, hueSpread.\n// ---------------------------------------------------------------------------\n\nstruct VsOut {\n  @builtin(position) pos : vec4<f32>,\n  @location(0) across : f32,        // -1..1 across the segment's width\n  @location(1) tint   : vec3<f32>,\n};\n\nfn posAt(i : u32) -> vec3<f32> {\n  let b = i * 8u;\n  return vec3<f32>(points[b + 0u], points[b + 1u], points[b + 2u]);\n}\n\nfn prevAt(i : u32) -> vec3<f32> {\n  let b = i * 8u;\n  return vec3<f32>(points[b + 4u], points[b + 5u], points[b + 6u]);\n}\n\n// OKLab -> linear sRGB. Perceptual mixing matters even for two stops:\n// interpolating in sRGB passes through a grey dead-zone (art-direction \xA72.1).\nfn oklabToLinear(c: vec3<f32>) -> vec3<f32> {\n  let l_ = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;\n  let m_ = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;\n  let s_ = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;\n  let l = l_ * l_ * l_;\n  let m = m_ * m_ * m_;\n  let s = s_ * s_ * s_;\n  return vec3<f32>(\n    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,\n   -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,\n   -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,\n  );\n}\n\n/** World -> clip. Returns xy in NDC and the depth factor used for shading. */\nfn project(p: vec3<f32>) -> vec3<f32> {\n  var q = p - vec3<f32>(P.centreX, P.centreY, P.centreZ);\n\n  // Rotation about the VERTICAL, which is what reveals the 3D structure of a\n  // flow that would otherwise read as a flat scribble. `P.spin` is an absolute\n  // angle derived from `bars`, never an integrated one \u2014 an integrated angle is\n  // a function of frame history and two runs at different pacing end up\n  // pointing different ways (\xA74.7).\n  let c = cos(P.spin);\n  let s = sin(P.spin);\n  q = vec3<f32>(q.x * c - q.z * s, q.y, q.x * s + q.z * c);\n\n  // Weak perspective. The clamp keeps the denominator away from zero: a point\n  // far enough behind the eye would otherwise flip sign and throw the segment\n  // across the frame. 0.6 caps the near gain at 2.5x.\n  let k = max(P.depthK, 1e-4);\n  let depth = 1.0 / (1.0 + max(q.z, -0.6 / k) * k);\n\n  var ndc = vec2<f32>(q.x, q.y) * P.scale * depth;\n  ndc.x = ndc.x / C.aspect;\n  return vec3<f32>(ndc, depth);\n}\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> VsOut {\n  let idx = vi / 6u;\n  let corner = vi % 6u;\n\n  let a = project(prevAt(idx));\n  let b = project(posAt(idx));\n\n  // Perpendicular to the segment, in NDC. A degenerate segment (a == b, which\n  // happens on the frame after a reseed) would make normalize return NaN, so\n  // fall back to a fixed direction.\n  var dir = b.xy - a.xy;\n  let len = length(dir);\n  if (len < 1e-7) { dir = vec2<f32>(1.0, 0.0); } else { dir = dir / len; }\n  let nrm = vec2<f32>(-dir.y, dir.x);\n\n  // VARY LINE WEIGHT (art-direction \xA74.4). Uniform stroke reads flat and\n  // machine-drawn. Two analytic terms, no noise: near segments are heavier than\n  // far ones, and a segment crossing fast is drawn finer than one dwelling \u2014\n  // which is also the correct physical reading, since a fast segment covers the\n  // same ink over more length.\n  let w = P.halfWidth\n        * (0.55 + 0.75 * b.z)\n        * (1.0 - 0.35 * clamp(len * 30.0, 0.0, 1.0));\n  let off = nrm * vec2<f32>(w / C.aspect, w);\n\n  // Two triangles: a-, a+, b-, b-, a+, b+\n  var pos : vec2<f32>;\n  var across : f32;\n  switch (corner) {\n    case 0u: { pos = a.xy - off; across = -1.0; }\n    case 1u: { pos = a.xy + off; across =  1.0; }\n    case 2u: { pos = b.xy - off; across = -1.0; }\n    case 3u: { pos = b.xy - off; across = -1.0; }\n    case 4u: { pos = a.xy + off; across =  1.0; }\n    default: { pos = b.xy + off; across =  1.0; }\n  }\n\n  // Hue walks with DEPTH only, over a narrow spread. That is one hue plus its\n  // neighbours, not a rainbow \u2014 hue variety within a frame is the number one\n  // amateur tell (art-direction \xA72.2), while slow rotation of the whole band\n  // over bars is fine and is what `hueShift` does.\n  let h = P.hueShift + b.z * P.hueSpread;\n  let lab = vec3<f32>(0.82, 0.085 * cos(h), 0.085 * sin(h));\n\n  // Fade long segments. A trajectory jumping between lobes moves fast, and\n  // drawing that jump at full brightness paints a bright chord straight across\n  // the figure \u2014 the same artefact that makes segment rendering wrong for the\n  // iterated maps entirely.\n  let speed = clamp(1.0 - len * 22.0, 0.05, 1.0);\n\n  var out : VsOut;\n  out.pos = vec4<f32>(pos, 0.0, 1.0);\n  out.across = across;\n  out.tint = max(oklabToLinear(lab), vec3<f32>(0.0)) * P.bright * b.z * speed;\n  return out;\n}\n\n@fragment\nfn fs(in : VsOut) -> @location(0) vec4<f32> {\n  // Analytic AA: a gaussian across the width, so the segment has soft edges\n  // instead of a hard ribbon. Aliased hairlines are the fastest way to look\n  // 2003 (art-direction \xA74.5), and additive hard edges band where they overlap.\n  let a = exp(-in.across * in.across * 3.0);\n  // C.opacity is the one obligation PASS_COMMON_WGSL imposes: fixed-function\n  // blending has no per-draw multiplier, so a pass that ignores it is a pass\n  // whose opacity slider does nothing.\n  return vec4<f32>(in.tint * a, a) * C.opacity;\n}\n";
+
+// src/sources/rossler.ts
+var UNIFORM_FLOATS2 = 17;
+var U_DT2 = 0;
+var U_STEPS2 = 1;
+var U_PA = 2;
+var U_PB = 3;
+var U_PC = 4;
+var U_COUNT2 = 5;
+var U_RESEED2 = 6;
+var U_SPIN2 = 7;
+var U_SCALE2 = 8;
+var U_HALF_WIDTH2 = 9;
+var U_BRIGHT2 = 10;
+var U_HUE_SHIFT2 = 11;
+var U_CENTRE_X = 12;
+var U_CENTRE_Y = 13;
+var U_CENTRE_Z = 14;
+var U_DEPTH_K = 15;
+var U_HUE_SPREAD = 16;
+var TAU2 = Math.PI * 2;
+var PARAMS_WGSL2 = (
+  /* wgsl */
+  `
+struct Rossler {
+  dt        : f32,   // simulation time per SUBSTEP. Derived from dtBeats on the CPU.
+  steps     : f32,   // substeps per dispatch
+  pa        : f32,   // a \u2014 canonical 0.2
+  pb        : f32,   // b \u2014 canonical 0.2
+  pc        : f32,   // c \u2014 canonical 5.7. The bifurcation parameter; audio drives it.
+  count     : f32,   // trajectories
+  reseed    : f32,   // > 0.5 scatters every trajectory again
+  spin      : f32,   // radians about the vertical
+  scale     : f32,   // world -> NDC fit
+  halfWidth : f32,   // half-width of a segment, NDC, before the weight variation
+  bright    : f32,   // per-frame contribution. Tiny; see below.
+  hueShift  : f32,   // radians
+  centreX   : f32,   // world point the projection centres on
+  centreY   : f32,
+  centreZ   : f32,
+  depthK    : f32,   // perspective strength
+  hueSpread : f32,   // radians of hue walked across the depth range
+};
+
+@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Rossler;
+`
+);
+var STORAGE_RW_WGSL2 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.storage0}) var<storage, read_write> points : array<f32>;`;
+var ROSSLER_DEFAULTS = {
+  /** Independent trajectories. 24k segments is ~144k vertices and a 768 KB buffer. */
+  trajectories: 24e3,
+  /** Euler substeps per dispatch. More substeps buy a smoother curve, not a faster one. */
+  substeps: 6,
+  /**
+   * Simulation time advanced per BEAT. Rossler's orbital period is ~6 time
+   * units at the canonical parameters, so 1.5 is a quarter turn of the scroll
+   * per beat — fast enough to read as travel, slow enough that a frame's
+   * segment is short.
+   */
+  simPerBeat: 1.5,
+  a: 0.2,
+  b: 0.2,
+  /** The bifurcation parameter. */
+  cBase: 5.7,
+  /**
+   * How far the MID band pushes c. Mid rather than low deliberately — the low
+   * band is Lorenz's driver, and art-direction §3.3 says two layers on the same
+   * driver breathe together and read as one pulsing blob.
+   *
+   * 5.7 + 4.5 = 10.2 at a full mid band: the scroll opens from a ribbon into a
+   * broad chaotic sheet. That is a change of SHAPE, which is what a driver is
+   * for.
+   */
+  cMid: 4.5,
+  /** How far the layer's envelope pushes c. */
+  cPulse: 2,
+  /** Bars per full revolution. Bars, not seconds — the spin phrases with the music. */
+  spinBars: 24,
+  /** Bars per full hue rotation. Slow: three hues maximum (art-direction §2.2). */
+  hueBars: 64,
+  /**
+   * Per-frame brightness floor. TINY on purpose: with a trail of retention k the
+   * accumulator settles at B/(1-k), which at a one-beat tau and 165 fps is ~50x.
+   * Tuning this as though each frame stood alone is what blows the frame out to
+   * white in about a second.
+   */
+  brightBase: 0.06,
+  /** Added per unit of broadband level. */
+  brightLevel: 0.12,
+  /** Added per unit of envelope. */
+  brightEnv: 0.08,
+  /**
+   * World -> NDC fit. The attractor spans x in [-10,12] and y in [-11,8] at
+   * c = 5.7, so ~11 units from the centre below; 11 * 0.042 * 1.52 (the near
+   * end of the perspective — `depth = 1/(1 + z*k)` is not symmetric about 1, so
+   * the near gain is larger than the far loss) lands around 0.70 NDC, which
+   * leaves headroom for the figure growing as audio pushes c up.
+   */
+  fit: 0.042,
+  /** Half-width of a segment in NDC, before the depth/speed variation in the shader. */
+  thickness: 16e-4,
+  /** Centre of the figure at c = 5.7. z is offset because the z spike is one-sided. */
+  centreX: 1,
+  centreY: -1.5,
+  centreZ: 6,
+  /** Perspective strength. The rotated depth range is ~+/-19, so 0.018 gives roughly 0.7x..1.5x. */
+  depthK: 0.018,
+  /** Radians of hue walked across that depth range. Narrow — one hue and its neighbours. */
+  hueSpread: 0.9
+};
+var MAX_TRAJECTORIES2 = 262144;
+var BYTES_PER_TRAJECTORY2 = 8 * 4;
+var MAX_DT_BEATS2 = 0.5;
+function num3(params, key, lo, hi) {
+  const fallback = ROSSLER_DEFAULTS[key];
+  const raw = params[key] ?? fallback;
+  const v = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(v)) return typeof fallback === "number" ? fallback : lo;
+  return v < lo ? lo : v > hi ? hi : v;
+}
+function trajectoryCount2(params) {
+  return Math.max(1, Math.floor(num3(params, "trajectories", 1, MAX_TRAJECTORIES2)));
+}
+function fract2(v) {
+  return v - Math.floor(v);
+}
+var POINTS2 = {
+  label: "points",
+  bytes: (params) => trajectoryCount2(params) * BYTES_PER_TRAJECTORY2
+};
+var SHAPE2 = {
+  type: "rossler",
+  family: "source",
+  input: "none",
+  uniformFloats: UNIFORM_FLOATS2,
+  storage: [POINTS2]
+};
+var rosslerPass = {
+  ...SHAPE2,
+  code: [
+    PASS_COMMON_WGSL,
+    PARAMS_WGSL2,
+    passBindingsWGSL({ ...SHAPE2, code: "" }),
+    attractor_flow_default
+  ].join("\n"),
+  compute: {
+    // Order is load-bearing: WGSL resolves module-scope names in declaration
+    // order, so the hash comes before the seed that calls it and the field comes
+    // before the main that integrates it.
+    code: [
+      PASS_COMMON_WGSL,
+      PARAMS_WGSL2,
+      STORAGE_RW_WGSL2,
+      attractor_common_default,
+      attr_rossler_default,
+      attractor_flow_main_default
+    ].join("\n"),
+    entryPoint: "main",
+    // `@workgroup_size(64)` in the shader. `Math.ceil` is applied by the
+    // renderer, so a count that is not a multiple of 64 dispatches one partial
+    // group and the shader's `i >= P.count` guard retires the excess threads.
+    workgroups: (ctx) => trajectoryCount2(ctx.params) / 64
+  },
+  draw: {
+    kind: "vertices",
+    // Six vertices per segment quad, and ZERO at progress 0 — a spent layer is a
+    // true no-op (Phase 5 DoD), not a draw that happens to be transparent.
+    vertexCount: (ctx) => ctx.progress > 0 ? 6 * trajectoryCount2(ctx.params) : 0
+  },
+  /**
+   * Full resolution. The segments are ~1.6e-3 NDC half-width — thinner than two
+   * pixels at 1440p — and their antialiasing is defined in attachment pixels, so
+   * a half-res pass is a half-res line smeared bilinearly back up. Advisory
+   * only; §4.11 says the scale is a budget decision.
+   */
+  defaultResolutionScale: 1,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    const count = trajectoryCount2(p);
+    const substeps = Math.max(1, Math.floor(num3(p, "substeps", 1, 64)));
+    const dtRaw = Number.isFinite(ctx.dtBeats) ? ctx.dtBeats : 0;
+    const dtBeats = dtRaw <= 0 ? 0 : Math.min(dtRaw, MAX_DT_BEATS2);
+    out[U_DT2] = num3(p, "simPerBeat", 0, 64) * dtBeats / substeps;
+    out[U_STEPS2] = substeps;
+    out[U_PA] = num3(p, "a", -4, 4);
+    out[U_PB] = num3(p, "b", -4, 4);
+    const c = num3(p, "cBase", 0, 32) + ctx.audio.bands.mid * num3(p, "cMid", -32, 32) + ctx.progress * num3(p, "cPulse", -32, 32);
+    out[U_PC] = Math.min(Math.max(c, 2), 24);
+    out[U_COUNT2] = count;
+    out[U_RESEED2] = 0;
+    out[U_SPIN2] = fract2(ctx.bars / Math.max(num3(p, "spinBars", 1e-3, 4096), 1e-3)) * TAU2;
+    out[U_HUE_SHIFT2] = fract2(ctx.bars / Math.max(num3(p, "hueBars", 1e-3, 4096), 1e-3)) * TAU2;
+    out[U_SCALE2] = num3(p, "fit", 0, 1) * Math.min(1, ctx.aspect * 1.15);
+    out[U_HALF_WIDTH2] = num3(p, "thickness", 0, 0.1);
+    out[U_BRIGHT2] = num3(p, "brightBase", 0, 1) + ctx.audio.level * num3(p, "brightLevel", 0, 1) + ctx.progress * num3(p, "brightEnv", 0, 1);
+    out[U_CENTRE_X] = num3(p, "centreX", -256, 256);
+    out[U_CENTRE_Y] = num3(p, "centreY", -256, 256);
+    out[U_CENTRE_Z] = num3(p, "centreZ", -256, 256);
+    out[U_DEPTH_K] = num3(p, "depthK", 1e-4, 1);
+    out[U_HUE_SPREAD] = num3(p, "hueSpread", 0, 6.283);
+  }
+};
+
+// src/shaders/attr-thomas.wgsl
+var attr_thomas_default = "// Thomas' cyclically symmetric attractor \u2014 vector field and seeded scatter.\n// The rest comes from `attractor-flow-main.wgsl`.\n//\n//   dx/dt = sin(y) - b*x\n//   dy/dt = sin(z) - b*y\n//   dz/dt = sin(x) - b*z\n//\n// CANONICAL VALUE: b = 0.208186. That is the standard chaotic setting and the\n// one every published picture uses.\n//\n// `b` is the dissipation, and it is the bifurcation parameter \u2014 this system's\n// whole route to chaos is a single slide down it:\n//\n//   b > 0.32787   everything decays to the origin\n//   b ~ 0.32      a single stable limit cycle\n//   b ~ 0.25      period doubling\n//   b = 0.208186  the canonical chaotic attractor\n//   b -> 0.1      a much larger, more space-filling tangle\n//   b = 0         conservative; the \"labyrinth walk\", unbounded diffusion\n//\n// Audio drives `b` DOWNWARD, so louder is more chaotic and more space-filling.\n// That direction matters: driving it upward would collapse the figure to a ring\n// on the loud parts, which is the opposite of what the ear expects.\n//\n// Note this system is bounded for any b > 0 without any guard of its own, and\n// its speed is O(1) everywhere \u2014 no fast lobe transits, hence no chords. It is\n// the quietest member of the family and the one that suits the `ink` look.\n//\n// P.pa = b. `P.pb` and `P.pc` are unused; the shared struct carries three\n// coefficient slots because Rossler needs three, and a struct per attractor\n// would be three uniform layouts to keep in step for no gain.\n\nfn deriv(q : vec3<f32>) -> vec3<f32> {\n  return vec3<f32>(\n    sin(q.y) - P.pa * q.x,\n    sin(q.z) - P.pa * q.y,\n    sin(q.x) - P.pa * q.z,\n  );\n}\n\n/**\n * The scatter. Thomas is globally bounded and the attractor fills a cube of\n * roughly +/-4.6 at the canonical `b`, so a uniform cloud slightly inside that\n * lands every trajectory on it within a few turns.\n *\n * The origin is a fixed point, so the scatter is deliberately not centred on a\n * point-symmetric range that could place a trajectory exactly there \u2014 the hash\n * makes that measure-zero anyway, but the offsets below keep it away from the\n * unstable equilibria at the same time.\n */\nfn seedPoint(i : f32) -> vec3<f32> {\n  return vec3<f32>(\n    (hash11(i + 0.13) - 0.5) * 7.0 + 0.31,\n    (hash11(i + 7.71) - 0.5) * 7.0 - 0.27,\n    (hash11(i + 3.31) - 0.5) * 7.0 + 0.19,\n  );\n}\n";
+
+// src/sources/thomas.ts
+var UNIFORM_FLOATS3 = 17;
+var U_DT3 = 0;
+var U_STEPS3 = 1;
+var U_PA2 = 2;
+var U_PB2 = 3;
+var U_PC2 = 4;
+var U_COUNT3 = 5;
+var U_RESEED3 = 6;
+var U_SPIN3 = 7;
+var U_SCALE3 = 8;
+var U_HALF_WIDTH3 = 9;
+var U_BRIGHT3 = 10;
+var U_HUE_SHIFT3 = 11;
+var U_CENTRE_X2 = 12;
+var U_CENTRE_Y2 = 13;
+var U_CENTRE_Z2 = 14;
+var U_DEPTH_K2 = 15;
+var U_HUE_SPREAD2 = 16;
+var TAU3 = Math.PI * 2;
+var PARAMS_WGSL3 = (
+  /* wgsl */
+  `
+struct Thomas {
+  dt        : f32,   // simulation time per SUBSTEP. Derived from dtBeats on the CPU.
+  steps     : f32,   // substeps per dispatch
+  pa        : f32,   // b \u2014 the dissipation. Canonical 0.208186. Audio drives it.
+  pb        : f32,   // unused; the shared flow layout carries three coefficients
+  pc        : f32,   // unused
+  count     : f32,
+  reseed    : f32,
+  spin      : f32,
+  scale     : f32,
+  halfWidth : f32,
+  bright    : f32,
+  hueShift  : f32,
+  centreX   : f32,
+  centreY   : f32,
+  centreZ   : f32,
+  depthK    : f32,
+  hueSpread : f32,
+};
+
+@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Thomas;
+`
+);
+var STORAGE_RW_WGSL3 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.storage0}) var<storage, read_write> points : array<f32>;`;
+var THOMAS_DEFAULTS = {
+  trajectories: 24e3,
+  substeps: 6,
+  /**
+   * Simulation time per BEAT. Thomas is SLOW — |dp/dt| is about 1.4 — so it
+   * needs a much larger figure than Lorenz's 0.85 to travel the same fraction
+   * of its (+/-4.6) extent per beat.
+   */
+  simPerBeat: 4,
+  /** Dissipation. See the header note on why this is below canonical. */
+  bBase: 0.19,
+  /**
+   * How far the LOW band pushes b, negative so that louder is LESS damped and
+   * therefore more chaotic. The direction matters: driving b upward would
+   * collapse the figure to a ring on the loud parts, which is backwards from
+   * what the ear expects.
+   *
+   * Low band rather than mid — Rossler is on mid and Halvorsen on sub, so the
+   * three attractors breathe on different drivers (art-direction §3.3).
+   */
+  bLow: -0.075,
+  /** How far the layer's envelope pushes b. Small: this look does not snap. */
+  bPulse: -0.03,
+  /** Bars per revolution. Slower than the others; `ink` motion is /8, /16. */
+  spinBars: 32,
+  hueBars: 48,
+  /** Per-frame contribution, tuned FOR the accumulator (steady state is B/(1-k)). */
+  brightBase: 0.055,
+  brightLevel: 0.1,
+  brightEnv: 0.075,
+  /** World -> NDC fit. The attractor fills a cube of ~+/-4.6, so 4.6*0.13*1.3 ~ 0.78 NDC. */
+  fit: 0.13,
+  /** Half-width in NDC before the shader's depth/speed variation. */
+  thickness: 18e-4,
+  /** Cyclically symmetric about the origin — there is nothing to offset. */
+  centreX: 0,
+  centreY: 0,
+  centreZ: 0,
+  /**
+   * Depth range is ~+/-4.6, and `depth = 1/(1 + z*k)` is NOT symmetric about 1:
+   * at k = 0.09 the far end is 0.71x but the near end is 1.71x, not the 1.5x the
+   * `fit` note above budgets for — 4.6 * 0.13 * 1.71 is 1.02 NDC, so the near
+   * corners of the cube fall off the frame. 0.07 gives 0.73x..1.48x, which is
+   * the range this was documented as and the one `fit` was fitted against.
+   */
+  depthK: 0.07,
+  hueSpread: 0.8
+};
+var MAX_TRAJECTORIES3 = 262144;
+var BYTES_PER_TRAJECTORY3 = 8 * 4;
+var MAX_DT_BEATS3 = 0.5;
+var B_MIN = 0.03;
+var B_MAX = 0.32;
+function num4(params, key, lo, hi) {
+  const fallback = THOMAS_DEFAULTS[key];
+  const raw = params[key] ?? fallback;
+  const v = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(v)) return typeof fallback === "number" ? fallback : lo;
+  return v < lo ? lo : v > hi ? hi : v;
+}
+function trajectoryCount3(params) {
+  return Math.max(1, Math.floor(num4(params, "trajectories", 1, MAX_TRAJECTORIES3)));
+}
+function fract3(v) {
+  return v - Math.floor(v);
+}
+var POINTS3 = {
+  label: "points",
+  bytes: (params) => trajectoryCount3(params) * BYTES_PER_TRAJECTORY3
+};
+var SHAPE3 = {
+  type: "thomas",
+  family: "source",
+  input: "none",
+  uniformFloats: UNIFORM_FLOATS3,
+  storage: [POINTS3]
+};
+var thomasPass = {
+  ...SHAPE3,
+  code: [
+    PASS_COMMON_WGSL,
+    PARAMS_WGSL3,
+    passBindingsWGSL({ ...SHAPE3, code: "" }),
+    attractor_flow_default
+  ].join("\n"),
+  compute: {
+    code: [
+      PASS_COMMON_WGSL,
+      PARAMS_WGSL3,
+      STORAGE_RW_WGSL3,
+      attractor_common_default,
+      attr_thomas_default,
+      attractor_flow_main_default
+    ].join("\n"),
+    entryPoint: "main",
+    workgroups: (ctx) => trajectoryCount3(ctx.params) / 64
+  },
+  draw: {
+    kind: "vertices",
+    vertexCount: (ctx) => ctx.progress > 0 ? 6 * trajectoryCount3(ctx.params) : 0
+  },
+  defaultResolutionScale: 1,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    const count = trajectoryCount3(p);
+    const substeps = Math.max(1, Math.floor(num4(p, "substeps", 1, 64)));
+    const dtRaw = Number.isFinite(ctx.dtBeats) ? ctx.dtBeats : 0;
+    const dtBeats = dtRaw <= 0 ? 0 : Math.min(dtRaw, MAX_DT_BEATS3);
+    out[U_DT3] = num4(p, "simPerBeat", 0, 64) * dtBeats / substeps;
+    out[U_STEPS3] = substeps;
+    const b = num4(p, "bBase", 0, 1) + ctx.audio.bands.low * num4(p, "bLow", -1, 1) + ctx.progress * num4(p, "bPulse", -1, 1);
+    out[U_PA2] = Math.min(Math.max(b, B_MIN), B_MAX);
+    out[U_PB2] = 0;
+    out[U_PC2] = 0;
+    out[U_COUNT3] = count;
+    out[U_RESEED3] = 0;
+    out[U_SPIN3] = fract3(ctx.bars / Math.max(num4(p, "spinBars", 1e-3, 4096), 1e-3)) * TAU3;
+    out[U_HUE_SHIFT3] = fract3(ctx.bars / Math.max(num4(p, "hueBars", 1e-3, 4096), 1e-3)) * TAU3;
+    out[U_SCALE3] = num4(p, "fit", 0, 1) * Math.min(1, ctx.aspect * 1.15);
+    out[U_HALF_WIDTH3] = num4(p, "thickness", 0, 0.1);
+    out[U_BRIGHT3] = num4(p, "brightBase", 0, 1) + ctx.audio.level * num4(p, "brightLevel", 0, 1) + ctx.progress * num4(p, "brightEnv", 0, 1);
+    out[U_CENTRE_X2] = num4(p, "centreX", -256, 256);
+    out[U_CENTRE_Y2] = num4(p, "centreY", -256, 256);
+    out[U_CENTRE_Z2] = num4(p, "centreZ", -256, 256);
+    out[U_DEPTH_K2] = num4(p, "depthK", 1e-4, 1);
+    out[U_HUE_SPREAD2] = num4(p, "hueSpread", 0, 6.283);
+  }
+};
+
+// src/shaders/attr-halvorsen.wgsl
+var attr_halvorsen_default = "// Halvorsen's cyclically symmetric attractor \u2014 vector field and seeded scatter.\n// The rest comes from `attractor-flow-main.wgsl`.\n//\n//   dx/dt = -a*x - 4y - 4z - y^2\n//   dy/dt = -a*y - 4z - 4x - z^2\n//   dz/dt = -a*z - 4x - 4y - x^2\n//\n// CANONICAL VALUE: a = 1.4. The 4s and the squares are structural, not tuning \u2014\n// changing them gives a different system, not a different-looking Halvorsen.\n//\n// `a` is the damping and the bifurcation parameter, and it is the one audio\n// drives:\n//\n//   a ~ 1.9      collapses toward a limit cycle\n//   a = 1.4      the canonical three-lobed attractor\n//   a ~ 1.2      broader, more open lobes\n//   a < 1.1      the trajectory escapes; the basin is genuinely finite here\n//\n// The audio therefore pushes `a` DOWN from 1.4 and the range is clamped short\n// of the escape, because this is the one member of the family with a real basin\n// boundary \u2014 the quadratic terms diverge in finite time outside it, which is\n// exactly what the guard in `attractor-flow-main.wgsl` exists for. Losing a few\n// trajectories per frame to the guard at low `a` is fine and reads as sparkle;\n// losing all of them is a black frame.\n//\n// P.pa = a. `P.pb` and `P.pc` are unused \u2014 see the note in `attr-thomas.wgsl`.\n\nfn deriv(q : vec3<f32>) -> vec3<f32> {\n  return vec3<f32>(\n    -P.pa * q.x - 4.0 * q.y - 4.0 * q.z - q.y * q.y,\n    -P.pa * q.y - 4.0 * q.z - 4.0 * q.x - q.z * q.z,\n    -P.pa * q.z - 4.0 * q.x - 4.0 * q.y - q.x * q.x,\n  );\n}\n\n/**\n * The scatter \u2014 TIGHT, and that is the whole point.\n *\n * (-1.48, -1.51, 2.04) is the standard published initial condition for this\n * system and is on the attractor. The basin is finite, so a loose cloud like\n * Rossler's would seed most trajectories outside it; they would diverge, hit\n * the guard, reseed to the same doomed point and strobe at the frame rate.\n * +/-0.8 stays comfortably inside.\n */\nfn seedPoint(i : f32) -> vec3<f32> {\n  return vec3<f32>(\n    -1.48 + (hash11(i + 0.13) - 0.5) * 1.6,\n    -1.51 + (hash11(i + 7.71) - 0.5) * 1.6,\n     2.04 + (hash11(i + 3.31) - 0.5) * 1.6,\n  );\n}\n";
+
+// src/sources/halvorsen.ts
+var UNIFORM_FLOATS4 = 17;
+var U_DT4 = 0;
+var U_STEPS4 = 1;
+var U_PA3 = 2;
+var U_PB3 = 3;
+var U_PC3 = 4;
+var U_COUNT4 = 5;
+var U_RESEED4 = 6;
+var U_SPIN4 = 7;
+var U_SCALE4 = 8;
+var U_HALF_WIDTH4 = 9;
+var U_BRIGHT4 = 10;
+var U_HUE_SHIFT4 = 11;
+var U_CENTRE_X3 = 12;
+var U_CENTRE_Y3 = 13;
+var U_CENTRE_Z3 = 14;
+var U_DEPTH_K3 = 15;
+var U_HUE_SPREAD3 = 16;
+var TAU4 = Math.PI * 2;
+var PARAMS_WGSL4 = (
+  /* wgsl */
+  `
+struct Halvorsen {
+  dt        : f32,   // simulation time per SUBSTEP. Derived from dtBeats on the CPU.
+  steps     : f32,   // substeps per dispatch
+  pa        : f32,   // a \u2014 the damping. Canonical 1.4. Audio drives it.
+  pb        : f32,   // unused; the shared flow layout carries three coefficients
+  pc        : f32,   // unused
+  count     : f32,
+  reseed    : f32,
+  spin      : f32,
+  scale     : f32,
+  halfWidth : f32,
+  bright    : f32,
+  hueShift  : f32,
+  centreX   : f32,
+  centreY   : f32,
+  centreZ   : f32,
+  depthK    : f32,
+  hueSpread : f32,
+};
+
+@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Halvorsen;
+`
+);
+var STORAGE_RW_WGSL4 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.storage0}) var<storage, read_write> points : array<f32>;`;
+var HALVORSEN_DEFAULTS = {
+  trajectories: 24e3,
+  /**
+   * Eight rather than six. The quadratic terms make this the stiffest member of
+   * the family — |dp/dt| reaches ~90 near the lobe extremes — so the same
+   * per-beat travel needs a finer substep to stay smooth under forward Euler.
+   */
+  substeps: 8,
+  /**
+   * Simulation time per BEAT. Much smaller than the other two because the field
+   * is much faster: at |dp/dt| ~ 70 over a ~15-unit figure, 0.20 per beat is
+   * about the same fraction of the extent per frame as Rossler's 1.5.
+   */
+  simPerBeat: 0.2,
+  /** The damping, and the bifurcation parameter. */
+  aBase: 1.4,
+  /**
+   * How far the SUB band pushes a, negative so that the low end OPENS the lobes.
+   * Sub rather than low or mid — Thomas is on low and Rossler on mid, so the
+   * three never breathe together (art-direction §3.3).
+   */
+  aSub: -0.14,
+  /** How far the layer's envelope pushes a. */
+  aPulse: -0.08,
+  /** Bars per revolution. The fastest of the three; `rave` motion is on the bar. */
+  spinBars: 20,
+  hueBars: 40,
+  /** Per-frame contribution, tuned FOR the accumulator (steady state is B/(1-k)). */
+  brightBase: 0.06,
+  brightLevel: 0.12,
+  brightEnv: 0.08,
+  /**
+   * World -> NDC fit. The figure spans roughly [-9, 5] on each axis about a
+   * centroid near -2, so ~7.5 units of radius; 7.5 * 0.08 * 1.4 lands near
+   * 0.84 NDC.
+   */
+  fit: 0.08,
+  thickness: 18e-4,
+  /** The centroid. Cyclic symmetry means the same offset on all three axes. */
+  centreX: -2,
+  centreY: -2,
+  centreZ: -2,
+  /** Depth range is ~+/-7.5, so 0.03 gives roughly 0.8x..1.3x. */
+  depthK: 0.03,
+  hueSpread: 1
+};
+var MAX_TRAJECTORIES4 = 262144;
+var BYTES_PER_TRAJECTORY4 = 8 * 4;
+var MAX_DT_BEATS4 = 0.5;
+var A_MIN = 1.18;
+var A_MAX = 1.9;
+function num5(params, key, lo, hi) {
+  const fallback = HALVORSEN_DEFAULTS[key];
+  const raw = params[key] ?? fallback;
+  const v = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(v)) return typeof fallback === "number" ? fallback : lo;
+  return v < lo ? lo : v > hi ? hi : v;
+}
+function trajectoryCount4(params) {
+  return Math.max(1, Math.floor(num5(params, "trajectories", 1, MAX_TRAJECTORIES4)));
+}
+function fract4(v) {
+  return v - Math.floor(v);
+}
+var POINTS4 = {
+  label: "points",
+  bytes: (params) => trajectoryCount4(params) * BYTES_PER_TRAJECTORY4
+};
+var SHAPE4 = {
+  type: "halvorsen",
+  family: "source",
+  input: "none",
+  uniformFloats: UNIFORM_FLOATS4,
+  storage: [POINTS4]
+};
+var halvorsenPass = {
+  ...SHAPE4,
+  code: [
+    PASS_COMMON_WGSL,
+    PARAMS_WGSL4,
+    passBindingsWGSL({ ...SHAPE4, code: "" }),
+    attractor_flow_default
+  ].join("\n"),
+  compute: {
+    code: [
+      PASS_COMMON_WGSL,
+      PARAMS_WGSL4,
+      STORAGE_RW_WGSL4,
+      attractor_common_default,
+      attr_halvorsen_default,
+      attractor_flow_main_default
+    ].join("\n"),
+    entryPoint: "main",
+    workgroups: (ctx) => trajectoryCount4(ctx.params) / 64
+  },
+  draw: {
+    kind: "vertices",
+    vertexCount: (ctx) => ctx.progress > 0 ? 6 * trajectoryCount4(ctx.params) : 0
+  },
+  defaultResolutionScale: 1,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    const count = trajectoryCount4(p);
+    const substeps = Math.max(1, Math.floor(num5(p, "substeps", 1, 64)));
+    const dtRaw = Number.isFinite(ctx.dtBeats) ? ctx.dtBeats : 0;
+    const dtBeats = dtRaw <= 0 ? 0 : Math.min(dtRaw, MAX_DT_BEATS4);
+    out[U_DT4] = num5(p, "simPerBeat", 0, 64) * dtBeats / substeps;
+    out[U_STEPS4] = substeps;
+    const a = num5(p, "aBase", 0, 8) + ctx.audio.bands.sub * num5(p, "aSub", -8, 8) + ctx.progress * num5(p, "aPulse", -8, 8);
+    out[U_PA3] = Math.min(Math.max(a, A_MIN), A_MAX);
+    out[U_PB3] = 0;
+    out[U_PC3] = 0;
+    out[U_COUNT4] = count;
+    out[U_RESEED4] = 0;
+    out[U_SPIN4] = fract4(ctx.bars / Math.max(num5(p, "spinBars", 1e-3, 4096), 1e-3)) * TAU4;
+    out[U_HUE_SHIFT4] = fract4(ctx.bars / Math.max(num5(p, "hueBars", 1e-3, 4096), 1e-3)) * TAU4;
+    out[U_SCALE4] = num5(p, "fit", 0, 1) * Math.min(1, ctx.aspect * 1.15);
+    out[U_HALF_WIDTH4] = num5(p, "thickness", 0, 0.1);
+    out[U_BRIGHT4] = num5(p, "brightBase", 0, 1) + ctx.audio.level * num5(p, "brightLevel", 0, 1) + ctx.progress * num5(p, "brightEnv", 0, 1);
+    out[U_CENTRE_X3] = num5(p, "centreX", -256, 256);
+    out[U_CENTRE_Y3] = num5(p, "centreY", -256, 256);
+    out[U_CENTRE_Z3] = num5(p, "centreZ", -256, 256);
+    out[U_DEPTH_K3] = num5(p, "depthK", 1e-4, 1);
+    out[U_HUE_SPREAD3] = num5(p, "hueSpread", 0, 6.283);
+  }
+};
+
+// src/shaders/attr-clifford.wgsl
+var attr_clifford_default = "// The Clifford attractor \u2014 one iterate and the seeded scatter. The rest comes\n// from `attractor-map-main.wgsl`.\n//\n//   x' = sin(a*y) + c*cos(a*x)\n//   y' = sin(b*x) + d*cos(b*y)\n//\n// CANONICAL VALUES: a = -1.4, b = 1.6, c = 1.0, d = 0.7. Those are Clifford\n// Pickover's own, and they give the familiar folded double-lobe.\n//\n// This is a MAP, not a flow. Successive iterates land far apart, so nothing here\n// may be joined into a segment \u2014 see the header of `attractor-map-main.wgsl`.\n//\n// The system is bounded by construction: |x'| <= 1 + |c| and |y'| <= 1 + |d|,\n// for any parameters at all. There is no divergence to guard against and no\n// basin to fall out of, which is what makes it safe to sweep the coefficients\n// hard from audio. Useful ranges:\n//\n//   a, b in [-2.2, 2.2]   the structural parameters. Small changes fold and\n//                         unfold the lobes completely.\n//   c, d in [-1.5, 1.5]   the offsets. These stretch it rather than refold it.\n//\n// Audio drives `a`, which is the one that reorganises the figure rather than\n// scaling it (art-direction \xA73.3 \u2014 shape, not brightness).\n//\n// P.pa = a, P.pb = b, P.pc = c, P.pd = d.\n\nfn mapStep(q : vec2<f32>) -> vec2<f32> {\n  return vec2<f32>(\n    sin(P.pa * q.y) + P.pc * cos(P.pa * q.x),\n    sin(P.pb * q.x) + P.pd * cos(P.pb * q.y),\n  );\n}\n\n/**\n * The scatter. Uniform over [-1, 1]^2, which is inside the bounding box for any\n * sane coefficients. The transient is discarded by `BURN_IN` in the shared main,\n * so the square this starts as is never drawn.\n */\nfn seedPoint(i : f32) -> vec2<f32> {\n  return vec2<f32>(\n    (hash11(i + 0.13) - 0.5) * 2.0,\n    (hash11(i + 7.71) - 0.5) * 2.0,\n  );\n}\n";
+
+// src/shaders/attractor-map-main.wgsl
+var attractor_map_main_default = "// The compute entry point shared by the 2D ITERATED MAPS (Clifford, De Jong).\n//\n// These are NOT flows and must not be treated as such. A flow's step is a small\n// displacement along a smooth curve, so consecutive samples can be joined into a\n// segment. A map's step jumps a long way across the figure \u2014 successive iterates\n// of x' = sin(a*y) + c*cos(a*x) are essentially uncorrelated in position \u2014 so\n// joining them paints chords straight across the picture and destroys exactly\n// the structure the map is famous for. We plot POINTS and let the density build\n// the image through the accumulator instead.\n//\n// Concatenated LAST, after `attractor-common.wgsl` (hash11) and after the\n// per-map body, which supplies:\n//\n//   fn mapStep(q : vec2<f32>) -> vec2<f32>   one iterate\n//   fn seedPoint(i : f32)     -> vec2<f32>   a starting point in the basin\n//\n// BUFFER LAYOUT \u2014 a contract with `attractor-map.wgsl`:\n//   [i*4 + 0..1] current xy\n//   [i*4 + 2]    seeded flag (0 = never seeded)\n//   [i*4 + 3]    iterations performed so far, absolute\n//\n// ---------------------------------------------------------------------------\n// WHY AN ABSOLUTE ITERATION COUNTER\n//\n// A map has no dt to scale, so the musical-time obligation (\xA73.1) lands on the\n// iteration RATE instead: the orbit must advance a fixed number of iterates per\n// BEAT at any refresh rate. Deriving the count from `dtBeats` per frame fails\n// outright \u2014 at 900 iterates/beat and 165 fps that is 11.6 per frame, and\n// `floor` of a per-frame figure below 1 never advances at all.\n//\n// So the CPU sends an ABSOLUTE target (`floor(beats * itersPerBeat)`) and each\n// thread walks its own counter up to it. The fractional part is carried in the\n// buffer for free, the rate is exact over any window, and nothing depends on\n// frame pacing. `maxSteps` bounds the catch-up: after a tab switch the deficit\n// is enormous, and the counter is snapped forward rather than the shader\n// grinding through ten thousand iterates in one dispatch.\n// ---------------------------------------------------------------------------\n\n/**\n * Iterates discarded when a point is first seeded.\n *\n * The seed scatter is uniform over a square; the attractor is not. Without a\n * burn-in the first frames show that square, which is a rectangle of noise\n * fading out of the accumulator \u2014 a visible, wrong, and completely avoidable\n * first impression. 64 iterates is far past the transient for both maps.\n */\nconst BURN_IN : i32 = 64;\n\nfn storeMap(base: u32, cur: vec2<f32>, flag: f32, iter: f32) {\n  points[base + 0u] = cur.x;\n  points[base + 1u] = cur.y;\n  points[base + 2u] = flag;\n  points[base + 3u] = iter;\n}\n\n@compute @workgroup_size(64)\nfn main(@builtin(global_invocation_id) gid : vec3<u32>) {\n  let i = gid.x;\n  if (f32(i) >= P.count) { return; }\n\n  let base = i * 4u;\n\n  if (points[base + 2u] < 0.5 || P.reseed > 0.5) {\n    var s = seedPoint(f32(i));\n    for (var k = 0; k < BURN_IN; k = k + 1) { s = mapStep(s); }\n    storeMap(base, s, 1.0, P.iterTarget);\n    return;\n  }\n\n  var q = vec2<f32>(points[base + 0u], points[base + 1u]);\n\n  // Bounded catch-up. Never falls permanently behind, never spends an unbounded\n  // dispatch getting even.\n  var it = points[base + 3u];\n  if (P.iterTarget - it > P.maxSteps) { it = P.iterTarget - P.maxSteps; }\n  let n = i32(max(P.iterTarget - it, 0.0));\n\n  for (var k = 0; k < n; k = k + 1) {\n    q = mapStep(q);\n  }\n\n  // Both maps are bounded by construction (|x| <= 1 + |c| for Clifford), so\n  // this cannot fire on the arithmetic alone \u2014 but a non-finite uniform would\n  // poison the buffer permanently and this is the only place that can catch it.\n  // Negated form, because a NaN compares false against everything.\n  if (!(all(abs(q) < vec2<f32>(1000.0)))) {\n    var s = seedPoint(f32(i) + 91.7);\n    for (var k = 0; k < BURN_IN; k = k + 1) { s = mapStep(s); }\n    storeMap(base, s, 1.0, P.iterTarget);\n    return;\n  }\n\n  storeMap(base, q, 1.0, P.iterTarget);\n}\n";
+
+// src/shaders/attractor-map.wgsl
+var attractor_map_default = "// The draw shared by the 2D ITERATED MAPS. One additive POINT sprite per orbit\n// per frame \u2014 no vertex buffer, the vertex stage indexes the storage buffer the\n// compute prepass just wrote.\n//\n// Points, not segments, and that is the single most important decision in this\n// half of the family. See the header of `attractor-map-main.wgsl`: successive\n// iterates are far apart, so a segment between them is a chord across the\n// figure rather than a piece of it.\n//\n// The picture is therefore a DENSITY, not a set of strokes: N orbits each\n// deposit one faint dot per frame, and the accumulator integrates them into the\n// map's invariant measure. Two consequences worth stating because they are easy\n// to get wrong:\n//\n//   - the per-frame contribution must be tuned FOR the accumulator. With\n//     retention k the steady state is B/(1-k), which at a one-beat tau is ~50x\n//     the per-frame value. Tuning `bright` as though each frame stood alone\n//     whites the frame out in about a second.\n//   - the layer needs a trail underneath it to look like anything at all. A\n//     single frame of this source is a faint dust of dots.\n//\n// ---------------------------------------------------------------------------\n// BINDINGS ARE NOT DECLARED HERE. The source module prepends\n// `PASS_COMMON_WGSL`, its own params struct at `PASS_BINDING.params`, and\n// `passBindingsWGSL` supplies `var<storage, read> points : array<f32>` at\n// `PASS_BINDING.storage0`.\n//\n// Layout: [i*4 + 0..1] xy, [i*4 + 2] seeded flag, [i*4 + 3] iteration count.\n//\n// The params struct must expose, identically named: spin, scale, halfWidth,\n// bright, hueShift, hueSpread.\n// ---------------------------------------------------------------------------\n\nstruct VsOut {\n  @builtin(position) pos : vec4<f32>,\n  @location(0) local : vec2<f32>,   // -1..1 within the sprite\n  @location(1) tint  : vec3<f32>,\n};\n\nfn ptAt(i : u32) -> vec2<f32> {\n  let b = i * 4u;\n  return vec2<f32>(points[b + 0u], points[b + 1u]);\n}\n\n// Same hash as the compute side. The render stage needs it for per-orbit weight\n// variation and must not invent a second one.\nfn hashR(p: f32) -> f32 {\n  var x = fract(p * 0.1031);\n  x = x * (x + 33.33);\n  return fract((x + x) * x);\n}\n\n// OKLab -> linear sRGB (art-direction \xA72.1 \u2014 never lerp in sRGB).\nfn oklabToLinear(c: vec3<f32>) -> vec3<f32> {\n  let l_ = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;\n  let m_ = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;\n  let s_ = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;\n  let l = l_ * l_ * l_;\n  let m = m_ * m_ * m_;\n  let s = s_ * s_ * s_;\n  return vec3<f32>(\n    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,\n   -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,\n   -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,\n  );\n}\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> VsOut {\n  let idx = vi / 6u;\n  let corner = vi % 6u;\n\n  var p = ptAt(idx);\n\n  // A rigid rotation of the whole figure, absolute from `bars`. Not a radial\n  // pulse and not centre-out motion \u2014 the figure simply turns, very slowly\n  // (art-direction \xA74.1 forbids the former, not the latter).\n  let c = cos(P.spin);\n  let s = sin(P.spin);\n  p = vec2<f32>(p.x * c - p.y * s, p.x * s + p.y * c);\n\n  var ndc = p * P.scale;\n  ndc.x = ndc.x / C.aspect;\n\n  // VARY LINE WEIGHT (art-direction \xA74.4). Every orbit gets a stable size drawn\n  // from its index, so the density field is built from a mixture of fine and\n  // coarse grain instead of one uniform dot \u2014 the difference between a printed\n  // stipple and a screen door.\n  let w = P.halfWidth * (0.55 + 1.10 * hashR(f32(idx) * 0.37 + 5.0));\n\n  let q = array<vec2<f32>, 6>(\n    vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),\n    vec2<f32>(-1.0,  1.0), vec2<f32>( 1.0, -1.0), vec2<f32>( 1.0,  1.0),\n  );\n  let l = q[corner];\n  let pos = ndc + l * vec2<f32>(w / C.aspect, w);\n\n  // Hue walks along the figure's x \u2014 a linear gradient, deliberately, so it does\n  // not read as radiating from the centre. It turns with the figure, because `p`\n  // is already rotated.\n  //\n  // The 0.25 normalises by the figure's extent: both maps are bounded at\n  // |x| <= 2, so `hueSpread` is radians across the WHOLE width rather than per\n  // world unit. Without it the default 0.55 walks 2.2 rad \u2014 126 degrees of hue\n  // inside one frame, which is the hue variety art-direction \xA72.2 forbids, not\n  // the \"one hue and its neighbours\" this is documented as.\n  let h = P.hueShift + p.x * 0.25 * P.hueSpread;\n  let lab = vec3<f32>(0.80, 0.090 * cos(h), 0.090 * sin(h));\n\n  // Energy per point held constant as the weight varies. Without this the size\n  // jitter above would double as a brightness jitter, and the coarse grain\n  // would dominate the density it is supposed to texture.\n  let area = max(w, 1e-6) / max(P.halfWidth, 1e-6);\n  let gain = P.bright / (area * area);\n\n  var out : VsOut;\n  out.pos = vec4<f32>(pos, 0.0, 1.0);\n  out.local = l;\n  out.tint = max(oklabToLinear(lab), vec3<f32>(0.0)) * gain;\n  return out;\n}\n\n@fragment\nfn fs(in : VsOut) -> @location(0) vec4<f32> {\n  // Analytic AA \u2014 a radial gaussian, so the sprite has no edge to alias\n  // (art-direction \xA74.5).\n  let a = exp(-dot(in.local, in.local) * 3.0);\n  // C.opacity, always. See PASS_COMMON_WGSL.\n  return vec4<f32>(in.tint * a, a) * C.opacity;\n}\n";
+
+// src/sources/clifford.ts
+var UNIFORM_FLOATS5 = 14;
+var U_ITER_TARGET = 0;
+var U_MAX_STEPS = 1;
+var U_PA4 = 2;
+var U_PB4 = 3;
+var U_PC4 = 4;
+var U_PD = 5;
+var U_COUNT5 = 6;
+var U_RESEED5 = 7;
+var U_SPIN5 = 8;
+var U_SCALE5 = 9;
+var U_HALF_WIDTH5 = 10;
+var U_BRIGHT5 = 11;
+var U_HUE_SHIFT5 = 12;
+var U_HUE_SPREAD4 = 13;
+var TAU5 = Math.PI * 2;
+var PARAMS_WGSL5 = (
+  /* wgsl */
+  `
+struct Clifford {
+  iterTarget : f32,   // absolute iterate index every orbit should have reached
+  maxSteps   : f32,   // cap on catch-up per dispatch
+  pa         : f32,   // a \u2014 canonical -1.4. Audio drives this one.
+  pb         : f32,   // b \u2014 canonical  1.6
+  pc         : f32,   // c \u2014 canonical  1.0
+  pd         : f32,   // d \u2014 canonical  0.7
+  count      : f32,   // orbits
+  reseed     : f32,   // > 0.5 re-scatters every orbit
+  spin       : f32,   // radians, in the picture plane
+  scale      : f32,   // figure -> NDC fit
+  halfWidth  : f32,   // half-width of a point sprite, NDC, before weight variation
+  bright     : f32,   // per-frame contribution per point. Tiny; see below.
+  hueShift   : f32,   // radians
+  hueSpread  : f32,   // radians of hue walked across the figure's full width
+};
+
+@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Clifford;
+`
+);
+var STORAGE_RW_WGSL5 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.storage0}) var<storage, read_write> points : array<f32>;`;
+var CLIFFORD_DEFAULTS = {
+  /**
+   * Independent orbits. Higher than the flows: each orbit contributes ONE dot
+   * per frame rather than a segment, so the count is the sample count of the
+   * density estimate and the picture is grainy below ~50k. 96k orbits is a
+   * 1.5 MB buffer and 576k vertices.
+   */
+  orbits: 96e3,
+  /**
+   * Iterates per BEAT. This is the musical rate — at 128 BPM and 165 fps it is
+   * ~5.5 iterates per frame, so every orbit lands somewhere genuinely new each
+   * frame and the density resamples continuously. Lower it and the cloud starts
+   * to visibly hold still between beats; raise it and the resampling is faster
+   * than the accumulator can integrate.
+   */
+  itersPerBeat: 900,
+  /**
+   * Cap on catch-up per dispatch. Bounds the work after a tab switch — see
+   * `attractor-map-main.wgsl`.
+   *
+   * It must exceed the NORMAL per-frame figure at the LOWEST refresh rate the
+   * show runs at, not at the highest. 900 iterates/beat at 128 BPM is 1920/s,
+   * which is 11.6 per frame at 165 fps but 32 at 60 Hz and 64 at 30 Hz — and
+   * below the cap the orbit silently resamples slower than the beat rate this
+   * source's whole musical-time mechanism exists to guarantee. 96 covers 30 Hz
+   * with margin and costs nothing on a frame that is not catching up.
+   */
+  maxSteps: 96,
+  /** The one audio drives. */
+  aBase: -1.4,
+  /**
+   * How far the HIGH band pushes a. `a` is the coefficient that refolds the
+   * figure rather than stretching it, so this is a change of SHAPE (§3.3).
+   *
+   * High band deliberately: this is the detail/sparkle role in the layer-role
+   * table, and the flows in this family are on sub, low and mid.
+   *
+   * Keep this together with `aPulse` inside the tested -1.40..-1.28 corridor.
+   * The former 0.45 drive crossed narrow periodic windows around -1.05..-0.90,
+   * collapsing 96k independent orbits into one-to-twelve point rings.
+   */
+  aHigh: 0.08,
+  /** Envelope contribution; bounded with `aHigh` so full drive reaches -1.28. */
+  aPulse: 0.04,
+  b: 1.6,
+  c: 1,
+  d: 0.7,
+  /**
+   * Bars per revolution of the whole figure. Very slow — a rigid rotation, not
+   * a centre-out pulse (art-direction §4.1 forbids the latter, not the former),
+   * and at 64 bars it reads as drift rather than as spin.
+   */
+  spinBars: 64,
+  /** Bars per full hue rotation. Slow: three hues maximum (§2.2). */
+  hueBars: 56,
+  /**
+   * Per-frame contribution PER POINT, and it is tiny for two compounding
+   * reasons: there are 96k of them, and with a trail of retention k the
+   * accumulator settles at B/(1-k) — ~50x at a one-beat tau and 165 fps. Tuned
+   * as though a frame stood alone this whites out in about a second.
+   */
+  brightBase: 0.035,
+  brightLevel: 0.07,
+  brightEnv: 0.05,
+  /** Figure -> NDC fit. |x| <= 2 at the canonical c, so 2 * 0.42 = 0.84 NDC. */
+  fit: 0.42,
+  /** Half-width of a point sprite in NDC, before the per-orbit weight variation. */
+  thickness: 22e-4,
+  /**
+   * Radians of hue walked across the FULL width of the figure (the shader
+   * normalises by the |x| <= 2 bound). 0.55 rad is 31 degrees — one hue and its
+   * neighbours, per art-direction §2.2, which forbids hue variety within a
+   * frame while allowing the whole band to rotate over bars.
+   */
+  hueSpread: 0.55
+};
+var MAX_ORBITS = 524288;
+var BYTES_PER_ORBIT = 4 * 4;
+var MAX_ITER_TARGET = 16777216;
+var A_LIMIT = 2.4;
+function num6(params, key, lo, hi) {
+  const fallback = CLIFFORD_DEFAULTS[key];
+  const raw = params[key] ?? fallback;
+  const v = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(v)) return typeof fallback === "number" ? fallback : lo;
+  return v < lo ? lo : v > hi ? hi : v;
+}
+function orbitCount(params) {
+  return Math.max(1, Math.floor(num6(params, "orbits", 1, MAX_ORBITS)));
+}
+function fract5(v) {
+  return v - Math.floor(v);
+}
+var POINTS5 = {
+  label: "points",
+  bytes: (params) => orbitCount(params) * BYTES_PER_ORBIT
+};
+var SHAPE5 = {
+  type: "clifford",
+  family: "source",
+  input: "none",
+  uniformFloats: UNIFORM_FLOATS5,
+  storage: [POINTS5]
+};
+var cliffordPass = {
+  ...SHAPE5,
+  code: [
+    PASS_COMMON_WGSL,
+    PARAMS_WGSL5,
+    passBindingsWGSL({ ...SHAPE5, code: "" }),
+    attractor_map_default
+  ].join("\n"),
+  compute: {
+    // Order is load-bearing: WGSL resolves module-scope names in declaration
+    // order, so the hash precedes the seed that calls it and `mapStep` precedes
+    // the main that iterates it.
+    code: [
+      PASS_COMMON_WGSL,
+      PARAMS_WGSL5,
+      STORAGE_RW_WGSL5,
+      attractor_common_default,
+      attr_clifford_default,
+      attractor_map_main_default
+    ].join("\n"),
+    entryPoint: "main",
+    workgroups: (ctx) => orbitCount(ctx.params) / 64
+  },
+  draw: {
+    kind: "vertices",
+    // Six vertices per point sprite, and ZERO at progress 0 — a spent layer is
+    // a true no-op (Phase 5 DoD), not a draw that happens to be transparent.
+    vertexCount: (ctx) => ctx.progress > 0 ? 6 * orbitCount(ctx.params) : 0
+  },
+  /**
+   * Full resolution. The sprites are ~2e-3 NDC — a couple of pixels at 1440p —
+   * and a half-res pass would land two orbits in one texel and destroy the
+   * density gradient this source is entirely made of. Advisory only (§4.11).
+   */
+  defaultResolutionScale: 1,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    const rate = num6(p, "itersPerBeat", 0, 1e5);
+    const target = Math.floor(Math.max(0, ctx.beats) * rate);
+    out[U_ITER_TARGET] = Math.min(target, MAX_ITER_TARGET);
+    out[U_MAX_STEPS] = Math.max(1, Math.floor(num6(p, "maxSteps", 1, 4096)));
+    const a = num6(p, "aBase", -A_LIMIT, A_LIMIT) + ctx.audio.bands.high * num6(p, "aHigh", -A_LIMIT, A_LIMIT) + ctx.progress * num6(p, "aPulse", -A_LIMIT, A_LIMIT);
+    out[U_PA4] = Math.min(Math.max(a, -A_LIMIT), A_LIMIT);
+    out[U_PB4] = num6(p, "b", -A_LIMIT, A_LIMIT);
+    out[U_PC4] = num6(p, "c", -2, 2);
+    out[U_PD] = num6(p, "d", -2, 2);
+    out[U_COUNT5] = orbitCount(p);
+    out[U_RESEED5] = 0;
+    out[U_SPIN5] = fract5(ctx.bars / Math.max(num6(p, "spinBars", 1e-3, 4096), 1e-3)) * TAU5;
+    out[U_HUE_SHIFT5] = fract5(ctx.bars / Math.max(num6(p, "hueBars", 1e-3, 4096), 1e-3)) * TAU5;
+    out[U_SCALE5] = num6(p, "fit", 0, 4) * Math.min(1, ctx.aspect * 1.15);
+    out[U_HALF_WIDTH5] = num6(p, "thickness", 1e-5, 0.1);
+    out[U_BRIGHT5] = num6(p, "brightBase", 0, 1) + ctx.audio.level * num6(p, "brightLevel", 0, 1) + ctx.progress * num6(p, "brightEnv", 0, 1);
+    out[U_HUE_SPREAD4] = num6(p, "hueSpread", 0, 6.283);
+  }
+};
+
+// src/shaders/attr-dejong.wgsl
+var attr_dejong_default = "// The Peter de Jong attractor \u2014 one iterate and the seeded scatter. The rest\n// comes from `attractor-map-main.wgsl`.\n//\n//   x' = sin(a*y) - cos(b*x)\n//   y' = sin(c*x) - cos(d*y)\n//\n// CANONICAL VALUES: a = 1.4, b = -2.3, c = 2.4, d = -2.1. The widely reproduced\n// set, and the one that gives the four-armed web.\n//\n// A MAP, not a flow \u2014 plot points, never segments. See\n// `attractor-map-main.wgsl`.\n//\n// Bounded by construction at |x|, |y| <= 2 for any coefficients, so like\n// Clifford it can be swept hard with no risk of escape. All four coefficients\n// are structural here (unlike Clifford, where c and d mostly stretch), and the\n// useful range is roughly [-3, 3] for each \u2014 outside about 3 the sines alias\n// against each other and the figure turns to even noise, which is why the\n// clamps in the descriptor stop short of it.\n//\n// Audio drives `c`. `a` and `b` set the overall armature and `c` rearranges the\n// filaments inside it, which is the change that reads as the figure MOVING\n// rather than the figure being replaced.\n//\n// P.pa = a, P.pb = b, P.pc = c, P.pd = d.\n\nfn mapStep(q : vec2<f32>) -> vec2<f32> {\n  return vec2<f32>(\n    sin(P.pa * q.y) - cos(P.pb * q.x),\n    sin(P.pc * q.x) - cos(P.pd * q.y),\n  );\n}\n\n/**\n * The scatter. Uniform over [-1, 1]^2; `BURN_IN` in the shared main discards the\n * transient so the square is never drawn.\n */\nfn seedPoint(i : f32) -> vec2<f32> {\n  return vec2<f32>(\n    (hash11(i + 0.13) - 0.5) * 2.0,\n    (hash11(i + 7.71) - 0.5) * 2.0,\n  );\n}\n";
+
+// src/sources/dejong.ts
+var UNIFORM_FLOATS6 = 14;
+var U_ITER_TARGET2 = 0;
+var U_MAX_STEPS2 = 1;
+var U_PA5 = 2;
+var U_PB5 = 3;
+var U_PC5 = 4;
+var U_PD2 = 5;
+var U_COUNT6 = 6;
+var U_RESEED6 = 7;
+var U_SPIN6 = 8;
+var U_SCALE6 = 9;
+var U_HALF_WIDTH6 = 10;
+var U_BRIGHT6 = 11;
+var U_HUE_SHIFT6 = 12;
+var U_HUE_SPREAD5 = 13;
+var TAU6 = Math.PI * 2;
+var PARAMS_WGSL6 = (
+  /* wgsl */
+  `
+struct DeJong {
+  iterTarget : f32,   // absolute iterate index every orbit should have reached
+  maxSteps   : f32,   // cap on catch-up per dispatch
+  pa         : f32,   // a \u2014 canonical  1.4
+  pb         : f32,   // b \u2014 canonical -2.3
+  pc         : f32,   // c \u2014 canonical  2.4. Audio drives this one.
+  pd         : f32,   // d \u2014 canonical -2.1
+  count      : f32,   // orbits
+  reseed     : f32,   // > 0.5 re-scatters every orbit
+  spin       : f32,   // radians, in the picture plane
+  scale      : f32,   // figure -> NDC fit
+  halfWidth  : f32,   // half-width of a point sprite, NDC, before weight variation
+  bright     : f32,   // per-frame contribution per point. Tiny; see below.
+  hueShift   : f32,   // radians
+  hueSpread  : f32,   // radians of hue walked across the figure's full width
+};
+
+@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : DeJong;
+`
+);
+var STORAGE_RW_WGSL6 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.storage0}) var<storage, read_write> points : array<f32>;`;
+var DEJONG_DEFAULTS = {
+  /**
+   * Independent orbits. Each contributes ONE dot per frame — the count is the
+   * sample count of the density estimate, and the web's thin filaments are the
+   * first thing to disappear when it is too low.
+   */
+  orbits: 96e3,
+  /**
+   * Iterates per BEAT — the musical rate. Slower than Clifford's on purpose:
+   * De Jong's filaments are narrow, and resampling them too fast reads as noise
+   * rather than as structure. At 128 BPM and 165 fps this is ~4.4 per frame.
+   */
+  itersPerBeat: 720,
+  /**
+   * Cap on catch-up per dispatch. It must exceed the normal per-frame figure at
+   * the LOWEST refresh rate, not the highest: 720/beat at 128 BPM is 4.4 per
+   * frame at 165 fps but 26 at 60 Hz and 51 at 30 Hz, and below the cap the
+   * orbit resamples slower than the beat rate rather than catching up.
+   */
+  maxSteps: 96,
+  a: 1.4,
+  b: -2.3,
+  /** The one audio drives. */
+  cBase: 2.4,
+  /**
+   * How far the MID band pushes c. All four coefficients are structural in this
+   * map, but `a` and `b` set the overall armature while `c` rearranges the
+   * filaments inside it — which reads as the figure MOVING rather than as the
+   * figure being replaced. That is the change worth handing to audio (§3.3).
+   *
+   * Mid band: Clifford is on high, and the three flows are on sub, low and mid
+   * — this shares mid with Rossler, so the two should not be stacked in one
+   * preset (art-direction §3.3).
+   */
+  cMid: 0.7,
+  /** How far the layer's envelope pushes c. */
+  cPulse: 0.4,
+  d: -2.1,
+  /** Bars per revolution. A rigid, very slow rotation — drift, not spin. */
+  spinBars: 80,
+  /** Bars per full hue rotation. Faster than Clifford's; `rave` may move. */
+  hueBars: 40,
+  /**
+   * Per-frame contribution PER POINT. Tiny for two compounding reasons: 96k
+   * points, and an accumulator whose steady state is B/(1-k) — ~50x at a
+   * one-beat tau and 165 fps.
+   */
+  brightBase: 0.035,
+  brightLevel: 0.07,
+  brightEnv: 0.05,
+  /** Figure -> NDC fit. |x| <= 2 always, so 2 * 0.42 = 0.84 NDC. */
+  fit: 0.42,
+  /** Half-width of a point sprite in NDC, before the per-orbit weight variation. */
+  thickness: 2e-3,
+  /**
+   * Radians of hue walked across the FULL width of the figure — the shader
+   * normalises by the |x| <= 2 bound. 0.6 rad is 34 degrees: one hue and its
+   * neighbours (§2.2), a little wider than Clifford's because `rave` may move.
+   */
+  hueSpread: 0.6
+};
+var MAX_ORBITS2 = 524288;
+var BYTES_PER_ORBIT2 = 4 * 4;
+var MAX_ITER_TARGET2 = 16777216;
+var COEF_LIMIT = 3;
+function num7(params, key, lo, hi) {
+  const fallback = DEJONG_DEFAULTS[key];
+  const raw = params[key] ?? fallback;
+  const v = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(v)) return typeof fallback === "number" ? fallback : lo;
+  return v < lo ? lo : v > hi ? hi : v;
+}
+function orbitCount2(params) {
+  return Math.max(1, Math.floor(num7(params, "orbits", 1, MAX_ORBITS2)));
+}
+function fract6(v) {
+  return v - Math.floor(v);
+}
+var POINTS6 = {
+  label: "points",
+  bytes: (params) => orbitCount2(params) * BYTES_PER_ORBIT2
+};
+var SHAPE6 = {
+  type: "dejong",
+  family: "source",
+  input: "none",
+  uniformFloats: UNIFORM_FLOATS6,
+  storage: [POINTS6]
+};
+var dejongPass = {
+  ...SHAPE6,
+  code: [
+    PASS_COMMON_WGSL,
+    PARAMS_WGSL6,
+    passBindingsWGSL({ ...SHAPE6, code: "" }),
+    attractor_map_default
+  ].join("\n"),
+  compute: {
+    code: [
+      PASS_COMMON_WGSL,
+      PARAMS_WGSL6,
+      STORAGE_RW_WGSL6,
+      attractor_common_default,
+      attr_dejong_default,
+      attractor_map_main_default
+    ].join("\n"),
+    entryPoint: "main",
+    workgroups: (ctx) => orbitCount2(ctx.params) / 64
+  },
+  draw: {
+    kind: "vertices",
+    // Six vertices per point sprite, ZERO at progress 0 — a true no-op.
+    vertexCount: (ctx) => ctx.progress > 0 ? 6 * orbitCount2(ctx.params) : 0
+  },
+  /** Full resolution: half-res would land two orbits in one texel and flatten the density. */
+  defaultResolutionScale: 1,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    const rate = num7(p, "itersPerBeat", 0, 1e5);
+    const target = Math.floor(Math.max(0, ctx.beats) * rate);
+    out[U_ITER_TARGET2] = Math.min(target, MAX_ITER_TARGET2);
+    out[U_MAX_STEPS2] = Math.max(1, Math.floor(num7(p, "maxSteps", 1, 4096)));
+    out[U_PA5] = num7(p, "a", -COEF_LIMIT, COEF_LIMIT);
+    out[U_PB5] = num7(p, "b", -COEF_LIMIT, COEF_LIMIT);
+    const c = num7(p, "cBase", -COEF_LIMIT, COEF_LIMIT) + ctx.audio.bands.mid * num7(p, "cMid", -COEF_LIMIT, COEF_LIMIT) + ctx.progress * num7(p, "cPulse", -COEF_LIMIT, COEF_LIMIT);
+    out[U_PC5] = Math.min(Math.max(c, -COEF_LIMIT), COEF_LIMIT);
+    out[U_PD2] = num7(p, "d", -COEF_LIMIT, COEF_LIMIT);
+    out[U_COUNT6] = orbitCount2(p);
+    out[U_RESEED6] = 0;
+    out[U_SPIN6] = fract6(ctx.bars / Math.max(num7(p, "spinBars", 1e-3, 4096), 1e-3)) * TAU6;
+    out[U_HUE_SHIFT6] = fract6(ctx.bars / Math.max(num7(p, "hueBars", 1e-3, 4096), 1e-3)) * TAU6;
+    out[U_SCALE6] = num7(p, "fit", 0, 4) * Math.min(1, ctx.aspect * 1.15);
+    out[U_HALF_WIDTH6] = num7(p, "thickness", 1e-5, 0.1);
+    out[U_BRIGHT6] = num7(p, "brightBase", 0, 1) + ctx.audio.level * num7(p, "brightLevel", 0, 1) + ctx.progress * num7(p, "brightEnv", 0, 1);
+    out[U_HUE_SPREAD5] = num7(p, "hueSpread", 0, 6.283);
+  }
+};
+
+// src/shaders/src-scope.wgsl
+var src_scope_default = "// Oscilloscope: line, circular and Lissajous/vectorscope. Plan \xA78.1.\n//\n// Look: LAB (art-direction \xA71.1) \u2014 one line, drawn well, on near-black. Which is\n// why this file spends most of its length on the line and none of it on fill.\n//\n// Geometry is a quad per segment, indexed straight out of `vertex_index` with no\n// vertex buffer, exactly as `points.wgsl` does. Three things the naive version of\n// this shader gets wrong and this one does not:\n//\n//   - Joins. A per-segment quad built from the segment normal alone leaves a\n//     wedge-shaped gap on every outside corner, and a scope at 512 segments is\n//     512 corners. Each endpoint is therefore offset along the MITER of its two\n//     adjacent segments, with the miter length clamped \u2014 an unclamped miter at a\n//     hairpin goes to infinity and fires one spike across the whole frame.\n//   - Sub-pixel width. A half-width below half a pixel does not draw a thin\n//     line, it draws a dashed one, because whether a given segment lands on a\n//     sample point becomes luck. The width is clamped to one pixel and the\n//     ALPHA carries the remainder instead, which is what keeps a quiet scope\n//     quiet rather than sparkly.\n//   - Uniform stroke. Weight varies with local amplitude and with the air band\n//     (art-direction \xA74.4); a constant stroke reads machine-drawn.\n//\n// It deliberately does NOT: fill, glow beyond the stroke's own shoulder, or pick\n// a colour. The colour is `C.color` \u2014 the layer's palette slot \u2014 because a source\n// that names its own hue is a source that breaks the three-hue rule from outside\n// the palette (\xA72.2).\n\nstruct Params {\n  mode      : f32,   // 0 line, 1 circular, 2 Lissajous\n  gain      : f32,   // amplitude scale\n  halfWidth : f32,   // half stroke width, in unit-y (see the space note below)\n  segments  : f32,\n  radius    : f32,   // circular base radius / Lissajous extent\n  centreX   : f32,   // unit space. Off-centre by default \u2014 art-direction \xA74.1\n  centreY   : f32,\n  spread    : f32,   // half the line-mode horizontal extent, aspect-corrected on the CPU\n  weightVar : f32,   // 0 = uniform stroke (do not), 1 = strongly varying\n  window    : f32,   // fraction of the waveform window traversed\n  spin      : f32,   // radians, from a clock division. Never wall-clock (\xA73.1)\n  _pad0     : f32,\n};\n\nconst TAU = 6.28318530718;\n\n// Everything below works in UNIT space: y in [-1,1], x in [-aspect, aspect].\n// Clip space is `vec2(p.x / C.aspect, p.y)`. Keeping the two apart is what makes\n// a circle round and a Lissajous square without every expression carrying an\n// aspect divide of its own.\n\nfn toClip(p : vec2<f32>) -> vec4<f32> {\n  return vec4<f32>(p.x / max(C.aspect, 1e-4), p.y, 0.0, 1.0);\n}\n\n/** Path parameter, wrapped for the closed (circular) path and clamped otherwise. */\nfn pathT(t : f32) -> f32 {\n  if (P.mode > 0.5 && P.mode < 1.5) { return fract(t + 1.0); }\n  return clamp(t, 0.0, 1.0);\n}\n\nfn scopePoint(t : f32) -> vec2<f32> {\n  let s = waveAt(t * P.window);\n  let mono = (s.x + s.y) * 0.5;\n  let c = vec2<f32>(P.centreX, P.centreY);\n\n  if (P.mode < 0.5) {\n    // Line. `spread` already carries the aspect, so the trace spans the frame.\n    return c + vec2<f32>((t - 0.5) * 2.0 * P.spread, mono * P.gain);\n  }\n  if (P.mode < 1.5) {\n    // Circular: radius = 1 + v. The spin comes from a clock division, so the\n    // figure rotates WITH the music rather than at some chosen constant.\n    let a = t * TAU + P.spin;\n    let r = P.radius * (1.0 + mono * P.gain);\n    return c + vec2<f32>(cos(a), sin(a)) * r;\n  }\n  // Lissajous / vectorscope: x = L, y = R. This is the one mode that genuinely\n  // needs true stereo, which is why stereo was a Phase 0 requirement rather than\n  // a refinement \u2014 from a mono sum it collapses to the line y = x and says\n  // nothing at all.\n  return c + vec2<f32>(s.x, s.y) * P.gain * P.radius;\n}\n\n/** Stroke weight and brightness at t. Returns (weight multiplier, glow multiplier). */\nfn strokeAt(t : f32) -> vec2<f32> {\n  let s = waveAt(t * P.window);\n  let amp = abs(s.x + s.y) * 0.5;\n  // Air rides the whole stroke a little, so hats read as a thickening of the\n  // trace rather than as a separate flashing thing (art-direction \xA73.3).\n  let w = 1.0 + P.weightVar * (1.8 * amp + 0.7 * bandAt(4u) - 0.35);\n  return vec2<f32>(max(w, 0.25), 0.55 + 0.75 * amp);\n}\n\n/**\n * Miter at `cur` between the segments prev->cur and cur->next.\n * Returns (direction.xy, length scale). The scale is 1/cos(theta/2), clamped:\n * a hairpin sends it to infinity and one vertex shoots off screen.\n *\n * The two degenerate cases are the ENDPOINTS of an open path, not exotica: the\n * line and Lissajous modes clamp `pathT`, so at seg 0 `prev == cur` and at the\n * last segment `next == cur`. Substituting an arbitrary direction there (the\n * obvious `safeDir` fallback of (1,0)) tilts the miter towards vertical and\n * visibly skews the first and last caps. Falling back to the ONE real adjacent\n * normal instead gives a square butt cap, which is what an open stroke wants.\n */\nfn joinNormal(prev : vec2<f32>, cur : vec2<f32>, next : vec2<f32>) -> vec3<f32> {\n  let e0 = cur - prev;\n  let e1 = next - cur;\n  let l0 = length(e0);\n  let l1 = length(e1);\n  // Both degenerate: a zero-length trace. Any consistent normal will do, and the\n  // quad it produces has zero extent along the path anyway.\n  if (l0 < 1e-7 && l1 < 1e-7) { return vec3<f32>(0.0, 1.0, 1.0); }\n  if (l0 < 1e-7) {\n    let d = e1 / l1;\n    return vec3<f32>(-d.y, d.x, 1.0);\n  }\n  if (l1 < 1e-7) {\n    let d = e0 / l0;\n    return vec3<f32>(-d.y, d.x, 1.0);\n  }\n  let d0 = e0 / l0;\n  let d1 = e1 / l1;\n  let n0 = vec2<f32>(-d0.y, d0.x);\n  let n1 = vec2<f32>(-d1.y, d1.x);\n  var m = n0 + n1;\n  let l = length(m);\n  // A 180-degree reversal has no miter. Fall back to the outgoing normal; the\n  // segment simply butts, which is invisible at these lengths.\n  if (l < 1e-5) { return vec3<f32>(n1, 1.0); }\n  m = m / l;\n  return vec3<f32>(m, min(1.0 / max(dot(m, n1), 0.1), 4.0));\n}\n\nstruct VsOut {\n  @builtin(position) pos : vec4<f32>,\n  @location(0) across : f32,   // -1..1 across the stroke\n  @location(1) fade   : f32,   // sub-pixel width compensation\n  @location(2) glow   : f32,\n};\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> VsOut {\n  let seg = f32(vi / 6u);\n  let corner = vi % 6u;\n  let n = max(P.segments, 2.0);\n\n  let t1 = pathT(seg / n);\n  let t2 = pathT((seg + 1.0) / n);\n\n  let p0 = scopePoint(pathT((seg - 1.0) / n));\n  let p1 = scopePoint(t1);\n  let p2 = scopePoint(t2);\n  let p3 = scopePoint(pathT((seg + 2.0) / n));\n\n  let j1 = joinNormal(p0, p1, p2);\n  let j2 = joinNormal(p1, p2, p3);\n\n  let s1 = strokeAt(t1);\n  let s2 = strokeAt(t2);\n  var w1 = P.halfWidth * s1.x;\n  var w2 = P.halfWidth * s2.x;\n\n  // One pixel is 2/resolution.y in unit-y, so half a pixel is 1/resolution.y.\n  // Below that the stroke stops being thin and starts being intermittent.\n  let minW = 1.0 / max(C.resolution.y, 1.0);\n  let fade1 = clamp(w1 / minW, 0.0, 1.0);\n  let fade2 = clamp(w2 / minW, 0.0, 1.0);\n  w1 = max(w1, minW);\n  w2 = max(w2, minW);\n\n  let o1 = j1.xy * (w1 * j1.z);\n  let o2 = j2.xy * (w2 * j2.z);\n\n  var pos : vec2<f32>;\n  var across : f32;\n  var fade : f32;\n  var glow : f32;\n  switch (corner) {\n    case 0u: { pos = p1 - o1; across = -1.0; fade = fade1; glow = s1.y; }\n    case 1u: { pos = p1 + o1; across =  1.0; fade = fade1; glow = s1.y; }\n    case 2u: { pos = p2 - o2; across = -1.0; fade = fade2; glow = s2.y; }\n    case 3u: { pos = p2 - o2; across = -1.0; fade = fade2; glow = s2.y; }\n    case 4u: { pos = p1 + o1; across =  1.0; fade = fade1; glow = s1.y; }\n    default: { pos = p2 + o2; across =  1.0; fade = fade2; glow = s2.y; }\n  }\n\n  var out : VsOut;\n  out.pos = toClip(pos);\n  out.across = across;\n  out.fade = fade;\n  out.glow = glow;\n  return out;\n}\n\n@fragment\nfn fs(in : VsOut) -> @location(0) vec4<f32> {\n  let d = abs(in.across);\n  // Analytic AA (art-direction \xA74.5): the edge is one fragment-derivative wide in\n  // the SAME parameter the edge is expressed in, so it holds at every stroke\n  // width and every resolution. `fwidth` is clamped because a stroke thinner\n  // than a fragment would otherwise smooth its own coverage away to nothing.\n  let e = clamp(fwidth(in.across), 1e-4, 0.9);\n  let cov = 1.0 - smoothstep(1.0 - e, 1.0, d);\n\n  // Phosphor shoulder: a bright core with a soft falloff across the width. A\n  // flat-topped stroke bands visibly wherever the trace crosses itself, which on\n  // a Lissajous is constantly.\n  let core = 0.30 + 0.70 * exp(-d * d * 2.4);\n\n  let a = cov * in.fade * C.opacity;\n  return vec4<f32>(C.color.rgb * core * in.glow * a, a);\n}\n";
+
+// src/sources/scope.ts
+var PARAMS_WGSL7 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Params;`;
+var F_MODE = 0;
+var F_GAIN = 1;
+var F_HALF_WIDTH = 2;
+var F_SEGMENTS = 3;
+var F_RADIUS = 4;
+var F_CENTRE_X = 5;
+var F_CENTRE_Y = 6;
+var F_SPREAD = 7;
+var F_WEIGHT_VAR = 8;
+var F_WINDOW = 9;
+var F_SPIN = 10;
+var PARAM_FLOATS = 12;
+var MODES = ["line", "circle", "lissajous"];
+var DEFAULT_SEGMENTS = 512;
+var scopePass = {
+  type: "scope",
+  family: "source",
+  // A source draws INTO the accumulator, so it cannot sample it. Explicit
+  // because the default is easy to assume the other way round.
+  input: "none",
+  usesAudio: true,
+  code: [PASS_COMMON_WGSL, AUDIO_WGSL, PARAMS_WGSL7, src_scope_default].join("\n"),
+  draw: {
+    kind: "vertices",
+    // Six vertices per segment quad, and ZERO at progress 0 — a spent layer is a
+    // true no-op (Phase 5 DoD), not a draw that happens to be transparent.
+    vertexCount: (ctx) => ctx.progress > 0 ? 6 * segmentCount(ctx.params) : 0
+  },
+  /**
+   * Thin analytic-AA line work is exactly what per-layer resolution scaling
+   * destroys: the stroke is defined in pixels of the ATTACHMENT, so at half res
+   * it is a half-res line bilinearly smeared back up. Advisory only — §4.11 says
+   * the scale is a budget decision and the budget belongs to the show.
+   */
+  defaultResolutionScale: 1,
+  uniformFloats: PARAM_FLOATS,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[F_MODE] = MODES.indexOf(mode(p, "mode", "line"));
+    out[F_GAIN] = num8(p, "gain", 0.55);
+    out[F_HALF_WIDTH] = Math.max(num8(p, "thickness", 35e-4), 0) * 0.5;
+    out[F_SEGMENTS] = segmentCount(p);
+    out[F_RADIUS] = num8(p, "radius", 0.45);
+    out[F_CENTRE_X] = num8(p, "centreX", -0.16);
+    out[F_CENTRE_Y] = num8(p, "centreY", 0.08);
+    out[F_SPREAD] = num8(p, "spread", 0.86) * ctx.aspect;
+    out[F_WEIGHT_VAR] = clamp014(num8(p, "weightVar", 0.7));
+    out[F_WINDOW] = clamp014(num8(p, "window", 1));
+    const spinBeats = Math.max(num8(p, "spinBeats", 32), 1e-3);
+    out[F_SPIN] = fract7(ctx.beats / spinBeats) * Math.PI * 2;
+  }
+};
+function segmentCount(p) {
+  return Math.max(2, Math.round(num8(p, "segments", DEFAULT_SEGMENTS)));
+}
+function num8(p, key, fallback) {
+  const v = p[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+function mode(p, key, fallback) {
+  const v = p[key];
+  const found = MODES.find((m) => m === v);
+  return found ?? fallback;
+}
+function clamp014(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+function fract7(v) {
+  return v - Math.floor(v);
+}
+
+// src/shaders/src-ribbon.wgsl
+var src_ribbon_default = "// Ribbon: the waveform extruded into a band with real width, twisted about its\n// own path and SHADED FROM A NORMAL. Plan \xA78.1.\n//\n// Look: INK (art-direction \xA71.1/\xA71.3) \u2014 a single slow stroke with weight, on\n// near-black. It is the one waveform source that is a surface rather than a\n// line, and everything here follows from that:\n//\n//   - A stroked line has no normal and therefore no light. This one carries a\n//     3D frame: the path is planar, but the band ROLLS about its tangent by\n//     `phi`, so its across-direction has a z component and the surface normal\n//     turns as the ribbon twists. That is what makes it read as a material\n//     catching light instead of a filled polyline.\n//   - The apparent half-width is `w * cos(phi)`. Not a stylisation \u2014 it is what\n//     an orthographic view of a twisted band actually does, and it is where most\n//     of the line-weight variation (\xA74.4) comes from for free. Edge-on the band\n//     collapses to a bright hairline, which is correct and is why the sub-pixel\n//     clamp below carries the remainder in ALPHA rather than widening the quad.\n//   - Shading happens in OKLab (\xA72.1). Only lightness and chroma move; the HUE\n//     is whatever the layer's palette slot is and never shifts, because a\n//     surface that changes hue as it turns is a third hue nobody asked for\n//     (\xA72.2). Shadows gain a little chroma, as real ones do.\n//   - The specular lobe is the ONLY thing allowed above 1.0, it is gated by\n//     `gloss` and by the air band, so bloom finds the ribbon's highlight on a\n//     transient and nothing else (\xA72.4).\n//\n// Joins are mitered exactly as `src-scope.wgsl` does them, and for the same\n// reason: a per-segment quad leaves a wedge on every outside corner, and an\n// unclamped miter fires a spike across the frame at a hairpin.\n//\n// ---------------------------------------------------------------------------\n// BINDINGS ARE NOT DECLARED HERE. `sources/ribbon.ts` prepends\n// `PASS_COMMON_WGSL` (C), `AUDIO_WGSL` (A, waveAt, bandAt) and the `params`\n// binding. No binding number is written in this file.\n// ---------------------------------------------------------------------------\n\nstruct Params {\n  gain        : f32,   // amplitude -> path displacement\n  halfWidth   : f32,   // half band width, unit-y\n  segments    : f32,\n  spread      : f32,   // half the horizontal extent, aspect-corrected on the CPU\n  centreX     : f32,   // unit space. Off-centre by default \u2014 \xA74.1\n  centreY     : f32,\n  twistTurns  : f32,   // total roll along the path, radians\n  twistPhase  : f32,   // radians, from a clock division. Never wall-clock (\xA73.1)\n  weightVar   : f32,   // 0 = uniform width (do not), 1 = strongly varying\n  window      : f32,   // fraction of the waveform window traversed\n  scroll      : f32,   // phase offset into that window, from a clock division\n  stereoWidth : f32,   // how much |L-R| widens the band\n  gloss       : f32,   // specular strength. The only HDR in this pass.\n  shade       : f32,   // lightness of the fully-turned-away side, 0..1\n  taper       : f32,   // end-taper exponent. The band starts and ends at nothing.\n  _pad0       : f32,\n};\n\nconst PI = 3.14159265359;\n\n// The key light. Fixed, off-centre, from the upper left \u2014 art-direction \xA74.1\n// rejects anything that radiates from the middle of the frame, and a light that\n// tracked the audio would make the whole band flash rather than turn.\nconst KEY = vec3<f32>(-0.4472, 0.7208, 0.5298);\n/** Curvature across the band, radians at the edge. A perfectly flat strip has one flat tone. */\nconst BEVEL = 0.85;\n\n// Unit space: y in [-1,1], x in [-aspect, aspect]. Clip is x/aspect.\nfn toClip(p : vec2<f32>) -> vec4<f32> {\n  return vec4<f32>(p.x / max(C.aspect, 1e-4), p.y, 0.0, 1.0);\n}\n\n/** L,R at path position t, phase-shifted by the scroll. */\nfn ribbonSample(t : f32) -> vec2<f32> {\n  return waveAt(fract(clamp(t, 0.0, 1.0) * P.window + P.scroll));\n}\n\nfn ribbonPoint(t : f32) -> vec2<f32> {\n  let s = ribbonSample(t);\n  let mono = (s.x + s.y) * 0.5;\n  return vec2<f32>(\n    P.centreX + (clamp(t, 0.0, 1.0) - 0.5) * 2.0 * P.spread,\n    P.centreY + mono * P.gain,\n  );\n}\n\n/**\n * Half-width at t, before the twist foreshortens it.\n *\n * `env` is the brush taper: zero at both ends, so the stroke has a start and a\n * finish instead of being clipped by the frame edge. `taper` below 1 makes the\n * shoulders fuller, above 1 makes it a needle.\n */\nfn ribbonWidth(t : f32) -> f32 {\n  let s = ribbonSample(t);\n  let amp = abs(s.x + s.y) * 0.5;\n  let stereo = abs(s.x - s.y);\n  let env = pow(clamp(sin(clamp(t, 0.0, 1.0) * PI), 0.0, 1.0), max(P.taper, 0.05));\n  let w = 1.0 + P.weightVar * (1.7 * amp - 0.28) + P.stereoWidth * stereo;\n  return P.halfWidth * env * max(w, 0.05);\n}\n\n/**\n * Roll about the tangent. Stereo divergence tilts the band on top of the steady\n * twist, so a wide stereo image reads as the surface turning into and out of the\n * light rather than as a brightness change (\xA75, \"full-frame brightness swings\").\n */\nfn ribbonRoll(t : f32) -> f32 {\n  let s = ribbonSample(t);\n  return P.twistPhase + clamp(t, 0.0, 1.0) * P.twistTurns + (s.x - s.y) * 1.4;\n}\n\nfn safeDir(v : vec2<f32>) -> vec2<f32> {\n  let l = length(v);\n  if (l < 1e-7) { return vec2<f32>(1.0, 0.0); }\n  return v / l;\n}\n\n/**\n * Miter at `cur` between prev->cur and cur->next: (direction.xy, length scale).\n * The scale is 1/cos(theta/2) and is clamped \u2014 a hairpin sends it to infinity.\n *\n * The degenerate cases are the ENDPOINTS, not exotica: `ribbonPoint` clamps its\n * parameter, so at seg 0 `prev == cur` and at the last segment `next == cur`.\n * Falling back to `safeDir`'s arbitrary (1,0) there would tilt the miter toward\n * vertical and visibly skew the first and last cap \u2014 the same trap `src-scope.wgsl`\n * documents. Use the ONE real adjacent normal instead, which is a square butt cap.\n */\nfn joinNormal(prev : vec2<f32>, cur : vec2<f32>, next : vec2<f32>) -> vec3<f32> {\n  let e0 = cur - prev;\n  let e1 = next - cur;\n  let l0 = length(e0);\n  let l1 = length(e1);\n  if (l0 < 1e-7 && l1 < 1e-7) { return vec3<f32>(0.0, 1.0, 1.0); }\n  if (l0 < 1e-7) {\n    let d = e1 / l1;\n    return vec3<f32>(-d.y, d.x, 1.0);\n  }\n  if (l1 < 1e-7) {\n    let d = e0 / l0;\n    return vec3<f32>(-d.y, d.x, 1.0);\n  }\n  let d0 = e0 / l0;\n  let d1 = e1 / l1;\n  let n0 = vec2<f32>(-d0.y, d0.x);\n  let n1 = vec2<f32>(-d1.y, d1.x);\n  var m = n0 + n1;\n  let l = length(m);\n  if (l < 1e-5) { return vec3<f32>(n1, 1.0); }\n  m = m / l;\n  return vec3<f32>(m, min(1.0 / max(dot(m, n1), 0.1), 4.0));\n}\n\n// OKLab <-> linear sRGB. Both directions, because the shading modulates the\n// palette colour PERCEPTUALLY: scaling linear rgb darkens through mud, and\n// mixing toward white in sRGB is the grey dead-zone of \xA72.1 in another costume.\nfn oklabToLinear(c : vec3<f32>) -> vec3<f32> {\n  let l_ = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;\n  let m_ = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;\n  let s_ = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;\n  let l = l_ * l_ * l_;\n  let m = m_ * m_ * m_;\n  let s = s_ * s_ * s_;\n  return vec3<f32>(\n    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,\n   -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,\n   -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,\n  );\n}\n\nfn linearToOklab(c : vec3<f32>) -> vec3<f32> {\n  let r = max(c.x, 0.0);\n  let g = max(c.y, 0.0);\n  let b = max(c.z, 0.0);\n  let l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b;\n  let m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b;\n  let s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b;\n  let l_ = pow(l, 1.0 / 3.0);\n  let m_ = pow(m, 1.0 / 3.0);\n  let s_ = pow(s, 1.0 / 3.0);\n  return vec3<f32>(\n    0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,\n    1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,\n    0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,\n  );\n}\n\nstruct VsOut {\n  @builtin(position) pos : vec4<f32>,\n  @location(0) across : f32,          // -1..1 across the band\n  @location(1) fade   : f32,          // sub-pixel width compensation\n  @location(2) nrm    : vec3<f32>,    // surface normal at the band's midline\n  @location(3) acr    : vec3<f32>,    // the band's across-direction, in 3D\n};\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> VsOut {\n  let seg = f32(vi / 6u);\n  let corner = vi % 6u;\n  let n = max(P.segments, 2.0);\n\n  let t1 = seg / n;\n  let t2 = (seg + 1.0) / n;\n\n  // Four points, because a miter needs the segment on each side of the joint.\n  let p0 = ribbonPoint((seg - 1.0) / n);\n  let p1 = ribbonPoint(t1);\n  let p2 = ribbonPoint(t2);\n  let p3 = ribbonPoint((seg + 2.0) / n);\n\n  let j1 = joinNormal(p0, p1, p2);\n  let j2 = joinNormal(p1, p2, p3);\n\n  let phi1 = ribbonRoll(t1);\n  let phi2 = ribbonRoll(t2);\n\n  // Signed, so a roll past 90 degrees genuinely flips the band over rather than\n  // folding it back on itself.\n  let a1 = ribbonWidth(t1) * cos(phi1);\n  let a2 = ribbonWidth(t2) * cos(phi2);\n\n  // One pixel is 2/resolution.y in unit-y. Below half of that a band does not\n  // draw thin, it draws INTERMITTENT \u2014 coverage becomes a question of whether a\n  // sample point happens to land inside it. Clamp the geometry, carry the\n  // remainder in alpha, and an edge-on ribbon dims instead of sparkling.\n  let minW = 1.0 / max(C.resolution.y, 1.0);\n  let fade1 = clamp(abs(a1) / minW, 0.0, 1.0);\n  let fade2 = clamp(abs(a2) / minW, 0.0, 1.0);\n  let w1 = max(abs(a1), minW) * select(-1.0, 1.0, a1 >= 0.0);\n  let w2 = max(abs(a2), minW) * select(-1.0, 1.0, a2 >= 0.0);\n\n  let o1 = j1.xy * (w1 * j1.z);\n  let o2 = j2.xy * (w2 * j2.z);\n\n  // The 3D frame. The tangent is planar (z = 0); the across-direction is the\n  // in-plane miter rolled by phi out of the plane. The normal is their cross\n  // product, which is what the fragment stage lights.\n  let t3a = normalize(vec3<f32>(safeDir(p2 - p0), 0.0));\n  let t3b = normalize(vec3<f32>(safeDir(p3 - p1), 0.0));\n  let acr1 = vec3<f32>(j1.xy * cos(phi1), sin(phi1));\n  let acr2 = vec3<f32>(j2.xy * cos(phi2), sin(phi2));\n  let nrm1 = normalize(cross(t3a, acr1));\n  let nrm2 = normalize(cross(t3b, acr2));\n\n  var pos : vec2<f32>;\n  var across : f32;\n  var fade : f32;\n  var nrm : vec3<f32>;\n  var acr : vec3<f32>;\n  switch (corner) {\n    case 0u: { pos = p1 - o1; across = -1.0; fade = fade1; nrm = nrm1; acr = acr1; }\n    case 1u: { pos = p1 + o1; across =  1.0; fade = fade1; nrm = nrm1; acr = acr1; }\n    case 2u: { pos = p2 - o2; across = -1.0; fade = fade2; nrm = nrm2; acr = acr2; }\n    case 3u: { pos = p2 - o2; across = -1.0; fade = fade2; nrm = nrm2; acr = acr2; }\n    case 4u: { pos = p1 + o1; across =  1.0; fade = fade1; nrm = nrm1; acr = acr1; }\n    default: { pos = p2 + o2; across =  1.0; fade = fade2; nrm = nrm2; acr = acr2; }\n  }\n\n  var out : VsOut;\n  out.pos = toClip(pos);\n  out.across = across;\n  out.fade = fade;\n  out.nrm = nrm;\n  out.acr = acr;\n  return out;\n}\n\n@fragment\nfn fs(in : VsOut) -> @location(0) vec4<f32> {\n  let d = abs(in.across);\n  // Analytic AA (\xA74.5), in the same parameter the edge is expressed in, so it\n  // holds at any width and any resolution. Clamped because a band thinner than a\n  // fragment would otherwise smooth its own coverage away to nothing.\n  let e = clamp(fwidth(in.across), 1e-4, 0.9);\n  let cov = 1.0 - smoothstep(1.0 - e, 1.0, d);\n\n  // Bend the normal across the width so the band is a shallow cylinder, not a\n  // flat strip. A flat strip has exactly one tone and stops reading as a surface.\n  let bend = in.across * BEVEL;\n  let nrm = normalize(in.nrm * cos(bend) + normalize(in.acr) * sin(bend));\n\n  // Wrapped diffuse: the far side goes to `shade`, not to black. A hard\n  // terminator on a band this thin reads as a hole punched in the stroke.\n  let lam = dot(nrm, KEY);\n  let diff = mix(P.shade, 1.0, clamp(lam * 0.5 + 0.5, 0.0, 1.0));\n\n  // Perceptual shading. Lightness carries the light; chroma rises slightly in\n  // shadow, as it does on real material. The hue never moves (\xA72.2).\n  let base = linearToOklab(C.color.rgb);\n  let lab = vec3<f32>(base.x * diff, base.y * (1.0 + 0.22 * (1.0 - diff)), base.z * (1.0 + 0.22 * (1.0 - diff)));\n  let rgb = max(oklabToLinear(lab), vec3<f32>(0.0));\n\n  // The one HDR term (\xA72.4). Blinn-Phong against a fixed view, gated by gloss\n  // and ridden by the air band so it lands on transients and is otherwise absent.\n  // `hv`, not `half` \u2014 `half` is a WGSL reserved word and the error it produces\n  // points at the next line.\n  let hv = normalize(KEY + vec3<f32>(0.0, 0.0, 1.0));\n  let spec = pow(max(dot(nrm, hv), 0.0), 48.0) * P.gloss * (0.35 + 1.15 * bandAt(4u));\n\n  let a = cov * in.fade * C.opacity;\n  return vec4<f32>((rgb + vec3<f32>(spec)) * a, a);\n}\n";
+
+// src/sources/ribbon.ts
+var PARAMS_WGSL8 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Params;`;
+var F_GAIN2 = 0;
+var F_HALF_WIDTH2 = 1;
+var F_SEGMENTS2 = 2;
+var F_SPREAD2 = 3;
+var F_CENTRE_X2 = 4;
+var F_CENTRE_Y2 = 5;
+var F_TWIST_TURNS = 6;
+var F_TWIST_PHASE = 7;
+var F_WEIGHT_VAR2 = 8;
+var F_WINDOW2 = 9;
+var F_SCROLL = 10;
+var F_STEREO_WIDTH = 11;
+var F_GLOSS = 12;
+var F_SHADE = 13;
+var F_TAPER = 14;
+var PARAM_FLOATS2 = 16;
+var TAU7 = Math.PI * 2;
+var DEFAULT_SEGMENTS2 = 768;
+var MAX_SEGMENTS = 8192;
+var ribbonPass = {
+  type: "ribbon",
+  family: "source",
+  // A source draws INTO the accumulator and so may not sample it. Explicit
+  // because the default is easy to assume the other way round.
+  input: "none",
+  usesAudio: true,
+  code: [PASS_COMMON_WGSL, AUDIO_WGSL, PARAMS_WGSL8, src_ribbon_default].join("\n"),
+  draw: {
+    kind: "vertices",
+    // Six vertices per segment quad, and ZERO at progress 0 — a spent layer is a
+    // true no-op (Phase 5 DoD), not a draw that happens to be transparent.
+    vertexCount: (ctx) => ctx.progress > 0 ? 6 * segmentCount2(ctx.params) : 0
+  },
+  /**
+   * Full resolution. The band's edge is analytic and its highlight is a
+   * ~1-pixel lobe; both are defined in ATTACHMENT pixels, so a half-res pass is
+   * a half-res edge bilinearly smeared back up. Advisory only — §4.11 says the
+   * scale is a budget decision and the budget belongs to the show.
+   */
+  defaultResolutionScale: 1,
+  uniformFloats: PARAM_FLOATS2,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[F_GAIN2] = num9(p, "gain", 0.28);
+    out[F_HALF_WIDTH2] = Math.max(num9(p, "width", 0.055), 0) * 0.5;
+    out[F_SEGMENTS2] = segmentCount2(p);
+    out[F_SPREAD2] = num9(p, "spread", 0.82) * ctx.aspect;
+    out[F_CENTRE_X2] = num9(p, "centreX", 0.05);
+    out[F_CENTRE_Y2] = num9(p, "centreY", -0.13);
+    out[F_TWIST_TURNS] = num9(p, "twistTurns", 1.35) * TAU7;
+    const twistBars = Math.max(num9(p, "twistBars", 24), 1e-3);
+    out[F_TWIST_PHASE] = fract8(ctx.bars / twistBars) * TAU7;
+    out[F_WEIGHT_VAR2] = clamp015(num9(p, "weightVar", 0.75));
+    out[F_WINDOW2] = clamp015(num9(p, "window", 1));
+    const scrollBeats = Math.max(num9(p, "scrollBeats", 8), 1e-3);
+    out[F_SCROLL] = fract8(ctx.beats / scrollBeats);
+    out[F_STEREO_WIDTH] = Math.max(num9(p, "stereoWidth", 0.9), 0);
+    out[F_GLOSS] = Math.max(num9(p, "gloss", 0.55), 0) * Math.max(ctx.color.intensity, 0);
+    out[F_SHADE] = clamp015(num9(p, "shade", 0.22));
+    out[F_TAPER] = Math.max(num9(p, "taper", 0.55), 0.05);
+  }
+};
+function segmentCount2(p) {
+  const n = Math.round(num9(p, "segments", DEFAULT_SEGMENTS2));
+  return n < 2 ? 2 : n > MAX_SEGMENTS ? MAX_SEGMENTS : n;
+}
+function num9(p, key, fallback) {
+  const v = p[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+function clamp015(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+function fract8(v) {
+  return v - Math.floor(v);
+}
+
+// src/shaders/src-spiral.wgsl
+var src_spiral_default = "// Spiral: an Archimedean spiral whose radius grows with the sample INDEX and is\n// perturbed by the sample itself. Plan \xA78.1.\n//\n// Look: LAB (art-direction \xA71.1) \u2014 one line, drawn well, on near-black. It is a\n// radial source, which \xA74.1 explicitly permits: a spiral has a centre by\n// construction, unlike a pulse that was bolted onto the middle of the frame. So\n// there is deliberately NO centre-out flashing on top of it, and the centre\n// itself sits slightly off the frame's own.\n//\n// The failure mode this file is written against is CROWDING. Turn n and turn\n// n+1 are `(rOuter - rInner) / turns` apart, which at eight turns is ~0.05 unit\n// \u2014 a stroke of constant width and constant brightness therefore fills the inner\n// third solid long before it reaches the middle, and the source stops being a\n// spiral and becomes a disc. Three things prevent it, and all three are needed:\n//\n//   - The stroke TAPERS toward the centre (`taperInner`), so weight varies along\n//     the line instead of being uniform (\xA74.4).\n//   - The brightness fades with it (`innerFade`). Taper alone still stacks\n//     coverage from adjacent turns into a solid additive core.\n//   - The radial wobble is CLAMPED on the CPU to a fraction of the turn spacing,\n//     so loud passages cannot make adjacent turns cross. Crossing turns are what\n//     turn a spiral into a scribble.\n//\n// Stereo is used rather than summed away: L displaces the radius, R displaces\n// the ANGLE. A centred mono signal breathes in and out; a wide one shears, which\n// is a shape the eye reads as stereo without being told.\n//\n// ---------------------------------------------------------------------------\n// BINDINGS ARE NOT DECLARED HERE. `sources/spiral.ts` prepends\n// `PASS_COMMON_WGSL` (C), `AUDIO_WGSL` (A, waveAt, bandAt) and the `params`\n// binding. No binding number is written in this file.\n// ---------------------------------------------------------------------------\n\nstruct Params {\n  gain       : f32,   // radial wobble, unit. CPU-clamped against the turn spacing.\n  halfWidth  : f32,   // half stroke width at the OUTER end, unit-y\n  segments   : f32,\n  turns      : f32,\n  rInner     : f32,\n  rOuter     : f32,\n  centreX    : f32,   // unit space. Off-centre by default \u2014 \xA74.1\n  centreY    : f32,\n  spin       : f32,   // radians, from a clock division. Never wall-clock (\xA73.1)\n  window     : f32,   // fraction of the waveform window traversed\n  scroll     : f32,   // phase offset into that window, from a clock division\n  weightVar  : f32,   // 0 = uniform stroke (do not), 1 = strongly varying\n  taperInner : f32,   // stroke width at the centre, as a fraction of the outer\n  innerFade  : f32,   // brightness at the centre, as a fraction of the outer\n  swirl      : f32,   // angular wobble from R, radians. CPU-clamped.\n  _pad0      : f32,\n};\n\nconst TAU = 6.28318530718;\n\n// Unit space: y in [-1,1], x in [-aspect, aspect]. Clip is x/aspect \u2014 which is\n// what keeps the spiral ROUND on a wide frame instead of an ellipse.\nfn toClip(p : vec2<f32>) -> vec4<f32> {\n  return vec4<f32>(p.x / max(C.aspect, 1e-4), p.y, 0.0, 1.0);\n}\n\n/** L,R at path position t, phase-shifted by the scroll. */\nfn spiralSample(t : f32) -> vec2<f32> {\n  return waveAt(fract(clamp(t, 0.0, 1.0) * P.window + P.scroll));\n}\n\n/**\n * t = 0 at the centre, t = 1 at the outside. Radius grows linearly with t, which\n * IS the Archimedean condition (r proportional to theta, and theta is linear in\n * t) \u2014 the constant-pitch spiral, not a logarithmic one whose inner turns\n * collapse into a point no taper can rescue.\n */\nfn spiralPoint(t : f32) -> vec2<f32> {\n  let u = clamp(t, 0.0, 1.0);\n  let s = spiralSample(u);\n  let a = P.spin + u * P.turns * TAU + s.y * P.swirl;\n  let r = mix(P.rInner, P.rOuter, u) + s.x * P.gain;\n  return vec2<f32>(P.centreX, P.centreY) + vec2<f32>(cos(a), sin(a)) * max(r, 0.0);\n}\n\n/** (width multiplier, brightness multiplier) at t. Both taper toward the centre. */\nfn strokeAt(t : f32) -> vec2<f32> {\n  let u = clamp(t, 0.0, 1.0);\n  let s = spiralSample(u);\n  let amp = abs(s.x + s.y) * 0.5;\n  let taper = mix(P.taperInner, 1.0, u);\n  // Air rides the stroke a little so hats thicken the whole figure rather than\n  // flashing as their own thing (\xA73.3).\n  let w = taper * (1.0 + P.weightVar * (1.6 * amp + 0.6 * bandAt(4u) - 0.3));\n  let glow = mix(P.innerFade, 1.0, u) * (0.5 + 0.85 * amp);\n  return vec2<f32>(max(w, 0.05), glow);\n}\n\n/**\n * Miter at `cur` between prev->cur and cur->next: (direction.xy, length scale).\n * Clamped, because the innermost turns bend hard and an unclamped 1/cos(theta/2)\n * fires one vertex across the whole frame.\n *\n * The degenerate cases are the two ENDS of the spiral: `spiralPoint` clamps its\n * parameter, so at seg 0 `prev == cur` and at the last segment `next == cur`.\n * Substituting an arbitrary direction there skews both caps; falling back to the\n * ONE real adjacent normal gives a square butt cap, exactly as `src-scope.wgsl`\n * does it.\n */\nfn joinNormal(prev : vec2<f32>, cur : vec2<f32>, next : vec2<f32>) -> vec3<f32> {\n  let e0 = cur - prev;\n  let e1 = next - cur;\n  let l0 = length(e0);\n  let l1 = length(e1);\n  if (l0 < 1e-7 && l1 < 1e-7) { return vec3<f32>(0.0, 1.0, 1.0); }\n  if (l0 < 1e-7) {\n    let d = e1 / l1;\n    return vec3<f32>(-d.y, d.x, 1.0);\n  }\n  if (l1 < 1e-7) {\n    let d = e0 / l0;\n    return vec3<f32>(-d.y, d.x, 1.0);\n  }\n  let d0 = e0 / l0;\n  let d1 = e1 / l1;\n  let n0 = vec2<f32>(-d0.y, d0.x);\n  let n1 = vec2<f32>(-d1.y, d1.x);\n  var m = n0 + n1;\n  let l = length(m);\n  if (l < 1e-5) { return vec3<f32>(n1, 1.0); }\n  m = m / l;\n  return vec3<f32>(m, min(1.0 / max(dot(m, n1), 0.1), 4.0));\n}\n\n// OKLab -> linear sRGB. The brightness ramp along the spiral is a LIGHTNESS\n// ramp, applied perceptually: scaling linear rgb toward black crushes the hue\n// out of the inner turns, which is \xA72.1 in its least obvious costume.\nfn oklabToLinear(c : vec3<f32>) -> vec3<f32> {\n  let l_ = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;\n  let m_ = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;\n  let s_ = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;\n  let l = l_ * l_ * l_;\n  let m = m_ * m_ * m_;\n  let s = s_ * s_ * s_;\n  return vec3<f32>(\n    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,\n   -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,\n   -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,\n  );\n}\n\nfn linearToOklab(c : vec3<f32>) -> vec3<f32> {\n  let r = max(c.x, 0.0);\n  let g = max(c.y, 0.0);\n  let b = max(c.z, 0.0);\n  let l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b;\n  let m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b;\n  let s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b;\n  let l_ = pow(l, 1.0 / 3.0);\n  let m_ = pow(m, 1.0 / 3.0);\n  let s_ = pow(s, 1.0 / 3.0);\n  return vec3<f32>(\n    0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,\n    1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,\n    0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,\n  );\n}\n\nstruct VsOut {\n  @builtin(position) pos : vec4<f32>,\n  @location(0) across : f32,   // -1..1 across the stroke\n  @location(1) fade   : f32,   // sub-pixel width compensation\n  @location(2) glow   : f32,\n};\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> VsOut {\n  let seg = f32(vi / 6u);\n  let corner = vi % 6u;\n  let n = max(P.segments, 2.0);\n\n  let t1 = seg / n;\n  let t2 = (seg + 1.0) / n;\n\n  let p0 = spiralPoint((seg - 1.0) / n);\n  let p1 = spiralPoint(t1);\n  let p2 = spiralPoint(t2);\n  let p3 = spiralPoint((seg + 2.0) / n);\n\n  let j1 = joinNormal(p0, p1, p2);\n  let j2 = joinNormal(p1, p2, p3);\n\n  let s1 = strokeAt(t1);\n  let s2 = strokeAt(t2);\n  var w1 = P.halfWidth * s1.x;\n  var w2 = P.halfWidth * s2.x;\n\n  // One pixel is 2/resolution.y in unit-y, so half a pixel is 1/resolution.y.\n  // The inner turns are exactly where the taper drives the stroke under that,\n  // and below it a line stops being thin and starts being INTERMITTENT. Clamp\n  // the geometry, carry the remainder in alpha, and the centre fades out\n  // smoothly instead of dissolving into sparkle.\n  let minW = 1.0 / max(C.resolution.y, 1.0);\n  let fade1 = clamp(w1 / minW, 0.0, 1.0);\n  let fade2 = clamp(w2 / minW, 0.0, 1.0);\n  w1 = max(w1, minW);\n  w2 = max(w2, minW);\n\n  let o1 = j1.xy * (w1 * j1.z);\n  let o2 = j2.xy * (w2 * j2.z);\n\n  var pos : vec2<f32>;\n  var across : f32;\n  var fade : f32;\n  var glow : f32;\n  switch (corner) {\n    case 0u: { pos = p1 - o1; across = -1.0; fade = fade1; glow = s1.y; }\n    case 1u: { pos = p1 + o1; across =  1.0; fade = fade1; glow = s1.y; }\n    case 2u: { pos = p2 - o2; across = -1.0; fade = fade2; glow = s2.y; }\n    case 3u: { pos = p2 - o2; across = -1.0; fade = fade2; glow = s2.y; }\n    case 4u: { pos = p1 + o1; across =  1.0; fade = fade1; glow = s1.y; }\n    default: { pos = p2 + o2; across =  1.0; fade = fade2; glow = s2.y; }\n  }\n\n  var out : VsOut;\n  out.pos = toClip(pos);\n  out.across = across;\n  out.fade = fade;\n  out.glow = glow;\n  return out;\n}\n\n@fragment\nfn fs(in : VsOut) -> @location(0) vec4<f32> {\n  let d = abs(in.across);\n  // Analytic AA (\xA74.5): the edge is one fragment-derivative wide in the same\n  // parameter the edge is expressed in, so it holds at every width and every\n  // resolution. Clamped, or a sub-fragment stroke smooths itself away.\n  let e = clamp(fwidth(in.across), 1e-4, 0.9);\n  let cov = 1.0 - smoothstep(1.0 - e, 1.0, d);\n\n  // Soft shoulder across the width. A flat-topped stroke bands visibly wherever\n  // the spiral passes close to its own previous turn, which is everywhere.\n  let core = 0.32 + 0.68 * exp(-d * d * 2.4);\n\n  // The glow ramp is a LIGHTNESS ramp in OKLab, so the dim inner turns keep the\n  // palette's hue instead of graduating to grey. Chroma lifts slightly at the\n  // bright end, which is what a phosphor actually does.\n  let base = linearToOklab(C.color.rgb);\n  let g = in.glow * core;\n  let lab = vec3<f32>(base.x * g, base.y * (0.85 + 0.35 * g), base.z * (0.85 + 0.35 * g));\n  let rgb = max(oklabToLinear(lab), vec3<f32>(0.0));\n\n  let a = cov * in.fade * C.opacity;\n  return vec4<f32>(rgb * a, a);\n}\n";
+
+// src/sources/spiral.ts
+var PARAMS_WGSL9 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Params;`;
+var F_GAIN3 = 0;
+var F_HALF_WIDTH3 = 1;
+var F_SEGMENTS3 = 2;
+var F_TURNS = 3;
+var F_R_INNER = 4;
+var F_R_OUTER = 5;
+var F_CENTRE_X3 = 6;
+var F_CENTRE_Y3 = 7;
+var F_SPIN2 = 8;
+var F_WINDOW3 = 9;
+var F_SCROLL2 = 10;
+var F_WEIGHT_VAR3 = 11;
+var F_TAPER_INNER = 12;
+var F_INNER_FADE = 13;
+var F_SWIRL = 14;
+var PARAM_FLOATS3 = 16;
+var TAU8 = Math.PI * 2;
+var DEFAULT_SEGMENTS3 = 1536;
+var MAX_SEGMENTS2 = 16384;
+var MAX_WOBBLE = 0.42;
+var spiralPass = {
+  type: "spiral",
+  family: "source",
+  input: "none",
+  usesAudio: true,
+  code: [PASS_COMMON_WGSL, AUDIO_WGSL, PARAMS_WGSL9, src_spiral_default].join("\n"),
+  draw: {
+    kind: "vertices",
+    // Six per segment quad, zero at progress 0 — a spent layer is a true no-op.
+    vertexCount: (ctx) => ctx.progress > 0 ? 6 * segmentCount3(ctx.params) : 0
+  },
+  /** Thin tapered line work. See the note in `scope.ts`; the same argument holds. */
+  defaultResolutionScale: 1,
+  uniformFloats: PARAM_FLOATS3,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    const turns = Math.max(num10(p, "turns", 8), 0.5);
+    const rInner = Math.max(num10(p, "rInner", 0.04), 0);
+    const rOuter = Math.max(num10(p, "rOuter", 0.92), rInner + 1e-3);
+    const spacing = (rOuter - rInner) / turns;
+    out[F_GAIN3] = Math.min(Math.max(num10(p, "gain", 0.09), 0), spacing * MAX_WOBBLE);
+    out[F_HALF_WIDTH3] = Math.max(num10(p, "thickness", 4e-3), 0) * 0.5;
+    out[F_SEGMENTS3] = segmentCount3(p);
+    out[F_TURNS] = turns;
+    out[F_R_INNER] = rInner;
+    out[F_R_OUTER] = rOuter;
+    out[F_CENTRE_X3] = num10(p, "centreX", 0.12);
+    out[F_CENTRE_Y3] = num10(p, "centreY", -0.06);
+    const spinBars = Math.max(num10(p, "spinBars", 12), 1e-3);
+    out[F_SPIN2] = fract9(ctx.bars / spinBars) * TAU8;
+    out[F_WINDOW3] = clamp016(num10(p, "window", 1));
+    const scrollBeats = Math.max(num10(p, "scrollBeats", 4), 1e-3);
+    out[F_SCROLL2] = fract9(ctx.beats / scrollBeats);
+    out[F_WEIGHT_VAR3] = clamp016(num10(p, "weightVar", 0.7));
+    out[F_TAPER_INNER] = clamp016(num10(p, "taperInner", 0.28));
+    out[F_INNER_FADE] = clamp016(num10(p, "innerFade", 0.22));
+    const step = turns * TAU8 / segmentCount3(p);
+    out[F_SWIRL] = Math.min(Math.max(num10(p, "swirl", 0.35), 0), step * 8);
+  }
+};
+function segmentCount3(p) {
+  const n = Math.round(num10(p, "segments", DEFAULT_SEGMENTS3));
+  return n < 2 ? 2 : n > MAX_SEGMENTS2 ? MAX_SEGMENTS2 : n;
+}
+function num10(p, key, fallback) {
+  const v = p[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+function clamp016(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+function fract9(v) {
+  return v - Math.floor(v);
+}
+
+// src/shaders/src-wavegrid.wgsl
+var src_wavegrid_default = "// Wavegrid: a perspective line grid displaced by the waveform \u2014 a rippled sheet\n// travelling toward the viewer under a fixed horizon. Plan \xA78.1.\n//\n// Look: GRID (art-direction \xA71.2). Its discipline is one sentence: **the horizon\n// does not move.** `P.horizon` is a constant screen height and nothing in this\n// file writes to it; the sheet scrolls underneath it, and the fixed element is\n// what makes the moving one read as fast.\n//\n// It is real GEOMETRY, not a raymarched plane. Every line is a quad with mitered\n// joins, for the same reason `src-scope.wgsl` builds them that way, plus one\n// that is specific to perspective: a screen-space stroke that keeps a constant\n// WORLD width gets thinner with distance on its own, which is \xA74.4's \"weight\n// varies with depth\" for free and is the single thing that stops a grid looking\n// machine-drawn.\n//\n// The hard part of a converging grid is the far rows, where the spacing falls\n// below a pixel. Three defences, and all three are needed:\n//\n//   - Width is clamped to half a pixel and the remainder is carried in ALPHA.\n//     Without it the far rows do not thin, they FLICKER: whether a row lands on\n//     a sample point becomes luck, and the luck changes every frame as the sheet\n//     scrolls. This is the same sub-pixel argument as the scope, but here it is\n//     load-bearing rather than a nicety.\n//   - `fwidth`-based analytic AA across the stroke (\xA74.5), so what is left of a\n//     far line is a correctly-weighted grey rather than a stair.\n//   - Fog. Distance darkens toward the palette's floor, so the rows that are\n//     beyond resolving are gone before they can alias at all (\xA72.3 \u2014 value range\n//     is doing the work here, not hue).\n//\n// Rows scroll by a FRACTION of one row spacing, never by a modulo of the whole\n// depth. A wrapping row index would tear every column line once per lap, because\n// column segment (i,j)->(i,j+1) would span the wrap. Offsetting all rows by\n// `travelFrac` instead makes the INTERIOR seamless: at 0 and at 1 the interior\n// world positions are the same set, and every quantity drawn is a function of\n// world z rather than of row index, so the interior picture is identical too.\n// The two ENDS are not covered by that argument \u2014 at the wrap the nearest row is\n// replaced and a new far row appears \u2014 which is what the near fade in `strokeAt`\n// and the fog at the far end are for. Without the near fade the bottom row pops\n// once per travel cycle.\n//\n// Stereo appears as a LEAN: the left of the sheet reads L, the right reads R. A\n// mono signal ripples symmetrically, a wide one does not.\n//\n// ---------------------------------------------------------------------------\n// BINDINGS ARE NOT DECLARED HERE. `sources/wavegrid.ts` prepends\n// `PASS_COMMON_WGSL` (C), `AUDIO_WGSL` (A, waveAt, bandAt) and the `params`\n// binding. No binding number is written in this file.\n// ---------------------------------------------------------------------------\n\nstruct Params {\n  rows       : f32,\n  cols       : f32,\n  amp        : f32,   // sheet displacement, world units\n  halfWidth  : f32,   // half stroke width at unit depth. Perspective does the rest.\n  spanX      : f32,   // half the sheet's world width\n  zNear      : f32,\n  zSpan      : f32,   // far - near\n  travelFrac : f32,   // 0..1 of one row spacing, from a clock division (\xA73.1)\n  horizon    : f32,   // screen height of the horizon, unit-y. FIXED.\n  camY       : f32,   // camera height above the sheet, world units\n  focal      : f32,\n  window     : f32,   // fraction of the waveform window spanned across the sheet\n  weightVar  : f32,   // 0 = uniform stroke (do not), 1 = strongly varying\n  fog        : f32,   // extinction per world unit of depth\n  scroll     : f32,   // phase offset into the wave window, from a clock division\n  stereo     : f32,   // 0 = mono sum, 1 = L on the left edge and R on the right\n  zWave      : f32,   // wave phase per world unit of depth \u2014 the ripple's wavelength\n  depthAmp   : f32,   // height falloff with depth. Distant rows must go quiet.\n  crest      : f32,   // brightness boost with |height|\n  _pad0      : f32,\n};\n\n// Unit space: y in [-1,1], x in [-aspect, aspect]. Clip is x/aspect, so the\n// sheet spans the frame at any aspect without the perspective going oval.\nfn toClip(p : vec2<f32>) -> vec4<f32> {\n  return vec4<f32>(p.x / max(C.aspect, 1e-4), p.y, 0.0, 1.0);\n}\n\nfn gridRows() -> f32 { return max(floor(P.rows), 2.0); }\nfn gridCols() -> f32 { return max(floor(P.cols), 2.0); }\n\n/**\n * Sheet height at (ux across the sheet 0..1, world depth z).\n *\n * The wave index folds BOTH axes: `ux` spreads the waveform across the sheet and\n * `z * zWave` phases it with depth, so the ripple is a travelling wave rather\n * than the same curve stamped on every row. Phasing on world z rather than on\n * the row INDEX is what stops the ripple swimming as the rows scroll \u2014 the\n * height belongs to the place, not to the row that happens to be there.\n */\nfn heightAt(ux : f32, z : f32) -> f32 {\n  let t = fract(ux * P.window + z * P.zWave + P.scroll);\n  let s = waveAt(t);\n  let mono = (s.x + s.y) * 0.5;\n  let lean = mix(s.x, s.y, clamp(ux, 0.0, 1.0));\n  // Distant rows go quiet. Without this the far half of the sheet is a solid\n  // band of noise at the horizon \u2014 the one place the eye is least able to\n  // resolve it and most able to see it flicker.\n  let att = 1.0 / (1.0 + max(z, 0.0) * P.depthAmp);\n  return mix(mono, lean, clamp(P.stereo, 0.0, 1.0)) * P.amp * att;\n}\n\n/** Node (fi, fj) -> (unit-space xy, world depth z). Indices may be fractional or out of range. */\nfn nodeAt(fi : f32, fj : f32) -> vec3<f32> {\n  let ux = fi / (gridCols() - 1.0);\n  let x = (ux - 0.5) * 2.0 * P.spanX;\n  let z = P.zNear + (fj + P.travelFrac) * (P.zSpan / gridRows());\n  let y = heightAt(ux, z);\n\n  // Weak perspective about a fixed horizon. As z grows the sheet converges to\n  // `horizon` from below and stays there \u2014 which is the discipline of \xA71.2.\n  let invZ = P.focal / max(z, 1e-3);\n  return vec3<f32>(x * invZ, P.horizon + (y - P.camY) * invZ, z);\n}\n\n/**\n * Neighbour for a miter, extrapolated in SCREEN space when the index falls off\n * the sheet.\n *\n * Extrapolating in world space instead would put the phantom node behind the\n * camera at the near edge (z <= 0), and one divide by a near-zero depth throws\n * that vertex off the frame \u2014 a single bright spike from the corner of the grid,\n * once per scroll cycle.\n */\nfn neighbour(fi : f32, fj : f32, ok : bool, p1 : vec2<f32>, p2 : vec2<f32>) -> vec2<f32> {\n  if (ok) { return nodeAt(fi, fj).xy; }\n  return 2.0 * p1 - p2;\n}\n\nfn safeDir(v : vec2<f32>) -> vec2<f32> {\n  let l = length(v);\n  if (l < 1e-7) { return vec2<f32>(1.0, 0.0); }\n  return v / l;\n}\n\n/** Miter at `cur`: (direction.xy, length scale). Clamped \u2014 a hairpin sends 1/cos to infinity. */\nfn joinNormal(prev : vec2<f32>, cur : vec2<f32>, next : vec2<f32>) -> vec3<f32> {\n  let d0 = safeDir(cur - prev);\n  let d1 = safeDir(next - cur);\n  let n0 = vec2<f32>(-d0.y, d0.x);\n  let n1 = vec2<f32>(-d1.y, d1.x);\n  var m = n0 + n1;\n  let l = length(m);\n  if (l < 1e-5) { return vec3<f32>(n1, 1.0); }\n  m = m / l;\n  return vec3<f32>(m, min(1.0 / max(dot(m, n1), 0.1), 4.0));\n}\n\n// OKLab -> linear sRGB. The fog is a LIGHTNESS ramp: scaling linear rgb toward\n// black drags the hue out with it, which is the grey dead-zone of \xA72.1 arriving\n// through the back door.\nfn oklabToLinear(c : vec3<f32>) -> vec3<f32> {\n  let l_ = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;\n  let m_ = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;\n  let s_ = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;\n  let l = l_ * l_ * l_;\n  let m = m_ * m_ * m_;\n  let s = s_ * s_ * s_;\n  return vec3<f32>(\n    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,\n   -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,\n   -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,\n  );\n}\n\nfn linearToOklab(c : vec3<f32>) -> vec3<f32> {\n  let r = max(c.x, 0.0);\n  let g = max(c.y, 0.0);\n  let b = max(c.z, 0.0);\n  let l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b;\n  let m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b;\n  let s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b;\n  let l_ = pow(l, 1.0 / 3.0);\n  let m_ = pow(m, 1.0 / 3.0);\n  let s_ = pow(s, 1.0 / 3.0);\n  return vec3<f32>(\n    0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,\n    1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,\n    0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,\n  );\n}\n\nstruct VsOut {\n  @builtin(position) pos : vec4<f32>,\n  @location(0) across : f32,   // -1..1 across the stroke\n  @location(1) fade   : f32,   // sub-pixel width compensation\n  @location(2) glow   : f32,\n};\n\n/** Stroke half-width and brightness for a node at depth z. */\nfn strokeAt(z : f32, height : f32) -> vec2<f32> {\n  // Constant WORLD width -> screen width falls as 1/z. Depth varies the weight\n  // without anyone choosing a curve for it (\xA74.4).\n  let w = P.halfWidth * (P.focal / max(z, 1e-3));\n  let crest = abs(height) / max(P.amp, 1e-4);\n  let vary = 1.0 + P.weightVar * (0.9 * crest + 0.5 * bandAt(1u) - 0.25);\n  // Beer-Lambert fog from the near plane, so the sheet reaches the horizon dark\n  // rather than being cut off there.\n  let att = exp(-max(P.fog, 0.0) * max(z - P.zNear, 0.0));\n  // The NEAR edge is a real edge and it is where the travel wrap shows. Row j\n  // lives at `zNear + (j + travelFrac) * spacing`, so when `travelFrac` wraps\n  // 0 -> 1 every row jumps back by exactly one spacing: the interior is\n  // identical (height and glow are functions of world z, not of row index) but\n  // the nearest row is REPLACED, and at the bottom of the frame that is a\n  // visible pop once per `travelBeats` \u2014 every beat, by default. Fading over\n  // precisely one row spacing makes the swap invisible, because the row\n  // arriving at `zNear + spacing` is then exactly as bright as the one that\n  // just left it. The far end needs no equivalent: fog has already taken it.\n  let spacing = P.zSpan / gridRows();\n  let near = smoothstep(0.0, max(spacing, 1e-4), z - P.zNear);\n  let glow = att * near * (0.55 + P.crest * crest);\n  return vec2<f32>(w * max(vary, 0.15), glow);\n}\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> VsOut {\n  let seg = f32(vi / 6u);\n  let corner = vi % 6u;\n\n  let rows = gridRows();\n  let cols = gridCols();\n  let rowSegs = rows * (cols - 1.0);\n\n  // Two line families out of one index range. Rows run across the sheet, columns\n  // run into the distance; both are polylines, so both get real joins.\n  var i1 : f32;\n  var j1 : f32;\n  var i2 : f32;\n  var j2 : f32;\n  var i0 : f32;\n  var j0 : f32;\n  var i3 : f32;\n  var j3 : f32;\n  var okPrev : bool;\n  var okNext : bool;\n\n  if (seg < rowSegs) {\n    let j = floor(seg / (cols - 1.0));\n    let i = seg - j * (cols - 1.0);\n    i1 = i;       j1 = j;\n    i2 = i + 1.0; j2 = j;\n    i0 = i - 1.0; j0 = j;\n    i3 = i + 2.0; j3 = j;\n    okPrev = i - 1.0 >= 0.0;\n    okNext = i + 2.0 <= cols - 1.0;\n  } else {\n    let s2 = seg - rowSegs;\n    let i = floor(s2 / (rows - 1.0));\n    let j = s2 - i * (rows - 1.0);\n    i1 = i; j1 = j;\n    i2 = i; j2 = j + 1.0;\n    i0 = i; j0 = j - 1.0;\n    i3 = i; j3 = j + 2.0;\n    okPrev = j - 1.0 >= 0.0;\n    okNext = j + 2.0 <= rows - 1.0;\n  }\n\n  let n1 = nodeAt(i1, j1);\n  let n2 = nodeAt(i2, j2);\n  let p1 = n1.xy;\n  let p2 = n2.xy;\n  let p0 = neighbour(i0, j0, okPrev, p1, p2);\n  let p3 = neighbour(i3, j3, okNext, p2, p1);\n\n  let jn1 = joinNormal(p0, p1, p2);\n  let jn2 = joinNormal(p1, p2, p3);\n\n  // The height is recoverable from the projection, but recomputing it is one\n  // waveAt and keeps `strokeAt` independent of the projection's algebra.\n  let h1 = heightAt(i1 / (cols - 1.0), n1.z);\n  let h2 = heightAt(i2 / (cols - 1.0), n2.z);\n  let s1 = strokeAt(n1.z, h1);\n  let s2 = strokeAt(n2.z, h2);\n\n  var w1 = s1.x;\n  var w2 = s2.x;\n\n  // Half a pixel in unit-y is 1/resolution.y. See the header: this clamp is what\n  // separates a grid that thins into the distance from one that flickers there.\n  let minW = 1.0 / max(C.resolution.y, 1.0);\n  let fade1 = clamp(w1 / minW, 0.0, 1.0);\n  let fade2 = clamp(w2 / minW, 0.0, 1.0);\n  w1 = max(w1, minW);\n  w2 = max(w2, minW);\n\n  let o1 = jn1.xy * (w1 * jn1.z);\n  let o2 = jn2.xy * (w2 * jn2.z);\n\n  var pos : vec2<f32>;\n  var across : f32;\n  var fade : f32;\n  var glow : f32;\n  switch (corner) {\n    case 0u: { pos = p1 - o1; across = -1.0; fade = fade1; glow = s1.y; }\n    case 1u: { pos = p1 + o1; across =  1.0; fade = fade1; glow = s1.y; }\n    case 2u: { pos = p2 - o2; across = -1.0; fade = fade2; glow = s2.y; }\n    case 3u: { pos = p2 - o2; across = -1.0; fade = fade2; glow = s2.y; }\n    case 4u: { pos = p1 + o1; across =  1.0; fade = fade1; glow = s1.y; }\n    default: { pos = p2 + o2; across =  1.0; fade = fade2; glow = s2.y; }\n  }\n\n  var out : VsOut;\n  out.pos = toClip(pos);\n  out.across = across;\n  out.fade = fade;\n  out.glow = glow;\n  return out;\n}\n\n@fragment\nfn fs(in : VsOut) -> @location(0) vec4<f32> {\n  let d = abs(in.across);\n  // Analytic AA in the stroke's own parameter (\xA74.5). This is the term that\n  // keeps the grid alive where the lines converge: coverage becomes a fraction\n  // rather than a decision.\n  let e = clamp(fwidth(in.across), 1e-4, 0.9);\n  let cov = 1.0 - smoothstep(1.0 - e, 1.0, d);\n  // A soft shoulder as well as a hard edge, so crossings of a row and a column\n  // do not read as a bright dot at every single intersection.\n  let core = 0.45 + 0.55 * exp(-d * d * 2.0);\n\n  let base = linearToOklab(C.color.rgb);\n  let g = in.glow * core;\n  let lab = vec3<f32>(base.x * g, base.y * (0.9 + 0.25 * g), base.z * (0.9 + 0.25 * g));\n  let rgb = max(oklabToLinear(lab), vec3<f32>(0.0));\n\n  let a = cov * in.fade * C.opacity;\n  return vec4<f32>(rgb * a, a);\n}\n";
+
+// src/sources/wavegrid.ts
+var PARAMS_WGSL10 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Params;`;
+var F_ROWS = 0;
+var F_COLS = 1;
+var F_AMP = 2;
+var F_HALF_WIDTH4 = 3;
+var F_SPAN_X = 4;
+var F_Z_NEAR = 5;
+var F_Z_SPAN = 6;
+var F_TRAVEL = 7;
+var F_HORIZON = 8;
+var F_CAM_Y = 9;
+var F_FOCAL = 10;
+var F_WINDOW4 = 11;
+var F_WEIGHT_VAR4 = 12;
+var F_FOG = 13;
+var F_SCROLL3 = 14;
+var F_STEREO = 15;
+var F_Z_WAVE = 16;
+var F_DEPTH_AMP = 17;
+var F_CREST2 = 18;
+var PARAM_FLOATS4 = 20;
+var DEFAULT_ROWS = 48;
+var DEFAULT_COLS = 64;
+var MAX_AXIS = 192;
+var wavegridPass = {
+  type: "wavegrid",
+  family: "source",
+  input: "none",
+  usesAudio: true,
+  code: [PASS_COMMON_WGSL, AUDIO_WGSL, PARAMS_WGSL10, src_wavegrid_default].join("\n"),
+  draw: {
+    kind: "vertices",
+    // Six per segment quad, zero at progress 0 — a spent layer is a true no-op.
+    vertexCount: (ctx) => ctx.progress > 0 ? 6 * segmentCount4(ctx.params) : 0
+  },
+  /**
+   * Full resolution, and here it is less advisory than elsewhere: the far rows
+   * are already at the sub-pixel clamp, and halving the attachment halves the
+   * depth at which the grid stops resolving — the horizon goes bald.
+   */
+  defaultResolutionScale: 1,
+  uniformFloats: PARAM_FLOATS4,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[F_ROWS] = axis(p, "rows", DEFAULT_ROWS);
+    out[F_COLS] = axis(p, "cols", DEFAULT_COLS);
+    out[F_AMP] = Math.max(num11(p, "amp", 0.42), 0);
+    out[F_HALF_WIDTH4] = Math.max(num11(p, "thickness", 0.011), 0) * 0.5;
+    out[F_SPAN_X] = Math.max(num11(p, "spanX", 4), 1e-3);
+    const zNear = Math.max(num11(p, "zNear", 1.6), 0.01);
+    out[F_Z_NEAR] = zNear;
+    out[F_Z_SPAN] = Math.max(num11(p, "depth", 26), 0.01);
+    out[F_HORIZON] = num11(p, "horizon", 0.3);
+    out[F_CAM_Y] = num11(p, "cameraHeight", 1.5);
+    out[F_FOCAL] = Math.max(num11(p, "focal", 1), 1e-3);
+    out[F_WINDOW4] = clamp017(num11(p, "window", 1));
+    out[F_WEIGHT_VAR4] = clamp017(num11(p, "weightVar", 0.7));
+    out[F_FOG] = Math.max(num11(p, "fog", 0.11), 0);
+    out[F_STEREO] = clamp017(num11(p, "stereo", 0.8));
+    out[F_Z_WAVE] = num11(p, "zWave", 0.09);
+    out[F_DEPTH_AMP] = Math.max(num11(p, "depthDamp", 0.1), 0);
+    out[F_CREST2] = Math.max(num11(p, "crest", 0.9), 0);
+    const travelBeats = Math.max(num11(p, "travelBeats", 1), 1e-3);
+    out[F_TRAVEL] = 1 - fract10(ctx.beats / travelBeats);
+    const scrollBeats = Math.max(num11(p, "scrollBeats", 16), 1e-3);
+    out[F_SCROLL3] = fract10(ctx.beats / scrollBeats);
+  }
+};
+function segmentCount4(p) {
+  const rows = axis(p, "rows", DEFAULT_ROWS);
+  const cols = axis(p, "cols", DEFAULT_COLS);
+  return rows * (cols - 1) + cols * (rows - 1);
+}
+function axis(p, key, fallback) {
+  const n = Math.floor(num11(p, key, fallback));
+  return n < 2 ? 2 : n > MAX_AXIS ? MAX_AXIS : n;
+}
+function num11(p, key, fallback) {
+  const v = p[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+function clamp017(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+function fract10(v) {
+  return v - Math.floor(v);
+}
+
+// src/shaders/src-spectrum.wgsl
+var src_spectrum_default = "// Spectrum: bars, filled ribbon, peak-hold caps. Plan \xA78.2.\r\n//\r\n// Look: GRID (art-direction \xA71.2) \u2014 bars are that look's native furniture, and\r\n// the horizon-under-bars composition is what it is for. Lab gets the scope; this\r\n// is not a lab source.\r\n//\r\n// The axis is LOGARITHMIC and that is not a preference. At 2048/48 kHz the bottom\r\n// octave gets one bin and the top gets 427 (plan \xA76), so a linear axis draws the\r\n// bass \u2014 the part of the music the eye is looking for \u2014 as a single bar and\r\n// spends four fifths of the frame on cymbals. Every x here is a frequency\r\n// ratio, not a bin index.\r\n//\r\n// A fragment shader rather than geometry, deliberately: the bar edges, the cap\r\n// edges and the ribbon's own contour are all analytic distances, so they\r\n// antialias exactly (\xA74.5) at any bar count, including counts where a bar is\r\n// under a pixel wide. A vertex-built bar chart cannot do the last one at all.\r\n//\r\n// Peak-hold needs no state here \u2014 `audioPeak` already holds and falls in the\r\n// analysis, so the cap is a second read of the same bin.\r\n//\r\n// It deliberately does NOT draw an octave grid, labels or a mirrored butterfly.\r\n// Those are separate layers, and stacking them into one pass is how a source\r\n// stops being composable.\r\n\r\nstruct Params {\r\n  mode      : f32,   // 0 bars, 1 filled ribbon\r\n  bars      : f32,\r\n  gain      : f32,\r\n  gamma     : f32,   // < 1 lifts the quiet end. Magnitude is not perceptual.\r\n  fLo       : f32,   // normalised frequency at x = 0\r\n  fHi       : f32,   // normalised frequency at x = 1\r\n  gap       : f32,   // 0..1 fraction of a bar cell left empty\r\n  panAmount : f32,   // 0 = fixed grid, 1 = a band sits at its stereo position\r\n  capHalf   : f32,   // half thickness of the peak cap / ribbon contour, in uv-y\r\n  bodyLevel : f32,\r\n  capLevel  : f32,\r\n  height    : f32,   // full-scale bar height, 0..1 of the frame\r\n  // --- LED ladder (modes 2..4) ----------------------------------------------\r\n  segments  : f32,   // rows in the ladder. 0 = continuous, i.e. not an LED.\r\n  segGap    : f32,   // 0..1 of each row cell left dark\r\n  ledOff    : f32,   // UNLIT row level. The ghost is what makes it read as hardware.\r\n  ledStyle  : f32,   // 0 solid, 1 segment, 2 dot, 3 capsule, 4 VU, 5 diamond, 6 matrix, 7 split\n  // --- peak, independently drivable -----------------------------------------\r\n  peakGlow  : f32,   // halo around the cap, in cap-thicknesses\r\n  peakPulse : f32,   // how much the layer envelope drives the cap alone\r\n  pad0      : f32,\r\n  pad1      : f32,   // 20 floats = 80 bytes, a multiple of 16 (WGSL alignment)\r\n};\r\n\r\n/**\r\n * The LED ladder.\r\n *\r\n * A bar quantised into rows, with the UNLIT rows left faintly visible. That\r\n * ghost is the whole illusion: a real EQ is a fixed grid of lamps and you can\r\n * see the dark ones, so a ladder that draws only the lit rows reads as a bar\r\n * chart with gaps rather than as hardware.\r\n *\r\n * Returns (lit, unlit) coverage so the caller can light them from different\r\n * levels \u2014 the same reason the body and cap are separate.\r\n */\r\nfn ledLadder(y : f32, h : f32, cellX : f32, eyPix : f32, exPix : f32) -> vec2<f32> {\r\n  let segs = max(P.segments, 1.0);\r\n  let cell = P.height / segs;\r\n  let idx = floor(y / max(cell, 1e-5));\r\n  let within = fract(y / max(cell, 1e-5));\r\n\r\n  // Row coverage along y.\r\n  //\r\n  // The edge widths are PASSED IN, not taken with fwidth() here. This function\r\n  // runs inside the cell loop, which is behind a `continue`, and WGSL forbids\r\n  // derivative builtins in non-uniform control flow \u2014 the pipeline fails to\r\n  // create, and the app renders black with no shader error surfaced anywhere\r\n  // except getCompilationInfo. The file's own note above the loop says every\r\n  // fwidth is hoisted \"precisely so that this is legal\"; this broke that.\r\n  //\r\n  // The gradients are analytic anyway: y/cell scales the caller's dy by 1/cell,\r\n  // and the lamp coordinates scale it again by 2/fill and 1/halfCell.\r\n  let fill = clamp(1.0 - P.segGap, 0.05, 1.0);\r\n  let ey = max(eyPix / max(cell, 1e-5), 1e-5);\n  var cov = (1.0 - smoothstep(fill - ey, fill + ey, within));\n  // Re-centred row coordinates, shared by every non-rectangular lamp shape.\n  let cy = (within - fill * 0.5) / max(fill, 1e-5) * 2.0;\n\r\n  // Lamp SHAPE is independent of band count and of bar/ribbon mode \u2014 that is\r\n  // the point of keeping it its own axis. 16 dots and 64 capsules are both\r\n  // reachable, and neither needs a new mode.\n  if (P.ledStyle > 1.5 && P.ledStyle < 3.5) {\n    if (P.ledStyle < 2.5) {\n      // DOT: circular lamp. cellX is -1..1 across the bar, so folding it in\r\n      // with the re-centred row keeps the dot round rather than elliptical.\r\n      let r = length(vec2<f32>(cellX, cy));\r\n      // Worst-case of the two axis gradients: exact enough for an edge a pixel\r\n      // wide, and free of a derivative.\r\n      let er = max(max(exPix, ey * 2.0 / max(fill, 1e-5)), 1e-5);\r\n      cov = 1.0 - smoothstep(0.85 - er, 0.85 + er, r);\r\n    } else {\r\n      // CAPSULE: a rounded rect, wider than tall. The classic hi-fi ladder.\r\n      let q = max(abs(vec2<f32>(cellX, cy)) - vec2<f32>(0.45, 0.0), vec2<f32>(0.0));\r\n      let d = length(q) - 0.42;\r\n      let ed = max(max(exPix, ey * 2.0 / max(fill, 1e-5)), 1e-5);\r\n      cov = 1.0 - smoothstep(-ed, ed, d);\n    }\n  } else if (P.ledStyle > 4.5 && P.ledStyle < 5.5) {\n    // DIAMOND: an angular lozenge. It gives the otherwise soft ladder a\n    // deliberately technical, faceted character without adding a new colour.\n    let d = abs(cellX) + abs(cy) - 0.86;\n    let ed = max(max(exPix, ey * 2.0 / max(fill, 1e-5)), 1e-5);\n    cov = 1.0 - smoothstep(-ed, ed, d);\n  } else if (P.ledStyle > 5.5 && P.ledStyle < 6.5) {\n    // MATRIX: three tiny diodes in each row. The discrete grid remains legible\n    // at low band counts, while high counts resolve into a dense LED texture.\n    let r = min(\n      length(vec2<f32>(cellX + 0.52, cy)),\n      min(length(vec2<f32>(cellX, cy)), length(vec2<f32>(cellX - 0.52, cy))),\n    );\n    let er = max(max(exPix, ey * 2.0 / max(fill, 1e-5)), 1e-5);\n    cov = 1.0 - smoothstep(0.25 - er, 0.25 + er, r);\n  } else if (P.ledStyle > 6.5) {\n    // SPLIT: paired pill lamps with a central dark seam \u2014 a compact modern\n    // meter face that still reads as physical hardware when it is unlit.\n    let q = max(\n      abs(vec2<f32>(abs(cellX) - 0.48, cy)) - vec2<f32>(0.24, 0.0),\n      vec2<f32>(0.0),\n    );\n    let d = length(q) - 0.34;\n    let ed = max(max(exPix, ey * 2.0 / max(fill, 1e-5)), 1e-5);\n    cov = 1.0 - smoothstep(-ed, ed, d);\n  }\r\n\r\n  // A row is lit when its BASE is under the bar height, not its centre \u2014\r\n  // otherwise the top row flickers on and off around the half-row mark.\r\n  let base = idx * cell;\r\n  let lit = select(0.0, 1.0, base < h);\r\n  return vec2<f32>(cov * lit, cov * (1.0 - lit));\r\n}\r\n\r\n/** How many bar cells either side to consider once pan can shift them. */\r\nconst PAN_SPAN : i32 = 2;\r\n\r\n/** Normalised frequency at horizontal position x. Geometric, so an octave is a fixed width. */\r\nfn logFreq(x : f32) -> f32 {\r\n  return P.fLo * pow(max(P.fHi / P.fLo, 1.0), clamp(x, 0.0, 1.0));\r\n}\r\n\r\n/** Magnitude -> height. Gamma first, then the layer's full-scale height. */\r\nfn shape(m : f32) -> f32 {\r\n  return clamp(pow(max(m * P.gain, 0.0), P.gamma), 0.0, 1.0) * P.height;\r\n}\r\n\r\n/**\r\n * Bar magnitude, taken as the MAX over the cell rather than its centre.\r\n *\r\n * A cell at the top of the axis spans dozens of bins, and sampling one point in\r\n * it drops narrow spikes at random \u2014 the bar then flickers on content that is\r\n * perfectly steady. `audio.ts` resamples by max for the same reason.\r\n */\r\nfn cellMag(i : f32, n : f32) -> vec2<f32> {\r\n  var m = 0.0;\r\n  var pk = 0.0;\r\n  for (var k = 0; k < 4; k = k + 1) {\r\n    let f = logFreq((i + (f32(k) + 0.5) * 0.25) / n);\r\n    m = max(m, fftAt(f));\r\n    pk = max(pk, peakAt(f));\r\n  }\r\n  return vec2<f32>(m, pk);\r\n}\r\n\r\n@vertex\r\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\r\n  return fullscreenTriangle(vi);\r\n}\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let uv = fragUV(frag);\r\n  // Height reads from the bottom of the frame; `fragUV` has y = 0 at the top.\r\n  let y = 1.0 - uv.y;\r\n\r\n  // Derivatives are taken ONCE, here, in uniform control flow. Called inside the\r\n  // bar loop below they would sit under a branch that depends on the fragment's\r\n  // own cell index, and a derivative under non-uniform control flow is undefined\r\n  // \u2014 which shows up as AA that works everywhere except at the bar edges.\r\n  let ex = max(fwidth(uv.x), 1e-5);\r\n  let ey = max(fwidth(y), 1e-5);\r\n\r\n  var body = 0.0;\r\n  var cap = 0.0;\r\n  var lit = 0.0;   // normalised height of whatever is under this fragment, for shading\r\n  var ghost = 0.0; // UNLIT LED rows. Drawn faintly \u2014 see ledLadder().\r\n  var capGlow = 0.0; // Wide, dim halo around the cap. Its own channel (see below).\r\n\r\n  if (P.mode < 0.5) {\r\n    let n = max(floor(P.bars), 1.0);\r\n    // `halfCell`, not `half`: this is half a CELL and the loop below compares it\r\n    // against a distance in x, so the unit matters. (`half` is legal WGSL \u2014\r\n    // `op-polar.wgsl` uses it and compiles \u2014 so this is naming, not a fix.)\r\n    let halfCell = max((1.0 - clamp(P.gap, 0.0, 0.95)) * 0.5 / n, 1e-5);\r\n    let i0 = floor(clamp(uv.x, 0.0, 1.0) * n);\r\n\r\n    // Neighbours as well as the nominal cell: with pan positioning on, a cell's\r\n    // rectangle no longer contains the x that selected it.\r\n    for (var k = -PAN_SPAN; k <= PAN_SPAN; k = k + 1) {\r\n      let i = i0 + f32(k);\r\n      let inRange = step(0.0, i) * step(i, n - 1.0);\r\n      let centre = (i + 0.5) / n;\r\n      // Plan \xA76: a band sits at its own stereo position. Scaled by the cell\r\n      // width so a full-left band moves exactly one cell, not across the frame \u2014\r\n      // beyond that the axis stops being a frequency axis.\r\n      let cx = centre + panAt(logFreq(centre)) * P.panAmount / n;\r\n      let m = inRange * (1.0 - smoothstep(halfCell - ex, halfCell + ex, abs(uv.x - cx)));\r\n\r\n      // Bail before `cellMag`, which is 24 buffer reads (4 sub-samples x 6).\r\n      // Unbailed, the five cells cost 120 of those per fragment on a FULLSCREEN\r\n      // pass, and at most one cell normally covers the fragment \u2014 the cells are\r\n      // narrower than their spacing, so they do not overlap. Stated honestly:\r\n      // `panAt` above the bail is still paid five times, so the loop's reads go\r\n      // from ~130 to ~34. That is a cut to this loop (\xA74.11), not to the whole\r\n      // pass.\r\n      //\r\n      // It is exactly, not approximately, free: every term skipped is\r\n      // multiplied by `m`, `m` is non-negative here, and the accumulators only\r\n      // ever `max` against it. The output is bit-identical.\r\n      //\r\n      // `continue` rather than the mask it replaces because the uniformity rule\r\n      // only governs DERIVATIVES, and every `fwidth` in this shader is hoisted\r\n      // above the branch precisely so that this is legal.\r\n      if (m <= 0.0) { continue; }\r\n\r\n      let mp = cellMag(i, n);\r\n      let h = shape(mp.x);\r\n      let ph = shape(mp.y);\r\n      // Solid bar, or an LED ladder. `ghost` carries the UNLIT rows so they can\r\n      // be lit from their own level further down.\r\n      var sy = 1.0 - smoothstep(h - ey, h + ey, y);\r\n      var gh = 0.0;\r\n      if (P.ledStyle > 0.5) {\r\n        // -1..1 across this bar cell, for the lamp shapes.\r\n        let cellX = (uv.x - cx) / max(halfCell, 1e-6);\r\n        // ey / ex are the hoisted screen-space derivatives from the top of the\r\n        // fragment function; exPix is rescaled into bar-cell units here.\r\n        let lad = ledLadder(y, h, cellX, ey, ex / max(halfCell, 1e-6));\r\n        sy = lad.x;\r\n        gh = lad.y;\r\n      }\r\n      // The cap is a band at the peak-hold height, and it falls because the\r\n      // analysis's peak falls. Drawn even when the bar itself has collapsed\r\n      // beneath it \u2014 that gap IS the peak-hold readout.\r\n      let dCap = abs(y - ph);\r\n      let sc = 1.0 - smoothstep(P.capHalf - ey, P.capHalf + ey, dCap);\r\n      // Exponential rather than a second smoothstep, so the halo reads as light\r\n      // spilling off the marker rather than as a fatter line.\r\n      let sg = exp(-dCap / max(P.capHalf * 4.0, 1e-4));\r\n\r\n      body = max(body, m * sy);\r\n      ghost = max(ghost, m * gh);\r\n      cap = max(cap, m * sc);\r\n      capGlow = max(capGlow, m * sg);\r\n      lit = max(lit, m * h);\r\n    }\r\n  } else {\r\n    // Filled ribbon. `h` is a function of uv.x alone, so `fwidth(y - h)` is the\r\n    // true screen-space width of the contour including its slope \u2014 an edge\r\n    // antialiased with fwidth(y) instead goes visibly stepped wherever the\r\n    // spectrum is steep, which near a bass transient is everywhere.\r\n    let f = logFreq(uv.x);\r\n    let h = shape(fftAt(f));\r\n    let d = y - h;\r\n    let e = max(fwidth(d), 1e-5);\r\n    body = 1.0 - smoothstep(-e, e, d);\r\n    let contour = 1.0 - smoothstep(P.capHalf - e, P.capHalf + e, abs(d));\r\n    let ph = shape(peakAt(f));\r\n    let dp = y - ph;\r\n    let ep = max(fwidth(dp), 1e-5);\r\n    let peakLine = 1.0 - smoothstep(P.capHalf - ep, P.capHalf + ep, abs(dp));\r\n    // The contour is the ribbon's own lit edge; the peak line sits above it and\r\n    // is deliberately dimmer, so the eye reads one shape with a marker rather\r\n    // than two competing lines (\xA74.2).\r\n    cap = max(contour, peakLine * 0.6);\r\n    capGlow = exp(-abs(dp) / max(P.capHalf * 4.0, 1e-4));\r\n    lit = h;\r\n  }\r\n\r\n  // Value range beats hue range (\xA72.3): the body darkens towards its base so the\r\n  // fill reads as a gradient with a lit top edge rather than as a flat slab, and\r\n  // the frame keeps a floor near zero. One hue throughout \u2014 the layer's palette\r\n  // slot \u2014 because a spectrum that colours by frequency is the rainbow\r\n  // anti-pattern wearing a hat (\xA72.2, \xA75).\r\n  let base = 0.18 + 0.82 * clamp(y / max(lit, 1e-4), 0.0, 1.0);\r\n\r\n  // THE PEAK IS ITS OWN CHANNEL. It can pulse, glow and hold independently of\r\n  // the bar under it, because in a real meter the peak marker is the thing the\r\n  // eye tracks and the bar is context.\r\n  //\r\n  // `peakPulse` folds the layer's envelope into the CAP alone, so a preset can\r\n  // put the cap on a beat trigger while the body breathes on a bar.\r\n  let pulse = mix(1.0, 0.35 + 1.65 * C.progress, clamp(P.peakPulse, 0.0, 1.0));\r\n  // Halo: a second, wider, dimmer band around the cap. Cheap because the\r\n  // distance to the cap is already computed; the falloff is exponential rather\r\n  // than a second smoothstep so it reads as light rather than a fatter line.\r\n  let glow = capGlow * P.peakGlow;\r\n  let capLevel = (cap + glow) * P.capLevel * pulse;\r\n\r\n  var level = body * P.bodyLevel * base + capLevel;\r\n  // Unlit lamps last, and never brighter than the dimmest lit one \u2014 the ghost\r\n  // is meant to be legible, not to compete (\xA74.2, one focal point).\r\n  level = level + ghost * P.ledOff * P.bodyLevel;\r\n\r\n  let a = clamp(body + cap + glow + ghost * P.ledOff, 0.0, 1.0) * C.opacity;\r\n\r\n  // VU: the lamp gets HOTTER as it climbs \u2014 a level readout, which is what a\r\n  // VU ladder is for.\r\n  //\r\n  // Done as intensity within ONE hue, not as a green/amber/red ramp. The\r\n  // palette lives on the CPU and shaders only receive their slot's resolved\r\n  // colour, so a three-colour ladder would mean hardcoding hues here \u2014 which is\r\n  // the rainbow anti-pattern (\xA72.2) and would ignore the preset's palette\r\n  // entirely. Value range beats hue range (\xA72.3).\r\n  if (P.ledStyle > 3.5 && P.ledStyle < 4.5) {\n    let climb = clamp(y / max(P.height, 1e-4), 0.0, 1.0);\r\n    level = level * (0.55 + 1.45 * climb * climb);\r\n  }\r\n  return vec4<f32>(C.color.rgb * level * C.opacity, a);\r\n}\r\n";
+
+// src/sources/spectrum.ts
+var PARAMS_WGSL11 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Params;`;
+var F_MODE2 = 0;
+var F_BARS = 1;
+var F_GAIN4 = 2;
+var F_GAMMA = 3;
+var F_LO = 4;
+var F_HI = 5;
+var F_GAP = 6;
+var F_PAN2 = 7;
+var F_CAP_HALF = 8;
+var F_BODY_LEVEL = 9;
+var F_CAP_LEVEL = 10;
+var F_HEIGHT = 11;
+var F_SEGMENTS4 = 12;
+var F_SEG_GAP = 13;
+var F_LED_OFF = 14;
+var F_LED_STYLE = 15;
+var F_PEAK_GLOW = 16;
+var F_PEAK_PULSE = 17;
+var PARAM_FLOATS5 = 20;
+var LED_STYLES = [
+  "solid",
+  "segment",
+  "dot",
+  "capsule",
+  "vu",
+  "diamond",
+  "matrix",
+  "split"
+];
+var MODES2 = ["bars", "ribbon"];
+var DEFAULT_LO = 13e-4;
+var DEFAULT_HI = 0.64;
+var spectrumPass = {
+  type: "spectrum",
+  family: "source",
+  input: "none",
+  usesAudio: true,
+  code: [PASS_COMMON_WGSL, AUDIO_WGSL, PARAMS_WGSL11, src_spectrum_default].join("\n"),
+  // Fullscreen geometry, but issued as a vertex count so that progress 0 draws
+  // literally nothing (Phase 5 DoD). The vertex shader is still
+  // `fullscreenTriangle`; only the count is conditional.
+  draw: {
+    kind: "vertices",
+    vertexCount: (ctx) => ctx.progress > 0 ? 3 : 0
+  },
+  /** Analytic bar and cap edges are defined in attachment pixels; see `scope.ts`. */
+  defaultResolutionScale: 1,
+  uniformFloats: PARAM_FLOATS5,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[F_MODE2] = MODES2.indexOf(mode2(p, "mode", "bars"));
+    out[F_BARS] = Math.max(1, Math.round(num12(p, "bars", 48)));
+    out[F_GAIN4] = num12(p, "gain", 1);
+    out[F_GAMMA] = Math.max(num12(p, "gamma", 0.62), 1e-3);
+    const lo = clamp3(num12(p, "fLo", DEFAULT_LO), 1e-5, 0.98);
+    out[F_LO] = lo;
+    out[F_HI] = clamp3(num12(p, "fHi", DEFAULT_HI), lo * 1.01, 1);
+    out[F_GAP] = clamp3(num12(p, "gap", 0.32), 0, 0.95);
+    out[F_PAN2] = clamp3(num12(p, "pan", 0), 0, 1);
+    out[F_CAP_HALF] = Math.max(num12(p, "capThickness", 6e-3), 1e-4);
+    out[F_BODY_LEVEL] = Math.max(num12(p, "bodyLevel", 0.55), 0);
+    out[F_CAP_LEVEL] = Math.max(num12(p, "capLevel", 1), 0);
+    out[F_HEIGHT] = clamp3(num12(p, "height", 0.42), 0, 1);
+    out[F_SEGMENTS4] = Math.max(1, Math.round(num12(p, "segments", 12)));
+    out[F_SEG_GAP] = clamp3(num12(p, "segGap", 0.32), 0, 0.95);
+    out[F_LED_OFF] = clamp3(num12(p, "ledOff", 0.1), 0, 1);
+    const style = String(p["ledStyle"] ?? "solid");
+    const si = LED_STYLES.indexOf(style);
+    out[F_LED_STYLE] = si < 0 ? 0 : si;
+    out[F_PEAK_GLOW] = Math.max(num12(p, "peakGlow", 0), 0);
+    out[F_PEAK_PULSE] = clamp3(num12(p, "peakPulse", 0), 0, 1);
+  }
+};
+function num12(p, key, fallback) {
+  const v = p[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+function mode2(p, key, fallback) {
+  const v = p[key];
+  const found = MODES2.find((m) => m === v);
+  return found ?? fallback;
+}
+function clamp3(v, lo, hi) {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+// src/shaders/src-radialbars.wgsl
+var src_radialbars_default = "// Radial bars: a log-frequency spectrum wrapped around a circle. Plan \xA78.2.\n//\n// Look: GRID (art-direction \xA71.2) \u2014 a ring of neon bars is that look's second\n// piece of native furniture after the flat bar chart, and it sits over a horizon\n// without competing with it. Rave will happily borrow it; lab will not.\n//\n// Two things decide whether this reads as a designed object or as a clock face:\n//\n//   - THE INNER RADIUS IS REAL. Bars that start at r = 0 all collide at the\n//     origin: 64 wedges meeting at a point is a solid disc with a fringe, and\n//     the low bars \u2014 the ones the eye is looking for \u2014 are the ones destroyed.\n//     `innerRadius` is a hard floor and the bar grows OUTWARD from it.\n//   - THE AXIS IS LOGARITHMIC. Angle is a frequency RATIO, so an octave is a\n//     fixed number of degrees. On a linear axis the bottom octave gets one\n//     wedge of the 360 and the top gets most of the ring (plan \xA76).\n//\n// The sweep is deliberately under a full turn by default. A closed ring puts the\n// top of the axis immediately next to the bottom of it, and that seam \u2014 a hat\n// bar hard against a kick bar \u2014 reads as a glitch. Leaving a gap makes the same\n// discontinuity read as the start and end of a scale, which is what it is.\n//\n// ---------------------------------------------------------------------------\n// Antialiasing without touching atan2's derivative\n//\n// The obvious polar AA \u2014 smoothstep on an ANGLE with `fwidth(angle)` \u2014 has a\n// discontinuity wherever atan2 wraps, and the seam it draws is a full-radius\n// blurred spoke. Everything here is measured as an ARC LENGTH instead\n// (`|dtheta| * r`, a real distance in unit space) and antialiased against ONE\n// epsilon: the size of a pixel in unit space, which is constant across the frame\n// because unit space is an affine function of the fragment coordinate. No\n// derivative of a wrapped quantity is ever taken.\n// ---------------------------------------------------------------------------\n\nstruct Params {\n  bars      : f32,\n  gain      : f32,\n  gamma     : f32,   // < 1 lifts the quiet end. Magnitude is not perceptual.\n  fLo       : f32,   // normalised frequency at the start of the sweep\n  fHi       : f32,   // normalised frequency at the end of it\n  gap       : f32,   // 0..1 fraction of a cell left empty\n  inner     : f32,   // inner radius, unit space. See the header \u2014 not optional.\n  reach     : f32,   // radial length of a full-scale bar, unit space\n  centreX   : f32,   // ring centre, unit space (x spans +/-aspect)\n  centreY   : f32,\n  capHalf   : f32,   // half thickness of the peak-hold cap, unit space\n  bodyLevel : f32,\n  capLevel  : f32,\n  weightVar : f32,   // 0 = every bar the same width. Art-direction \xA74.4.\n  sweep     : f32,   // turns covered by the axis. 1 closes the ring.\n  spin      : f32,   // radians. Driven from a clock division on the CPU.\n};\n\nconst TAU : f32 = 6.28318530717958647;\nconst PI  : f32 = 3.14159265358979323;\n\n/** Signed angle difference in (-PI, PI]. The one place a wrap happens, and it is exact. */\nfn wrapPi(a : f32) -> f32 {\n  return a - TAU * floor((a + PI) / TAU);\n}\n\n/** Normalised frequency at axis position u. Geometric, so an octave is a fixed arc. */\nfn logFreq(u : f32) -> f32 {\n  return P.fLo * pow(max(P.fHi / P.fLo, 1.0), clamp(u, 0.0, 1.0));\n}\n\n/** Magnitude -> radial length. Gamma first, then the layer's reach. */\nfn shape(m : f32) -> f32 {\n  return clamp(pow(max(m * P.gain, 0.0), P.gamma), 0.0, 1.0) * P.reach;\n}\n\n/**\n * Cell magnitude and peak, taken as the MAX across the cell rather than at its\n * centre. A cell near the top of the axis spans dozens of bins; sampling one\n * point in it drops narrow spikes at random and the bar flickers on content that\n * is perfectly steady. `audio.ts` resamples by max for the same reason.\n */\nfn cellMag(i : f32, n : f32) -> vec2<f32> {\n  var m = 0.0;\n  var pk = 0.0;\n  for (var k = 0; k < 4; k = k + 1) {\n    let f = logFreq((i + (f32(k) + 0.5) * 0.25) / n);\n    m = max(m, fftAt(f));\n    pk = max(pk, peakAt(f));\n  }\n  return vec2<f32>(m, pk);\n}\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  return fullscreenTriangle(vi);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let uv = fragUV(frag);\n  // Unit space: y in [-1, 1], x in [-aspect, aspect], y up. Circles stay round\n  // at any aspect and every length below is comparable to every other.\n  let p = vec2<f32>((uv.x * 2.0 - 1.0) * C.aspect, 1.0 - uv.y * 2.0);\n  let q = p - vec2<f32>(P.centreX, P.centreY);\n\n  // One pixel, in unit space. Taken here in uniform control flow \u2014 inside the\n  // cell loop it would sit under a branch that depends on the fragment's own\n  // cell index, and a derivative under non-uniform control flow is undefined.\n  // It is also constant across the frame (unit space is affine in `frag`), so\n  // this is a shared epsilon rather than a per-fragment estimate.\n  let e = max(max(fwidth(p.x), fwidth(p.y)), 1e-5);\n\n  let r = length(q);\n  let ang = atan2(q.y, q.x);\n\n  let n = max(floor(P.bars), 1.0);\n  let sweep = max(P.sweep, 1e-3);\n  // Position along the axis, 0..1 across the sweep. Fragments in the gap land\n  // above 1 and every cell rejects them.\n  let u = fract((ang - P.spin) / TAU) / sweep;\n  let i0 = floor(u * n);\n\n  var body = 0.0;\n  var cap = 0.0;\n  var lit = 0.0;   // radial length of whatever is under this fragment, for shading\n\n  // Neighbours as well as the nominal cell: a fragment one pixel inside cell i\n  // still has to be antialiased against cell i+1's edge.\n  for (var k : i32 = -1; k <= 1; k = k + 1) {\n    let i = i0 + f32(k);\n    let inRange = step(0.0, i) * step(i, n - 1.0);\n    let cu = (i + 0.5) / n;\n\n    // Vary the weight along the axis: heavy at the bottom, light at the top.\n    // Uniform stroke width across a frame reads flat and machine-drawn\n    // (art-direction \xA74.4), and tying the variation to frequency means the bass\n    // \u2014 the thing the eye is already looking for \u2014 carries the weight.\n    let wt = 1.0 + P.weightVar * (0.5 - cu);\n    // Half a cell, in axis units -> radians -> arc length at this radius. The\n    // wedge therefore keeps a constant ANGULAR width and fans out with r, which\n    // is the honest polar object; the inner radius is what stops the narrow end\n    // of it collapsing.\n    let halfArc = max((1.0 - clamp(P.gap, 0.0, 0.95)) * 0.5 / n, 1e-5)\n                * sweep * TAU * max(wt, 0.05) * r;\n\n    // Arc length from the cell's centre line. A real distance, so it shares the\n    // frame's one epsilon and never sees atan2's wrap.\n    let d = abs(wrapPi(ang - (P.spin + cu * sweep * TAU))) * r;\n    let sx = 1.0 - smoothstep(halfArc - e, halfArc + e, d);\n\n    let m = inRange * sx;\n    // Bail before `cellMag`, which is 8 buffer reads; three cells on a\n    // FULLSCREEN pass is 24, and at most one of them normally covers the\n    // fragment (\xA74.11). Exactly, not approximately, free: every term below is\n    // multiplied by `m`, and `max(x, 0.0)` for these non-negative coverages is\n    // `x`, so the output is bit-identical. `continue` rather than a mask is\n    // legal because the uniformity rule governs DERIVATIVES alone and the only\n    // one in this shader \u2014 `e` \u2014 is hoisted above the loop precisely for this.\n    if (m <= 0.0) { continue; }\n\n    let mp = cellMag(i, n);\n    let h = shape(mp.x);\n    let ph = shape(mp.y);\n\n    // Grows outward from the inner radius, and is clipped by it on the inside \u2014\n    // the two smoothsteps together are the wedge.\n    let sIn = smoothstep(P.inner - e, P.inner + e, r);\n    let sOut = 1.0 - smoothstep(P.inner + h - e, P.inner + h + e, r);\n    // The cap rides the peak-hold radius and falls because the analysis's peak\n    // falls. Drawn even when the bar beneath it has collapsed \u2014 that gap IS the\n    // peak-hold readout.\n    let sc = 1.0 - smoothstep(P.capHalf - e, P.capHalf + e, abs(r - (P.inner + ph)));\n\n    body = max(body, m * sIn * sOut);\n    cap = max(cap, m * sc * sIn);\n    lit = max(lit, m * h);\n  }\n\n  // Value range beats hue range (\xA72.3): the wedge darkens towards the hub so it\n  // reads as a lit blade rather than a flat slab, and the floor stays near zero.\n  // ONE hue \u2014 the layer's palette slot. Colouring a spectrum by frequency is the\n  // rainbow anti-pattern wearing a hat (\xA72.2, \xA75).\n  let along = clamp((r - P.inner) / max(lit, 1e-4), 0.0, 1.0);\n  let base = 0.20 + 0.80 * along;\n  let level = body * P.bodyLevel * base + cap * P.capLevel;\n  let a = clamp(body + cap, 0.0, 1.0) * C.opacity;\n  return vec4<f32>(C.color.rgb * level * C.opacity, a);\n}\n";
+
+// src/sources/radialbars.ts
+var PARAMS_WGSL12 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Params;`;
+var F_BARS2 = 0;
+var F_GAIN5 = 1;
+var F_GAMMA2 = 2;
+var F_LO2 = 3;
+var F_HI2 = 4;
+var F_GAP2 = 5;
+var F_INNER = 6;
+var F_REACH = 7;
+var F_CENTRE_X4 = 8;
+var F_CENTRE_Y4 = 9;
+var F_CAP_HALF2 = 10;
+var F_BODY_LEVEL2 = 11;
+var F_CAP_LEVEL2 = 12;
+var F_WEIGHT_VAR5 = 13;
+var F_SWEEP = 14;
+var F_SPIN3 = 15;
+var PARAM_FLOATS6 = 16;
+var DEFAULT_LO2 = 13e-4;
+var DEFAULT_HI2 = 0.64;
+var radialBarsPass = {
+  type: "radialbars",
+  family: "source",
+  // A source draws INTO the accumulator, so it cannot sample it.
+  input: "none",
+  usesAudio: true,
+  code: [PASS_COMMON_WGSL, AUDIO_WGSL, PARAMS_WGSL12, src_radialbars_default].join("\n"),
+  // Fullscreen geometry, issued as a vertex count so progress 0 draws literally
+  // nothing (Phase 5 DoD). The vertex shader is still `fullscreenTriangle`.
+  draw: {
+    kind: "vertices",
+    vertexCount: (ctx) => ctx.progress > 0 ? 3 : 0
+  },
+  /** Analytic wedge and cap edges are defined in attachment pixels; see `scope.ts`. */
+  defaultResolutionScale: 1,
+  uniformFloats: PARAM_FLOATS6,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[F_BARS2] = Math.max(1, Math.round(num13(p, "bars", 64)));
+    out[F_GAIN5] = num13(p, "gain", 1.6);
+    out[F_GAMMA2] = Math.max(num13(p, "gamma", 0.62), 1e-3);
+    const lo = clamp4(num13(p, "fLo", DEFAULT_LO2), 1e-5, 0.98);
+    out[F_LO2] = lo;
+    out[F_HI2] = clamp4(num13(p, "fHi", DEFAULT_HI2), lo * 1.01, 1);
+    out[F_GAP2] = clamp4(num13(p, "gap", 0.34), 0, 0.95);
+    out[F_INNER] = clamp4(num13(p, "innerRadius", 0.26), 0.04, 1.5);
+    out[F_REACH] = Math.max(num13(p, "reach", 0.34), 0);
+    out[F_CENTRE_X4] = num13(p, "centreX", -0.18);
+    out[F_CENTRE_Y4] = num13(p, "centreY", 0.06);
+    out[F_CAP_HALF2] = Math.max(num13(p, "capThickness", 8e-3), 1e-4);
+    out[F_BODY_LEVEL2] = Math.max(num13(p, "bodyLevel", 0.55), 0);
+    out[F_CAP_LEVEL2] = Math.max(num13(p, "capLevel", 1), 0);
+    out[F_WEIGHT_VAR5] = clamp4(num13(p, "weightVar", 0.6), 0, 1.8);
+    out[F_SWEEP] = clamp4(num13(p, "sweep", 0.93), 0.05, 1);
+    const spinBars = Math.max(num13(p, "spinBars", 32), 1e-3);
+    out[F_SPIN3] = fract11(ctx.bars / spinBars) * Math.PI * 2;
+  }
+};
+function num13(p, key, fallback) {
+  const v = p[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+function clamp4(v, lo, hi) {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+function fract11(v) {
+  return v - Math.floor(v);
+}
+
+// src/shaders/src-butterfly.wgsl
+var src_butterfly_default = "// Mirrored butterfly spectrum. Plan \xA78.2.\n//\n// Look: GRID (art-direction \xA71.2) \u2014 it is a spectrum, it is horizon-shaped, and\n// it sits on the same furniture as `src-spectrum.wgsl`. It is deliberately NOT a\n// mode of that shader: stacking a second composition into one pass is how a\n// source stops being composable, and the two want different params.\n//\n// The composition, and why each half of it is the way it is:\n//\n//   - LOW FREQUENCIES AT THE CENTRE LINE, mirrored outward to both edges. The\n//     bass is where the eye lands, and putting it in the middle makes the shape\n//     a body with wings rather than a ramp. The axis is logarithmic in both\n//     directions, so an octave is a fixed width and the fold is symmetric.\n//   - THE UPPER WING IS LEFT, THE LOWER WING IS RIGHT. A mirror about the\n//     horizontal is free symmetry and free symmetry is decoration; driving the\n//     two halves from the two CHANNELS makes the asymmetry mean something. A\n//     mono mix draws a perfectly symmetric moth, wide material breathes, and a\n//     hard-panned hat lifts one wing on its own. `stereo` at 0 restores the\n//     plain mirror for material that has no width worth showing.\n//\n// Antialiasing: every edge is an analytic distance in y, and each wing's own\n// `fwidth` is taken on `y - h` rather than on `y` \u2014 so the contour includes the\n// slope of the spectrum and stays crisp where the curve is steep, which near a\n// bass transient is everywhere.\n//\n// The one honest wart: `d` folds at the centre line (`abs(uv.x - 0.5)`), and a\n// fold has no well-defined derivative on the quad that straddles it. The field\n// is CONTINUOUS across the fold (both sides evaluate the same frequency there),\n// so the artifact is at most one column of slightly wide AA, not the blurred\n// seam that folding a TEXTURE coordinate produces \u2014 there is no sampler here to\n// pick the wrong mip.\n\nstruct Params {\n  gain      : f32,\n  gamma     : f32,   // < 1 lifts the quiet end. Magnitude is not perceptual.\n  fLo       : f32,   // normalised frequency at the centre line\n  fHi       : f32,   // normalised frequency at the wing tips\n  span      : f32,   // full-scale wing height, 0..1 of the frame\n  spread    : f32,   // fraction of the frame width the wings occupy\n  centreY   : f32,   // 0..1 from the bottom\n  capHalf   : f32,   // half thickness of the wing contour at the tips\n  bodyLevel : f32,\n  capLevel  : f32,\n  stereo    : f32,   // 0 = mirror the mono sum, 1 = L above / R below\n  weightVar : f32,   // how much heavier the contour is at the body. \xA74.4.\n};\n\n/** Normalised frequency at distance d from the centre line. Geometric. */\nfn logFreq(d : f32) -> f32 {\n  return P.fLo * pow(max(P.fHi / P.fLo, 1.0), clamp(d, 0.0, 1.0));\n}\n\n/** Magnitude -> wing height. Gamma first, then the layer's span. */\nfn shape(m : f32) -> f32 {\n  return clamp(pow(max(m * P.gain, 0.0), P.gamma), 0.0, 1.0) * P.span;\n}\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  return fullscreenTriangle(vi);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let uv = fragUV(frag);\n  // Bottom-origin y, measured from the layer's centre line. Positive is the\n  // upper wing.\n  let y = (1.0 - uv.y) - P.centreY;\n  // Distance from the centre line, 0 at the body and 1 at the wing tip.\n  //\n  // `dRaw` is kept unclamped so the wing can actually END at `spread`. Clamping\n  // alone maps every column past the tip to fHi, which does not stop the wing \u2014\n  // it draws the top bin's magnitude flat from the tip to the frame edge. At the\n  // default 0.92 that is a small ledge; at `spread` 0.3 it is a horizontal slab\n  // across the outer 70% of the frame, which is not what the param says it does.\n  let dRaw = abs(uv.x - 0.5) * 2.0 / max(P.spread, 1e-3);\n  let d = clamp(dRaw, 0.0, 1.0);\n  // Taken here, in uniform control flow, with the rest of the derivatives.\n  let eSpan = max(fwidth(dRaw), 1e-5);\n  let within = 1.0 - smoothstep(1.0 - eSpan, 1.0 + eSpan, dRaw);\n\n  let f = logFreq(d);\n  let s = fftStereoAt(f);\n  let mono = (s.x + s.y) * 0.5;\n  let ps = peakAt(f);\n\n  // The channel split is a MIX towards mono, not a switch: a preset can dial the\n  // stereo asymmetry down without the shape changing under it.\n  let hUp = shape(mix(mono, s.x, P.stereo));\n  let hDn = shape(mix(mono, s.y, P.stereo));\n  // One peak height for both wings: `audioPeak` is held per bin on the mono sum,\n  // so a per-channel peak would be a number the analysis does not have.\n  let pk = shape(ps);\n\n  let dU = y - hUp;\n  let dD = -y - hDn;\n  let eU = max(fwidth(dU), 1e-5);\n  let eD = max(fwidth(dD), 1e-5);\n  let ey = max(fwidth(y), 1e-5);\n\n  // Each wing is bounded by the centre line on one side and by its own height on\n  // the other. SUMMED rather than maxed: at the centre line both masks read 0.5\n  // and a max would draw a dark seam straight through the body of the moth,\n  // which is the one place the shape must be solid.\n  let upIn = smoothstep(-ey, ey, y);\n  let dnIn = 1.0 - upIn;\n  let bodyUp = upIn * (1.0 - smoothstep(-eU, eU, dU));\n  let bodyDn = dnIn * (1.0 - smoothstep(-eD, eD, dD));\n  let body = clamp(bodyUp + bodyDn, 0.0, 1.0) * within;\n\n  // Contour weight varies along the wing \u2014 heavy at the body, fine at the tips.\n  // Uniform stroke reads flat and machine-drawn (art-direction \xA74.4), and tying\n  // the variation to frequency puts the weight where the energy is.\n  let cw = P.capHalf * (1.0 + P.weightVar * (1.0 - d));\n  let cUp = 1.0 - smoothstep(cw - eU, cw + eU, abs(dU));\n  let cDn = 1.0 - smoothstep(cw - eD, cw + eD, abs(dD));\n\n  // Peak-hold sits above each wing and is deliberately dimmer, so the eye reads\n  // one shape with a marker rather than two competing outlines (\xA74.2).\n  let qU = y - pk;\n  let qD = -y - pk;\n  let eQU = max(fwidth(qU), 1e-5);\n  let eQD = max(fwidth(qD), 1e-5);\n  let pkUp = (1.0 - smoothstep(cw - eQU, cw + eQU, abs(qU))) * upIn;\n  let pkDn = (1.0 - smoothstep(cw - eQD, cw + eQD, abs(qD))) * dnIn;\n\n  let cap = max(max(cUp, cDn), max(pkUp, pkDn) * 0.55) * within;\n\n  // Value range beats hue range (\xA72.3): the fill darkens towards the centre line\n  // so the wings read as lit surfaces with a bright edge rather than as two\n  // slabs. One hue throughout \u2014 colouring by frequency is the rainbow\n  // anti-pattern wearing a hat (\xA72.2, \xA75).\n  let h = max(select(hDn, hUp, y >= 0.0), 1e-4);\n  let base = 0.16 + 0.84 * clamp(abs(y) / h, 0.0, 1.0);\n  let level = body * P.bodyLevel * base + cap * P.capLevel;\n  let a = clamp(body + cap, 0.0, 1.0) * C.opacity;\n  return vec4<f32>(C.color.rgb * level * C.opacity, a);\n}\n";
+
+// src/sources/butterfly.ts
+var PARAMS_WGSL13 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Params;`;
+var F_GAIN6 = 0;
+var F_GAMMA3 = 1;
+var F_LO3 = 2;
+var F_HI3 = 3;
+var F_SPAN = 4;
+var F_SPREAD3 = 5;
+var F_CENTRE_Y5 = 6;
+var F_CAP_HALF3 = 7;
+var F_BODY_LEVEL3 = 8;
+var F_CAP_LEVEL3 = 9;
+var F_STEREO2 = 10;
+var F_WEIGHT_VAR6 = 11;
+var PARAM_FLOATS7 = 12;
+var DEFAULT_LO3 = 13e-4;
+var DEFAULT_HI3 = 0.64;
+var butterflyPass = {
+  type: "butterfly",
+  family: "source",
+  input: "none",
+  usesAudio: true,
+  code: [PASS_COMMON_WGSL, AUDIO_WGSL, PARAMS_WGSL13, src_butterfly_default].join("\n"),
+  // Fullscreen geometry, issued as a vertex count so progress 0 draws literally
+  // nothing (Phase 5 DoD).
+  draw: {
+    kind: "vertices",
+    vertexCount: (ctx) => ctx.progress > 0 ? 3 : 0
+  },
+  /** The contour is a thin analytic edge defined in attachment pixels; see `scope.ts`. */
+  defaultResolutionScale: 1,
+  uniformFloats: PARAM_FLOATS7,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[F_GAIN6] = num14(p, "gain", 1.6);
+    out[F_GAMMA3] = Math.max(num14(p, "gamma", 0.62), 1e-3);
+    const lo = clamp5(num14(p, "fLo", DEFAULT_LO3), 1e-5, 0.98);
+    out[F_LO3] = lo;
+    out[F_HI3] = clamp5(num14(p, "fHi", DEFAULT_HI3), lo * 1.01, 1);
+    out[F_SPAN] = clamp5(num14(p, "span", 0.2), 0, 0.5);
+    out[F_SPREAD3] = clamp5(num14(p, "spread", 0.92), 0.05, 1);
+    out[F_CENTRE_Y5] = clamp5(num14(p, "centreY", 0.5), 0, 1);
+    out[F_CAP_HALF3] = Math.max(num14(p, "capThickness", 35e-4), 1e-4);
+    out[F_BODY_LEVEL3] = Math.max(num14(p, "bodyLevel", 0.4), 0);
+    out[F_CAP_LEVEL3] = Math.max(num14(p, "capLevel", 1), 0);
+    out[F_STEREO2] = clamp5(num14(p, "stereo", 1), 0, 1);
+    out[F_WEIGHT_VAR6] = clamp5(num14(p, "weightVar", 1.4), 0, 6);
+  }
+};
+function num14(p, key, fallback) {
+  const v = p[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+function clamp5(v, lo, hi) {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+// src/shaders/src-stereofield.wgsl
+var src_stereofield_default = "// Stereo field scope: every frequency drawn at its OWN pan position. Plan \xA76, \xA78.2.\n//\n// Look: LAB (art-direction \xA71.1) \u2014 this is an instrument, not decoration. Thin\n// bright filament on near-black, no fill worth the name, and it reads as\n// measurement. It is the display a mastering engineer stares at for hours, and\n// the reason it survives that is that it is honest: nothing here is an effect.\n//\n// x = pan, y = log frequency, brightness = magnitude.\n//\n// `panAt(f)` is `(L-R)/(L+R)` per BIN \u2014 the one piece of analysis in the project\n// that nothing else consumes yet. A broadband pan number says \"the mix leans\n// left\"; a per-bin one says \"the bass is centred, the pad is wide and the hat is\n// 70% right\", which is a completely different picture and is the whole point of\n// having done the stereo work in Phase 0.\n//\n// ---------------------------------------------------------------------------\n// Why a filament and not a cloud of dots\n//\n// The obvious rendering is one dot per bin. 256 gaussian dots average into fog \u2014\n// the same lesson the attractor learned at 24k points, where drawing each step\n// as a SEGMENT rather than a point was most of the visual quality in it. Here\n// the continuum is already there: pan is a function of frequency, and frequency\n// is the vertical axis, so the bins form a CURVE x(y). Drawing it as a\n// continuous stroke resolves the structure that dots bury.\n//\n// The stroke's WIDTH carries magnitude (art-direction \xA74.4). A quiet bin is a\n// hairline and a loud one swells, so level is read as weight rather than as\n// another brightness ramp, and the two loud bands in a mix become the two things\n// the eye lands on without any hue variety at all.\n//\n// AA: `fwidth` is taken on the signed horizontal distance to the curve, not on\n// `uv.x` \u2014 so it includes the curve's own slope. Where a band's pan swings hard\n// across a narrow frequency range the stroke is nearly horizontal, and an edge\n// antialiased with `fwidth(uv.x)` there goes visibly stepped.\n// ---------------------------------------------------------------------------\n\nstruct Params {\n  gain      : f32,\n  gamma     : f32,   // < 1 lifts the quiet end. Magnitude is not perceptual.\n  fLo       : f32,   // normalised frequency at the bottom of the frame\n  fHi       : f32,   // normalised frequency at the top\n  spread    : f32,   // fraction of the frame width a full L/R pan reaches\n  halfWidth : f32,   // hairline half-width, uv units, at zero magnitude\n  widthVar  : f32,   // how much magnitude swells the stroke. \xA74.4.\n  bodyLevel : f32,\n  fillLevel : f32,   // the lean bar from the mono axis out to the curve\n  axisLevel : f32,   // centre and hard-L/R guides\n  peakLevel : f32,   // peak-hold ghost around the stroke\n  gate      : f32,   // magnitude below which a bin draws nothing\n};\n\n/** Normalised frequency at vertical position t (0 at the bottom). Geometric. */\nfn logFreq(t : f32) -> f32 {\n  return P.fLo * pow(max(P.fHi / P.fLo, 1.0), clamp(t, 0.0, 1.0));\n}\n\n/** Magnitude -> 0..1 weight. Gamma only; this axis has no height to scale into. */\nfn shape(m : f32) -> f32 {\n  return clamp(pow(max(m * P.gain, 0.0), P.gamma), 0.0, 1.0);\n}\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  return fullscreenTriangle(vi);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let uv = fragUV(frag);\n  // Bass at the bottom. The alternative reads as a waterfall running the wrong\n  // way, because every other spectrum display in the project puts it low.\n  let t = 1.0 - uv.y;\n  let f = logFreq(t);\n\n  let m = shape(fftAt(f));\n  let pk = shape(peakAt(f));\n  // Plan \xA76, and the only consumer of this buffer in the project.\n  let pan = clamp(panAt(f), -1.0, 1.0);\n\n  // Half a frame of travel is a full pan, scaled by `spread`. Beyond that the\n  // axis stops being readable as a pan axis at all.\n  let cx = 0.5 + pan * 0.5 * clamp(P.spread, 0.0, 1.0);\n  let dx = uv.x - cx;\n  // Includes the slope of cx(t) \u2014 see the header. Uniform control flow: nothing\n  // below branches before this is taken.\n  let e = max(fwidth(dx), 1e-5);\n  let ex = max(fwidth(uv.x), 1e-5);\n\n  // A silent bin has a pan of whatever 0/0 resolved to, and drawing it puts a\n  // meaningless line through the quiet half of the frame. The gate is soft so\n  // the filament fades in rather than switching on.\n  let live = smoothstep(P.gate, P.gate + 0.06, m);\n\n  // Weight carries magnitude. This is the layer's one non-negotiable idea.\n  let hw = max(P.halfWidth * (1.0 + P.widthVar * m), 1e-5);\n  let stroke = (1.0 - smoothstep(hw - e, hw + e, abs(dx))) * live;\n\n  // Peak-hold as a ghost OUTSIDE the stroke rather than as a second line: the\n  // recent maximum width of the same filament, so it reads as a decay envelope\n  // around the live one instead of competing with it (\xA74.2).\n  //\n  // Gated on the PEAK, not on the live magnitude and not at all. Ungated, the\n  // ghost defeats the gate outright: `hwPk >= hw` by construction, so a bin\n  // below the gate contributes `coverage(hw) - 0` and every silent bin draws a\n  // full-strength hairline at whatever 0/0 resolved its pan to \u2014 which is\n  // exactly the dead line down the middle of the frame this layer exists to\n  // prove is NOT there. The peak is the right gate because the ghost's whole\n  // job is to show where a band was a moment ago, and `pk >= m` keeps it a\n  // superset of the stroke so the subtraction below never goes negative.\n  let livePk = smoothstep(P.gate, P.gate + 0.06, pk);\n  let hwPk = max(P.halfWidth * (1.0 + P.widthVar * pk), hw);\n  let ghost = max((1.0 - smoothstep(hwPk - e, hwPk + e, abs(dx))) * livePk - stroke, 0.0);\n\n  // The lean: a dim bar from the mono axis out to the curve, so a band that sits\n  // off-centre reads as a displacement and not just as a wiggle. Kept low \u2014\n  // this look is 80% negative space (\xA71.1) and the fill is the first thing that\n  // would eat it.\n  let a0 = min(0.5, cx);\n  let b0 = max(0.5, cx);\n  let fill = smoothstep(a0 - ex, a0 + ex, uv.x)\n           * (1.0 - smoothstep(b0 - ex, b0 + ex, uv.x)) * live * m;\n\n  // Guides at mono and at hard L/R. Furniture, drawn at a level that admits it.\n  let gw = ex * 1.5;\n  let edge = 0.5 * clamp(P.spread, 0.0, 1.0);\n  var axis = 1.0 - smoothstep(gw, gw * 2.0, abs(uv.x - 0.5));\n  axis = max(axis, (1.0 - smoothstep(gw, gw * 2.0, abs(abs(uv.x - 0.5) - edge))) * 0.6);\n\n  // One hue \u2014 the layer's palette slot \u2014 with everything expressed as value\n  // (\xA72.3). The stroke brightens with magnitude on top of thickening, which is\n  // what makes the loud band the focal element without any second colour.\n  let level = stroke * P.bodyLevel * (0.35 + 0.65 * m)\n            + ghost * P.peakLevel\n            + fill * P.fillLevel\n            + axis * P.axisLevel;\n  let a = clamp(stroke + ghost * 0.5 + fill * 0.5 + axis * 0.5, 0.0, 1.0) * C.opacity;\n  return vec4<f32>(C.color.rgb * level * C.opacity, a);\n}\n";
+
+// src/sources/stereofield.ts
+var PARAMS_WGSL14 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Params;`;
+var F_GAIN7 = 0;
+var F_GAMMA4 = 1;
+var F_LO4 = 2;
+var F_HI4 = 3;
+var F_SPREAD4 = 4;
+var F_HALF_WIDTH5 = 5;
+var F_WIDTH_VAR = 6;
+var F_BODY_LEVEL4 = 7;
+var F_FILL_LEVEL = 8;
+var F_AXIS_LEVEL = 9;
+var F_PEAK_LEVEL = 10;
+var F_GATE = 11;
+var PARAM_FLOATS8 = 12;
+var DEFAULT_LO4 = 13e-4;
+var DEFAULT_HI4 = 0.64;
+var stereoFieldPass = {
+  type: "stereofield",
+  family: "source",
+  input: "none",
+  usesAudio: true,
+  code: [PASS_COMMON_WGSL, AUDIO_WGSL, PARAMS_WGSL14, src_stereofield_default].join("\n"),
+  // Fullscreen geometry, issued as a vertex count so progress 0 draws literally
+  // nothing (Phase 5 DoD).
+  draw: {
+    kind: "vertices",
+    vertexCount: (ctx) => ctx.progress > 0 ? 3 : 0
+  },
+  /**
+   * Full resolution, and this one means it more than its siblings: the stroke is
+   * a few thousandths of the frame wide and its antialiasing is defined in
+   * attachment pixels, so a half-res pass is a half-res hairline bilinearly
+   * smeared back up — which is precisely the 2003 look §4.5 rejects. Advisory
+   * only; §4.11 says the scale is a budget decision and the budget belongs to
+   * the show.
+   */
+  defaultResolutionScale: 1,
+  uniformFloats: PARAM_FLOATS8,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[F_GAIN7] = num15(p, "gain", 1.8);
+    out[F_GAMMA4] = Math.max(num15(p, "gamma", 0.55), 1e-3);
+    const lo = clamp6(num15(p, "fLo", DEFAULT_LO4), 1e-5, 0.98);
+    out[F_LO4] = lo;
+    out[F_HI4] = clamp6(num15(p, "fHi", DEFAULT_HI4), lo * 1.01, 1);
+    out[F_SPREAD4] = clamp6(num15(p, "spread", 0.8), 0.05, 1);
+    out[F_HALF_WIDTH5] = Math.max(num15(p, "thickness", 22e-4), 1e-5) * 0.5;
+    out[F_WIDTH_VAR] = Math.max(num15(p, "widthVar", 6), 0);
+    out[F_BODY_LEVEL4] = Math.max(num15(p, "bodyLevel", 1), 0);
+    out[F_FILL_LEVEL] = Math.max(num15(p, "fillLevel", 0.1), 0);
+    out[F_AXIS_LEVEL] = Math.max(num15(p, "axisLevel", 0.08), 0);
+    out[F_PEAK_LEVEL] = Math.max(num15(p, "peakLevel", 0.22), 0);
+    out[F_GATE] = clamp6(num15(p, "gate", 0.05), 0, 0.9);
+  }
+};
+function num15(p, key, fallback) {
+  const v = p[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+function clamp6(v, lo, hi) {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+// src/shaders/src-waterfall.wgsl
+var src_waterfall_default = "// Waterfall: the scrolling spectrogram. Time on one axis, LOG frequency on the\n// other, magnitude through an OKLab ramp.\n//\n// Look: GRID (art-direction \xA71.2). A spectrogram is a readout \u2014 instrument\n// furniture \u2014 and the horizon/panel composition is what that look is for. It is\n// legible in LAB too if the palette's chroma is near zero, because the ramp is\n// built from the layer's own palette slot rather than from a fixed hue.\n//\n// Four decisions this file exists to get right, all of which are easy to get\n// wrong in a way that still produces a picture:\n//\n//   - THE RING OFFSET IS NOT MINE TO COMPUTE. `spectrogramAt(uv)` in\n//     `audiogpu.ts` addresses rows relative to the write head and wraps. Row 0\n//     of the buffer is NOT the oldest row, it is wherever the writer happened to\n//     be, so indexing `audioGram` directly makes the history JUMP once per lap \u2014\n//     a bug that shows up every 256 analysis frames and is invisible in a\n//     screenshot. Every read here goes through the accessor. uv.y is AGE: 0 is\n//     now, 1 is the oldest row still held.\n//   - THE FREQUENCY AXIS IS LOGARITHMIC. `audio.ts` resamples the FFT into\n//     SPEC_N bins LINEARLY, so bin space is linear in frequency: the bottom\n//     octave gets one bin and the top gets hundreds (plan \xA76). Drawn on a linear\n//     axis the bass \u2014 the part of the music the eye is looking for \u2014 is one\n//     pixel wide. Every x here is a frequency RATIO.\n//   - MAGNITUDE IS RESAMPLED BY MAX ACROSS THE PIXEL. At the top of a log axis\n//     one pixel covers many bins, and sampling the centre of that footprint\n//     drops narrow spikes at random. Peaks are what the eye reads; averaging\n//     buries them under their quiet neighbours.\n//   - THE RAMP IS OKLab AND CARRIES AT MOST ONE HUE ROTATION. A spectrogram\n//     coloured by a rainbow LUT is the number-one amateur tell (\xA72.2, \xA75). The\n//     ramp here runs dark -> the palette slot's own hue -> a lighter, slightly\n//     rotated version of it: value range doing the work, hue range staying still\n//     (\xA72.3). HDR headroom is reached only by the hottest few percent of cells,\n//     and only if the palette slot was given any (\xA72.4).\n//\n// It deliberately does NOT draw octave gridlines, labels, or a mirrored second\n// panel. Those are separate layers; stacking them in here is how a source stops\n// being composable \u2014 the same argument `src-spectrum.wgsl` makes.\n\nstruct Params {\n  orient     : f32,   // 0 vertical (freq across X), 1 horizontal (freq up Y)\n  flip       : f32,   // > 0.5 reverses the direction time scrolls\n  span       : f32,   // fraction of the held history the panel shows, 0..1\n  gain       : f32,\n  gamma      : f32,   // < 1 lifts the quiet end. Magnitude is not perceptual.\n  fLo        : f32,   // normalised frequency at the low end of the axis\n  fHi        : f32,   // normalised frequency at the high end\n  floorKnee  : f32,   // below this, cells fall to true black (\xA72.3)\n  cx         : f32,   // panel centre, uv\n  cy         : f32,\n  hw         : f32,   // panel half extent, uv\n  hh         : f32,\n  hueSpread  : f32,   // radians. The WHOLE hue excursion of the ramp.\n  edgeLevel  : f32,   // brightness of the \"now\" edge. 0 turns it off.\n  topLevel   : f32,   // multiplier on the palette's HDR headroom at the hot end\n  _pad0      : f32,\n};\n\n/**\n * Sub-taps across the pixel's own frequency footprint. Three is enough: the\n * footprint is one pixel wide, and the fourth tap costs another four storage\n * loads to refine a maximum that has already stopped moving.\n */\nconst TAPS : i32 = 3;\n\n/** Normalised frequency at axis position x. Geometric, so an octave is a fixed width. */\nfn logFreq(x : f32) -> f32 {\n  return P.fLo * pow(max(P.fHi / P.fLo, 1.0), clamp(x, 0.0, 1.0));\n}\n\n// OKLab <-> linear sRGB. Both directions, because the ramp is BUILT from the\n// palette slot: the slot arrives as linear rgb (`C.color`), and mixing a ramp\n// from it in sRGB passes through the grey dead-zone this project exists to avoid\n// (\xA72.1). `points.wgsl` carries the same forward transform; the two are\n// deliberately identical arithmetic.\nfn oklabToLinear(c : vec3<f32>) -> vec3<f32> {\n  let l_ = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;\n  let m_ = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;\n  let s_ = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;\n  let l = l_ * l_ * l_;\n  let m = m_ * m_ * m_;\n  let s = s_ * s_ * s_;\n  return vec3<f32>(\n    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,\n   -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,\n   -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,\n  );\n}\n\n/** Cube root that survives a negative argument. `pow` returns NaN for one. */\nfn cbrt(x : f32) -> f32 {\n  return sign(x) * pow(abs(x), 1.0 / 3.0);\n}\n\nfn linearToOklab(c : vec3<f32>) -> vec3<f32> {\n  let l = 0.4122214708 * c.x + 0.5363325363 * c.y + 0.0514459929 * c.z;\n  let m = 0.2119034982 * c.x + 0.6806995451 * c.y + 0.1073969566 * c.z;\n  let s = 0.0883024619 * c.x + 0.2817188376 * c.y + 0.6299787005 * c.z;\n  let l_ = cbrt(l);\n  let m_ = cbrt(m);\n  let s_ = cbrt(s);\n  return vec3<f32>(\n    0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,\n    1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,\n    0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,\n  );\n}\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  return fullscreenTriangle(vi);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let uv = fragUV(frag);\n\n  // Panel-local coordinates, -1..1 inside the panel on both axes.\n  let px = (uv.x - P.cx) / max(P.hw, 1e-4);\n  let py = (uv.y - P.cy) / max(P.hh, 1e-4);\n\n  // `orient` and `flip` come from a uniform, so branching on them would still be\n  // uniform control flow \u2014 but `select` keeps the derivatives below trivially\n  // provably so, and costs nothing.\n  let vert = P.orient < 0.5;\n\n  // Vertical: frequency runs left to right, age runs down the panel.\n  // Horizontal: frequency runs bottom to top (uv.y grows DOWNWARD, hence the\n  // sign), age runs right to left, so the newest column is the right edge.\n  let fq = select(0.5 - 0.5 * py, 0.5 + 0.5 * px, vert);\n  let agRaw = select(0.5 - 0.5 * px, 0.5 + 0.5 * py, vert);\n  let ag = select(agRaw, 1.0 - agRaw, P.flip > 0.5);\n\n  // Every derivative is taken HERE, in uniform control flow, before any branch\n  // on the fragment's own data. A derivative under non-uniform control flow is\n  // undefined, and the symptom is AA that works everywhere except at the edges \u2014\n  // which is the only place it was needed.\n  let ef = max(fwidth(fq), 1e-6);\n  let ea = max(fwidth(ag), 1e-6);\n  let epx = max(fwidth(px), 1e-5);\n  let epy = max(fwidth(py), 1e-5);\n\n  // The panel's own edges, analytically antialiased (\xA74.5).\n  let panel = (1.0 - smoothstep(1.0 - epx, 1.0 + epx, abs(px)))\n            * (1.0 - smoothstep(1.0 - epy, 1.0 + epy, abs(py)));\n\n  // Age 0 is now; `span` decides how far back the far end reaches. Age is fed to\n  // the accessor unwrapped \u2014 the ring arithmetic is its job, not this shader's.\n  let age = clamp(ag, 0.0, 1.0) * clamp(P.span, 0.0, 1.0);\n\n  var m = 0.0;\n  for (var k = 0; k < TAPS; k = k + 1) {\n    let o = (f32(k) / f32(TAPS - 1) - 0.5) * ef;\n    m = max(m, spectrogramAt(vec2<f32>(logFreq(fq + o), age)));\n  }\n\n  // Gamma below 1 lifts the quiet end; the knee then pushes the very bottom back\n  // to true black, so the panel's floor is zero rather than a grey haze (\xA72.3).\n  var v = pow(clamp(m * P.gain, 0.0, 1.0), max(P.gamma, 1e-3));\n  v = v * smoothstep(0.0, max(P.floorKnee, 1e-4), v);\n\n  // The ramp is built from the layer's palette slot, so a preset re-grades the\n  // whole spectrogram from one control (\xA72.5). `C.color.rgb` already has the\n  // slot's intensity applied, so it is divided back out to recover the unit hue\n  // \u2014 otherwise a slot with HDR headroom would come back as an out-of-gamut\n  // chroma and the ramp would clip on its way through OKLab.\n  let unit = max(C.color.rgb / max(C.color.a, 1e-3), vec3<f32>(0.0));\n  let base = linearToOklab(unit);\n  let h0 = atan2(base.z, base.y);\n  // A greyscale palette slot has no hue to rotate. Chroma of zero falls straight\n  // through everything below and the ramp is a value ramp, which is correct.\n  let c0 = length(base.yz);\n\n  // The two ends of the rotation, split 5:3 either side of the slot's own hue so\n  // the dark end moves further than the bright one. The split is normalised so\n  // that hLo - hHi is EXACTLY `hueSpread` \u2014 the .ts caps that dial at 0.9 rad on\n  // the understanding that it is the whole excursion, and a shader that spent\n  // 1.6x of it would be running a 82-degree sweep against a 52-degree budget.\n  let hLo = h0 + P.hueSpread * 0.625;\n  let hHi = h0 - P.hueSpread * 0.375;\n\n  // Three stops, and the hue excursion across all of them is `hueSpread`. This\n  // is a hue ROTATION, which \xA72.2 allows; a per-magnitude hue SWEEP is the\n  // rainbow anti-pattern and is what this shape exists to refuse.\n  var L : f32;\n  var ch : f32;\n  var hu : f32;\n  if (v < 0.55) {\n    let u = v / 0.55;\n    L = mix(0.04, 0.58, u);\n    ch = mix(0.20, 0.90, u) * c0;\n    hu = mix(hLo, h0, u);\n  } else {\n    let u = (v - 0.55) / 0.45;\n    L = mix(0.58, 0.94, u);\n    ch = mix(0.90, 0.55, u) * c0;\n    hu = mix(h0, hHi, u);\n  }\n  var rgb = max(oklabToLinear(vec3<f32>(L, ch * cos(hu), ch * sin(hu))), vec3<f32>(0.0));\n\n  // HDR is for the focal element only (\xA72.4), so the headroom is reached by the\n  // hottest few percent of cells and by nothing else \u2014 and only if the palette\n  // slot was given any. A slot at intensity 1 leaves this a no-op.\n  rgb = rgb * mix(1.0, max(C.color.a, 1.0) * max(P.topLevel, 0.0), smoothstep(0.86, 1.0, v));\n\n  // The leading edge: a thin bright line at age 0, which is where the newest row\n  // enters. It gives the panel one lit edge to read as its \"now\", and it is the\n  // only line in this source, so it is the only place line weight can vary \u2014\n  // it thickens with broadband level (\xA74.4).\n  let edgeHalf = ea * (1.0 + 1.6 * clamp(A.level, 0.0, 1.0));\n  let edge = (1.0 - smoothstep(edgeHalf, edgeHalf * 2.2, abs(ag))) * max(P.edgeLevel, 0.0);\n\n  // Below the knee nothing is drawn at all: the ramp's darkest stop is not black,\n  // and a full panel of near-black under `add` is a grey wash over the frame.\n  let gate = smoothstep(0.0, 0.03, v);\n\n  let col = (rgb * gate + C.color.rgb * edge) * panel;\n  let a = clamp(gate + edge, 0.0, 1.0) * panel;\n  // C.opacity is the one obligation `PASS_COMMON_WGSL` imposes: fixed-function\n  // blending has no per-draw multiplier, so a pass that ignores it is a pass\n  // whose opacity slider does nothing.\n  return vec4<f32>(col * C.opacity, a * C.opacity);\n}\n";
+
+// src/sources/waterfall.ts
+var PARAMS_WGSL15 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Params;`;
+var F_ORIENT = 0;
+var F_FLIP = 1;
+var F_SPAN2 = 2;
+var F_GAIN8 = 3;
+var F_GAMMA5 = 4;
+var F_LO5 = 5;
+var F_HI5 = 6;
+var F_FLOOR = 7;
+var F_CX = 8;
+var F_CY = 9;
+var F_HW = 10;
+var F_HH = 11;
+var F_HUE_SPREAD = 12;
+var F_EDGE = 13;
+var F_TOP = 14;
+var PARAM_FLOATS9 = 16;
+var ORIENTATIONS = ["vertical", "horizontal"];
+var DEFAULT_LO5 = 13e-4;
+var DEFAULT_HI5 = 0.64;
+var MAX_HUE_SPREAD = 0.9;
+var waterfallPass = {
+  type: "waterfall",
+  family: "source",
+  // A source draws INTO the accumulator, so it cannot sample it. Explicit
+  // because the default is easy to assume the other way round.
+  input: "none",
+  usesAudio: true,
+  code: [PASS_COMMON_WGSL, AUDIO_WGSL, PARAMS_WGSL15, src_waterfall_default].join("\n"),
+  // Fullscreen geometry, issued as a vertex count so that progress 0 draws
+  // literally nothing (Phase 5 DoD) rather than a full-frame pass that happens
+  // to be transparent.
+  draw: {
+    kind: "vertices",
+    vertexCount: (ctx) => ctx.progress > 0 ? 3 : 0
+  },
+  /**
+   * The panel edge and the "now" line are analytic edges defined in attachment
+   * pixels, so a half-res pass is a half-res edge smeared bilinearly back up.
+   * Advisory only — §4.11 says the scale is a budget decision and the budget
+   * belongs to the show.
+   */
+  defaultResolutionScale: 1,
+  uniformFloats: PARAM_FLOATS9,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[F_ORIENT] = ORIENTATIONS.indexOf(orientation(p, "orientation", "vertical"));
+    out[F_FLIP] = bool2(p, "flip", false) ? 1 : 0;
+    out[F_SPAN2] = clamp7(num16(p, "span", 1), 0.02, 1);
+    out[F_GAIN8] = Math.max(num16(p, "gain", 1.5), 0);
+    out[F_GAMMA5] = Math.max(num16(p, "gamma", 0.55), 1e-3);
+    const lo = clamp7(num16(p, "fLo", DEFAULT_LO5), 1e-5, 0.98);
+    out[F_LO5] = lo;
+    out[F_HI5] = clamp7(num16(p, "fHi", DEFAULT_HI5), lo * 1.01, 1);
+    out[F_FLOOR] = clamp7(num16(p, "floorKnee", 0.14), 1e-4, 0.9);
+    out[F_CX] = num16(p, "centreX", 0.5);
+    out[F_CY] = num16(p, "centreY", 0.62);
+    out[F_HW] = clamp7(num16(p, "halfWidth", 0.46), 1e-3, 0.5);
+    out[F_HH] = clamp7(num16(p, "halfHeight", 0.3), 1e-3, 0.5);
+    out[F_HUE_SPREAD] = clamp7(num16(p, "hueSpread", 0.32), 0, MAX_HUE_SPREAD);
+    out[F_EDGE] = Math.max(num16(p, "edgeLevel", 0.55), 0);
+    out[F_TOP] = Math.max(num16(p, "topLevel", 1), 0);
+  }
+};
+function num16(p, key, fallback) {
+  const v = p[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+function bool2(p, key, fallback) {
+  const v = p[key];
+  return typeof v === "boolean" ? v : fallback;
+}
+function orientation(p, key, fallback) {
+  const v = p[key];
+  const found = ORIENTATIONS.find((m) => m === v);
+  return found ?? fallback;
+}
+function clamp7(v, lo, hi) {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+// src/shaders/src-scopetunnel.wgsl
+var src_scopetunnel_default = "// Scope tunnel: successive rows of the spectrogram history receding in Z, so\n// the past trails away from the viewer.\n//\n// Look: GRID (art-direction \xA71.2). `landscape` mode IS the look's landscape grid\n// \u2014 a fixed horizon with everything else travelling towards it, which is exactly\n// the discipline that section names. `tunnel` mode is the same machinery with\n// the vanishing point pulled off the horizon and into the frame.\n//\n// ---------------------------------------------------------------------------\n// Depth is 1/r from the vanishing point, and that is the whole construction\n// ---------------------------------------------------------------------------\n//\n// A plane at depth z projects to a screen offset r = f/z from the vanishing\n// point. So z is proportional to 1/r, and a set of rows EVENLY SPACED IN DEPTH\n// is a set of rows evenly spaced in 1/r \u2014 bunching towards the vanishing point\n// on their own, without a single hand-placed constant. Every row here therefore\n// lives at a fixed position on the 1/r axis, and that same position is its AGE\n// in the history: depth and age are one coordinate, which is what makes a\n// feature visibly travel away from the viewer as it gets older.\n//\n// Heights follow from the same identity. A world-space height h projects to\n// h * f/z on screen, and f/z is exactly r \u2014 so a row's amplitude is scaled by\n// its own r and shrinks with distance for free. Scaling the height by a constant\n// instead is the usual mistake and produces far rows that tower over near ones.\n//\n// ---------------------------------------------------------------------------\n// Three more things this file is careful about\n// ---------------------------------------------------------------------------\n//\n//   - THE RING OFFSET IS NOT MINE TO COMPUTE. Every history read goes through\n//     `spectrogramAt` (`audiogpu.ts`), whose uv.y is AGE and which addresses\n//     rows relative to the write head. Indexing `audioGram` directly makes the\n//     whole tunnel JUMP once per 256-row lap \u2014 invisible in a screenshot and\n//     obvious in motion, which is the worst combination.\n//   - LINE WEIGHT VARIES, deliberately (\xA74.4). With depth, because that is what\n//     perspective does, and with the row's own energy. It is also clamped to one\n//     pixel with the remainder carried in ALPHA: a stroke thinner than a fragment\n//     does not draw a thin line, it draws an intermittent one, and a tunnel is\n//     mostly far rows.\n//   - THE FAR END FADES OUT. Not atmosphere for its own sake: rows bunch\n//     towards the vanishing point until they are sub-pixel, and a far end that\n//     stays bright is both aliased AND a second thing competing with the near\n//     rows for the eye (\xA74.2). One focal point means the near rows.\n//\n// Radial by construction, which \xA74.1 permits \u2014 a tunnel has a centre the way a\n// circular scope does. What it does NOT do is add centre-out pulsing on top of\n// that; nothing here breathes from the origin on the beat.\n\nstruct Params {\n  mode       : f32,   // 0 landscape (horizon), 1 tunnel (vanishing point)\n  rows       : f32,   // history rows drawn\n  span       : f32,   // fraction of the held history the far end reaches\n  gain       : f32,\n  gamma      : f32,   // < 1 lifts the quiet end\n  fLo        : f32,   // normalised frequency at the near/left end of a row\n  fHi        : f32,\n  height     : f32,   // amplitude, in screen units at the near plane\n  originX    : f32,   // vanishing point / horizon centre, unit space\n  originY    : f32,   // landscape: the horizon's height. It does not move.\n  farR       : f32,   // r at which the far end is cut off\n  lineWidth  : f32,   // half stroke width at the near plane\n  falloff    : f32,   // exponent on the depth fade\n  widthScale : f32,   // lateral extent of a landscape row\n  weightVar  : f32,   // 0 = uniform stroke (do not), 1 = strongly varying\n  hueSpread  : f32,   // radians of hue rotation between near and far\n  spin       : f32,   // tunnel only. From a clock division, never wall-clock (\xA73.1).\n  _pad0      : f32,\n  _pad1      : f32,\n  _pad2      : f32,\n};\n\nconst TAU = 6.28318530718;\nconst PI = 3.14159265359;\n\n/**\n * Rows searched either side of the one under the fragment.\n *\n * A row can be displaced by its own amplitude, so the row visible at a given\n * screen position is not always the one that position indexes. Three either side\n * covers the default height at the default row count; more is a straight cost of\n * four storage loads per row per fragment, and the ones beyond this contribute\n * nothing because the depth fade has already taken them to zero.\n */\nconst SEARCH : i32 = 3;\n\n/** Normalised frequency along a row. Geometric, so an octave is a fixed width. */\nfn logFreq(x : f32) -> f32 {\n  return P.fLo * pow(max(P.fHi / P.fLo, 1.0), clamp(x, 0.0, 1.0));\n}\n\n// OKLab -> linear sRGB, and back. The tint ramp is built FROM the layer's\n// palette slot, and building it in sRGB would pass through the grey dead-zone\n// (\xA72.1). Identical arithmetic to `points.wgsl` and `src-waterfall.wgsl`.\nfn oklabToLinear(c : vec3<f32>) -> vec3<f32> {\n  let l_ = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;\n  let m_ = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;\n  let s_ = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;\n  let l = l_ * l_ * l_;\n  let m = m_ * m_ * m_;\n  let s = s_ * s_ * s_;\n  return vec3<f32>(\n    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,\n   -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,\n   -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,\n  );\n}\n\nfn cbrt(x : f32) -> f32 {\n  return sign(x) * pow(abs(x), 1.0 / 3.0);\n}\n\nfn linearToOklab(c : vec3<f32>) -> vec3<f32> {\n  let l = 0.4122214708 * c.x + 0.5363325363 * c.y + 0.0514459929 * c.z;\n  let m = 0.2119034982 * c.x + 0.6806995451 * c.y + 0.1073969566 * c.z;\n  let s = 0.0883024619 * c.x + 0.2817188376 * c.y + 0.6299787005 * c.z;\n  let l_ = cbrt(l);\n  let m_ = cbrt(m);\n  let s_ = cbrt(s);\n  return vec3<f32>(\n    0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,\n    1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,\n    0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_,\n  );\n}\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  return fullscreenTriangle(vi);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let uv = fragUV(frag);\n  // Unit space: y in [-1,1] and UP, x in [-aspect, aspect]. Keeping the aspect\n  // in the coordinate rather than in every expression is what makes the tunnel\n  // round instead of egg-shaped.\n  let p = vec2<f32>((uv.x - 0.5) * 2.0 * C.aspect, 1.0 - uv.y * 2.0);\n  let o = vec2<f32>(P.originX, P.originY);\n  let d = p - o;\n  let tunnel = P.mode > 0.5;\n\n  // r from the vanishing point. For the landscape that is the distance BELOW the\n  // horizon line, which is the same quantity in one dimension \u2014 the horizon is a\n  // vanishing point smeared sideways.\n  let rr = select(o.y - p.y, length(d), tunnel);\n\n  // The only derivative in this shader, taken here in uniform control flow. `rr`\n  // changes by roughly one screen pixel's worth per fragment, so this is the\n  // exact width to antialias a line expressed in r against \u2014 and it stays\n  // correct at every depth, which a constant edge width does not.\n  let er = max(fwidth(rr), 1e-6);\n\n  // The near plane: the bottom edge of the frame for a landscape, the far corner\n  // for a tunnel. Derived rather than a param \u2014 a param copy of it disagrees with\n  // the attachment the moment the aspect changes.\n  let rNear = select(o.y + 1.0, length(vec2<f32>(C.aspect, 1.0)) + length(o), tunnel);\n  // The far cutoff has to stay inside the near plane or the field below is empty\n  // and the layer renders nothing at all, silently. That is not hypothetical: a\n  // landscape with `originY` near the bottom of the frame leaves only a sliver\n  // below the horizon, and the default `farR` of 0.12 is larger than the sliver.\n  // Half of rNear is the ceiling because a depth range narrower than 2:1 is not\n  // a recession, and it is far above anything a sane preset asks for \u2014 at the\n  // default horizon the ratio is ~11:1, so this clamp is inert there.\n  let farR = clamp(P.farR, 1e-3, max(rNear * 0.5, 1e-3));\n\n  // Outside the field entirely: above the horizon, or inside the vanishing\n  // point's cutoff. Masked rather than returned early so that nothing below sits\n  // under a branch on the fragment's own position.\n  let field = step(farR, rr) * step(rr, max(rNear, farR * 2.0));\n\n  let qNear = 1.0 / max(rNear, 1e-3);\n  let qFar = 1.0 / farR;\n  // Depth, normalised. Linear in 1/r, hence linear in z: rows evenly spaced in\n  // this are rows evenly spaced in the world.\n  let t = clamp((1.0 / max(rr, 1e-4) - qNear) / max(qFar - qNear, 1e-4), 0.0, 1.0);\n\n  // Angle for the tunnel, wrapped and MIRRORED. Mapping frequency onto a full\n  // turn would put fHi hard against fLo at the seam, and a spectrogram with a\n  // discontinuity in it reads as a rendering fault rather than as data.\n  var th = atan2(d.y, d.x) + P.spin;\n  th = th - TAU * floor((th + PI) / TAU);\n  let ang = abs(th) / PI;\n\n  // The tint ramp's endpoints, resolved once. `C.color.rgb` carries the slot's\n  // intensity, so it is divided back out to recover the unit hue \u2014 otherwise a\n  // slot with HDR headroom returns an out-of-gamut chroma and the ramp clips on\n  // its way through OKLab.\n  let unit = max(C.color.rgb / max(C.color.a, 1e-3), vec3<f32>(0.0));\n  let base = linearToOklab(unit);\n  let h0 = atan2(base.z, base.y);\n  let c0 = length(base.yz);\n\n  let n = max(floor(P.rows), 2.0);\n  let k0 = floor(t * n - 0.5);\n  let span = clamp(P.span, 0.02, 1.0);\n\n  var col = vec3<f32>(0.0);\n  var cov = 0.0;\n\n  for (var j = -SEARCH; j <= SEARCH; j = j + 1) {\n    let k = k0 + f32(j);\n    let inRange = step(0.0, k) * step(k, n - 1.0);\n    // Clamped, then masked by `inRange`. Out-of-range rows are still EVALUATED \u2014\n    // the loop is uniform and stays that way \u2014 so their arithmetic has to stay\n    // finite: an unclamped depth outside [0,1] can put `mix(qNear, qFar, tk)`\n    // through zero, and the resulting infinity multiplied by a mask of zero is a\n    // NaN, not a nothing.\n    let tk = clamp((k + 0.5) / n, 0.0, 1.0);\n\n    // This row's baseline r, from its depth. Not from an interpolation in r \u2014\n    // that would space the rows evenly on SCREEN, which is a flat stack of\n    // stripes rather than a receding one.\n    let rk = 1.0 / mix(qNear, qFar, tk);\n\n    // Lateral position along the row. For a landscape the row is a plane at\n    // depth, so a fixed world x lands at a screen x proportional to r: dividing\n    // by rk is what makes the rows converge towards the horizon.\n    let s = select(\n      0.5 + (d.x * rNear) / max(rk * 2.0 * C.aspect * max(P.widthScale, 1e-3), 1e-4),\n      ang,\n      tunnel,\n    );\n    // Soft ends rather than a hard cut. A landscape row runs out of frequency\n    // axis before it runs out of screen, and a hard edge there is a vertical\n    // line the eye reads as structure.\n    let ends = select(\n      smoothstep(0.0, 0.04, s) * smoothstep(0.0, 0.04, 1.0 - s),\n      1.0,\n      tunnel,\n    );\n\n    // Depth IS age: this row shows the history as it was `tk` of the way back.\n    let raw = spectrogramAt(vec2<f32>(logFreq(clamp(s, 0.0, 1.0)), tk * span));\n    let m = pow(clamp(raw * P.gain, 0.0, 1.0), max(P.gamma, 1e-3));\n\n    // Height in screen units, scaled by the row's own r \u2014 see the header. The\n    // landscape rises towards the horizon (smaller r); the tunnel bulges\n    // outwards (larger r), which is what makes it read as a pipe rather than as\n    // a set of flat discs.\n    let amp = m * max(P.height, 0.0) * rk;\n    let rc = select(rk - amp, rk + amp, tunnel);\n\n    // Weight varies with depth AND with this row's energy (\xA74.4). Clamped to a\n    // fragment; below that the remainder goes into alpha as `thin`, because a\n    // sub-fragment stroke drawn at full brightness is a dashed line.\n    // The energy term is floored at zero: a strong `weightVar` against a silent\n    // row would otherwise ask for a negative width, which reads as a hole in the\n    // line rather than as a thin one.\n    let want = max(P.lineWidth, 0.0) * rk * max(1.0 + P.weightVar * (m - 0.35), 0.0);\n    let w = max(want, er);\n    let thin = clamp(want / er, 0.0, 1.0);\n\n    // Analytic AA, in the same coordinate the edge is expressed in (\xA74.5).\n    let cvg = 1.0 - smoothstep(w - er, w + er, abs(rr - rc));\n\n    // The far end goes quiet. One focal point (\xA74.2), and it also disposes of\n    // the rows that have bunched below a pixel.\n    let fade = pow(1.0 - tk, max(P.falloff, 0.0)) * thin;\n\n    // Hue rotates by at most `hueSpread` from near to far and lightness falls:\n    // value range carrying the depth cue, hue range barely moving (\xA72.2, \xA72.3).\n    let hu = h0 + P.hueSpread * tk;\n    let ch = c0 * mix(1.0, 0.55, tk);\n    var tint = max(oklabToLinear(vec3<f32>(mix(0.90, 0.52, tk), ch * cos(hu), ch * sin(hu))), vec3<f32>(0.0));\n    // HDR headroom for the near, loud rows alone, and only if the palette slot\n    // was given any (\xA72.4).\n    tint = tint * mix(1.0, max(C.color.a, 1.0), smoothstep(0.65, 1.0, m) * (1.0 - tk));\n\n    let mask = cvg * inRange * ends * fade;\n    // `max`, not `+`. Rows overlap wherever a loud one is displaced across its\n    // neighbour, and accumulating there blows the crossing out to white \u2014 the\n    // same steady-state arithmetic that whited the attractor's trail out.\n    col = max(col, tint * (0.35 + 0.9 * m) * mask);\n    cov = max(cov, mask);\n  }\n\n  let a = clamp(cov, 0.0, 1.0) * field;\n  // C.opacity is the one obligation `PASS_COMMON_WGSL` imposes: fixed-function\n  // blending has no per-draw multiplier, so a pass that ignores it is a pass\n  // whose opacity slider does nothing.\n  return vec4<f32>(col * field * C.opacity, a * C.opacity);\n}\n";
+
+// src/sources/scopetunnel.ts
+var PARAMS_WGSL16 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Params;`;
+var F_MODE3 = 0;
+var F_ROWS2 = 1;
+var F_SPAN3 = 2;
+var F_GAIN9 = 3;
+var F_GAMMA6 = 4;
+var F_LO6 = 5;
+var F_HI6 = 6;
+var F_HEIGHT2 = 7;
+var F_ORIGIN_X = 8;
+var F_ORIGIN_Y = 9;
+var F_FAR_R = 10;
+var F_LINE_WIDTH = 11;
+var F_FALLOFF = 12;
+var F_WIDTH_SCALE = 13;
+var F_WEIGHT_VAR7 = 14;
+var F_HUE_SPREAD2 = 15;
+var F_SPIN4 = 16;
+var PARAM_FLOATS10 = 20;
+var MODES3 = ["landscape", "tunnel"];
+var DEFAULT_LO6 = 13e-4;
+var DEFAULT_HI6 = 0.64;
+var DEFAULT_ROWS2 = 48;
+var MAX_ROWS = 192;
+var MAX_HUE_SPREAD2 = 0.9;
+var scopetunnelPass = {
+  type: "scopetunnel",
+  family: "source",
+  // A source draws INTO the accumulator, so it cannot sample it.
+  input: "none",
+  usesAudio: true,
+  code: [PASS_COMMON_WGSL, AUDIO_WGSL, PARAMS_WGSL16, src_scopetunnel_default].join("\n"),
+  // Fullscreen geometry, issued as a vertex count so progress 0 draws literally
+  // nothing (Phase 5 DoD).
+  draw: {
+    kind: "vertices",
+    vertexCount: (ctx) => ctx.progress > 0 ? 3 : 0
+  },
+  /**
+   * Full resolution. The strokes are clamped to one ATTACHMENT pixel and carry
+   * their remainder in alpha, so a half-res pass is a half-res line bilinearly
+   * smeared back up — and most of the frame is far rows, which is exactly the
+   * part that clamp is holding together. Advisory only (§4.11).
+   */
+  defaultResolutionScale: 1,
+  uniformFloats: PARAM_FLOATS10,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    const tunnel = mode3(p, "mode", "landscape") === "tunnel";
+    out[F_MODE3] = tunnel ? 1 : 0;
+    out[F_ROWS2] = clamp8(Math.round(num17(p, "rows", DEFAULT_ROWS2)), 2, MAX_ROWS);
+    out[F_SPAN3] = clamp8(num17(p, "span", 1), 0.02, 1);
+    out[F_GAIN9] = Math.max(num17(p, "gain", 1.6), 0);
+    out[F_GAMMA6] = Math.max(num17(p, "gamma", 0.6), 1e-3);
+    const lo = clamp8(num17(p, "fLo", DEFAULT_LO6), 1e-5, 0.98);
+    out[F_LO6] = lo;
+    out[F_HI6] = clamp8(num17(p, "fHi", DEFAULT_HI6), lo * 1.01, 1);
+    out[F_HEIGHT2] = clamp8(num17(p, "height", 0.24), 0, 2);
+    out[F_ORIGIN_X] = clamp8(num17(p, "originX", tunnel ? -0.14 : 0), -2, 2);
+    out[F_ORIGIN_Y] = clamp8(num17(p, "originY", tunnel ? 0.06 : 0.34), -1, 1);
+    out[F_FAR_R] = clamp8(num17(p, "farR", 0.12), 5e-3, 1);
+    out[F_LINE_WIDTH] = clamp8(num17(p, "lineWidth", 28e-4), 0, 0.2);
+    out[F_FALLOFF] = clamp8(num17(p, "falloff", 2.2), 0, 12);
+    out[F_WIDTH_SCALE] = clamp8(num17(p, "widthScale", 1), 0.05, 8);
+    out[F_WEIGHT_VAR7] = clamp8(num17(p, "weightVar", 0.8), 0, 4);
+    out[F_HUE_SPREAD2] = clamp8(num17(p, "hueSpread", 0.28), 0, MAX_HUE_SPREAD2);
+    const spinBars = Math.max(num17(p, "spinBars", 64), 1e-3);
+    out[F_SPIN4] = tunnel ? fract12(ctx.bars / spinBars) * Math.PI * 2 : 0;
+  }
+};
+function num17(p, key, fallback) {
+  const v = p[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+function mode3(p, key, fallback) {
+  const v = p[key];
+  const found = MODES3.find((m) => m === v);
+  return found ?? fallback;
+}
+function clamp8(v, lo, hi) {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+function fract12(v) {
+  return v - Math.floor(v);
+}
+
+// src/shaders/src-chladni.wgsl
+var src_chladni_default = "// Chladni figures. Plan \xA78.6 \u2014 \"the most audio-native visual there is\".\n//\n// Look: LAB (art-direction \xA71.1). The document lists Chladni in Lab's source set\n// and it belongs there for a reason: a Chladni figure is a MEASUREMENT. Sand on a\n// bowed plate settles on the nodal lines of a standing wave, so what you are\n// looking at is the shape of a frequency, drawn by physics rather than by taste.\n// Thin bright lines on near-black, no fill, one hue. Lab's discipline \u2014 one line,\n// drawn well \u2014 is the whole brief.\n//\n// The field is the square-plate mode superposition:\n//\n//     f(x, y) = cos(n*pi*x)*cos(m*pi*y) - cos(m*pi*x)*cos(n*pi*y)\n//\n// and the picture is its ZERO SET. Note the antisymmetry: swapping n and m negates\n// f, and n == m makes it identically zero \u2014 the whole plate becomes a nodal line\n// and the frame goes white. `chladni.ts` guarantees n != m; this shader does not\n// re-check it, because a shader that silently repairs its uniforms hides the bug\n// in the module that packed them.\n//\n// n and m arrive as INTEGERS, quantised on a clock division by the CPU. That is\n// not a rounding convenience: the modes of a plate are discrete, so a fractional\n// n is not a quieter version of the figure, it is a figure that does not exist.\n// Interpolating between two mode numbers smears the two patterns over each other\n// for the whole crossfade and reads as a wash of noise rather than as a shape\n// changing. Snapping on a musical boundary means the plate visibly re-settles\n// with the music, which is what the mechanism actually is.\n//\n// Two things this file spends its length on and the naive version does not:\n//\n//   - Distance, not magnitude. Thresholding |f| directly gives a line whose width\n//     varies wildly with the local gradient \u2014 hairline where the field is steep,\n//     a fat blob near a saddle. |f| / |grad f| is a first-order distance estimate\n//     to the zero set, and dividing by `fwidth(f)` gives that distance in\n//     FRAGMENTS, which is the unit a line width should be specified in. It is the\n//     same analytic-AA argument as \xA74.5, applied to an implicit curve.\n//   - Varying weight (art-direction \xA74.4). Weight rides the air band and the\n//     local flatness of the field, so the line thickens where the plate is\n//     lazily excited and where the music is bright. A constant stroke reads\n//     machine-drawn.\n//\n// It deliberately does NOT fill the antinodes, tint by mode number, or draw the\n// plate's border. The colour is `C.color` \u2014 the layer's palette slot \u2014 because a\n// source that names its own hue breaks the three-hue rule from outside the\n// palette (\xA72.2).\n\nstruct Params {\n  n         : f32,   // mode number, INTEGRAL. Quantised on a clock division.\n  m         : f32,   // the other mode number. Never equal to n \u2014 see the header.\n  halfPx    : f32,   // half stroke width, in FRAGMENTS of the attachment\n  size      : f32,   // plate half-extent in unit-y\n  centreX   : f32,   // unit space, off-centre by default (art-direction \xA74.1)\n  centreY   : f32,\n  excite    : f32,   // 0..1, decaying from the last division boundary\n  weightVar : f32,   // 0 = uniform stroke (do not), 1 = strongly varying\n  spin      : f32,   // radians, from a clock division. Never wall-clock (\xA73.1)\n  _pad0     : f32,\n  _pad1     : f32,\n  _pad2     : f32,\n};\n\nconst PI = 3.14159265359;\n\n/**\n * The field. `p` is plate coordinates in [0,1]^2 \u2014 the classical statement of the\n * square-plate mode, kept in exactly the form \xA78.6 writes it so the two can be\n * compared without translating between conventions.\n */\nfn chladni(p : vec2<f32>) -> f32 {\n  let a = P.n * PI;\n  let b = P.m * PI;\n  return cos(a * p.x) * cos(b * p.y) - cos(b * p.x) * cos(a * p.y);\n}\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  return fullscreenTriangle(vi);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let uv = fragUV(frag);\n\n  // Unit space: y in [-1,1], x in [-aspect, aspect], y up. Isotropic, which is\n  // what keeps the plate square at any aspect without a divide in every term.\n  let unit = vec2<f32>((uv.x * 2.0 - 1.0) * C.aspect, 1.0 - uv.y * 2.0);\n  let d = unit - vec2<f32>(P.centreX, P.centreY);\n\n  // Rotate the PLATE, not the field. Rotating inside `chladni` would shear the\n  // mode itself into something that is no longer a solution.\n  let cs = cos(P.spin);\n  let sn = sin(P.spin);\n  let rot = vec2<f32>(d.x * cs + d.y * sn, -d.x * sn + d.y * cs);\n  let q = rot / max(P.size, 1e-4);              // plate coords, -1..1\n\n  let f = chladni(q * 0.5 + vec2<f32>(0.5, 0.5));\n\n  // Every derivative in this shader is taken HERE, at the top level, in uniform\n  // control flow. A derivative under a branch that depends on the fragment's own\n  // position is undefined, and the symptom is AA that works everywhere except\n  // exactly at the edges it was added for.\n  let g = max(fwidth(f), 1e-6);\n  let edge = max(abs(q.x), abs(q.y));\n  let ge = max(fwidth(edge), 1e-5);\n\n  // Distance to the zero set, in fragments.\n  let dist = abs(f) / g;\n\n  // Reference gradient: the field's dominant spatial frequency is ~(n+m)/2 cycles\n  // across the plate, and the plate spans `size * resolution.y` fragments. Where\n  // the true gradient is below this the field is locally flat \u2014 a shallow node,\n  // where a real plate piles the most sand \u2014 so the line widens there. Clamped\n  // hard: this is a look, not a simulation, and an unclamped ratio at a saddle\n  // point goes to infinity and fills the frame.\n  let platePx = max(P.size * C.resolution.y, 1.0);\n  let gRef = max((P.n + P.m) * 0.5 * PI / platePx, 1e-6);\n  let flat = clamp(sqrt(gRef / g), 0.7, 1.8);\n\n  // Air rides the stroke so hats read as a thickening of the line rather than as\n  // a separate flashing thing (art-direction \xA73.3).\n  let audioW = 1.0 + P.weightVar * (0.9 * bandAt(4u) + 0.5 * A.level - 0.35);\n  var halfW = P.halfPx * flat * max(audioW, 0.25);\n\n  // Sub-pixel width. Below half a fragment the line does not get thinner, it gets\n  // INTERMITTENT \u2014 whether a given stretch lands on a sample point becomes luck,\n  // and a quiet plate sparkles instead of staying quiet. Clamp the width and let\n  // the alpha carry the remainder. Same treatment as `src-scope.wgsl`.\n  let fade = clamp(halfW / 0.5, 0.0, 1.0);\n  halfW = max(halfW, 0.5);\n\n  let cov = 1.0 - smoothstep(halfW - 0.5, halfW + 0.5, dist);\n\n  // Phosphor shoulder: bright core, soft falloff across the width. A flat-topped\n  // stroke bands visibly wherever nodal lines cross, and on a Chladni figure they\n  // cross constantly.\n  let across = dist / halfW;\n  let core = 0.30 + 0.70 * exp(-across * across * 2.4);\n\n  // The plate has an edge, and it is a hard one \u2014 outside it there is no plate,\n  // not a faded one. Antialiased, then multiplied in rather than branched on, so\n  // the derivatives above stay uniform.\n  let plate = 1.0 - smoothstep(1.0 - ge, 1.0, edge);\n\n  // The strike. `excite` decays from the last division boundary, so the figure\n  // does not merely change on the beat, it visibly re-settles \u2014 which is what a\n  // bowed plate does and is the only reason to quantise in the first place.\n  let glow = 0.55 + 0.55 * A.level + 0.9 * P.excite;\n\n  let a = cov * fade * plate * C.opacity;\n  return vec4<f32>(C.color.rgb * core * glow * a, a);\n}\n";
+
+// src/sources/chladni.ts
+var PARAMS_WGSL17 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Params;`;
+var F_N = 0;
+var F_M = 1;
+var F_HALF_PX = 2;
+var F_SIZE = 3;
+var F_CENTRE_X5 = 4;
+var F_CENTRE_Y6 = 5;
+var F_EXCITE = 6;
+var F_WEIGHT_VAR8 = 7;
+var F_SPIN5 = 8;
+var PARAM_FLOATS11 = 12;
+var BAND_ORDER3 = ["sub", "low", "mid", "high", "air"];
+var DEFAULT_N_MIN = 3;
+var DEFAULT_N_MAX = 11;
+var latch = /* @__PURE__ */ new Map();
+var LATCH_LIMIT = 256;
+var chladniPass = {
+  type: "chladni",
+  family: "source",
+  // A source draws INTO the accumulator, so it cannot sample it. Explicit
+  // because the default is easy to assume the other way round.
+  input: "none",
+  usesAudio: true,
+  code: [PASS_COMMON_WGSL, AUDIO_WGSL, PARAMS_WGSL17, src_chladni_default].join("\n"),
+  // Fullscreen geometry, issued as a vertex count so that progress 0 draws
+  // literally nothing (Phase 5 DoD). The vertex shader is still
+  // `fullscreenTriangle`; only the count is conditional.
+  draw: {
+    kind: "vertices",
+    vertexCount: (ctx) => ctx.progress > 0 ? 3 : 0
+  },
+  /**
+   * The stroke is specified in FRAGMENTS of the attachment, so at half res it is
+   * a half-res hairline smeared back up — and a Chladni figure is nothing but
+   * hairlines. Advisory only; §4.11 says the scale is a budget decision and the
+   * budget belongs to the show.
+   */
+  defaultResolutionScale: 1,
+  uniformFloats: PARAM_FLOATS11,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    const divBeats = Math.max(num18(p, "divisionBeats", 4), 1e-3);
+    const step = Math.floor(ctx.beats / divBeats);
+    const [n, m] = modesFor(ctx, step, divBeats, p);
+    out[F_N] = n;
+    out[F_M] = m;
+    out[F_HALF_PX] = Math.max(num18(p, "thicknessPx", 1.6), 0.05) * 0.5;
+    out[F_SIZE] = Math.max(num18(p, "size", 0.62), 1e-3);
+    out[F_CENTRE_X5] = num18(p, "centreX", -0.1);
+    out[F_CENTRE_Y6] = num18(p, "centreY", 0.04);
+    const settleBeats = Math.max(num18(p, "settleBeats", 0.75), 1e-3);
+    const intoStep = ctx.beats - step * divBeats;
+    out[F_EXCITE] = clamp018(num18(p, "excite", 0.6)) * Math.exp(-intoStep / settleBeats);
+    out[F_WEIGHT_VAR8] = clamp018(num18(p, "weightVar", 0.7));
+    const spinBeats = num18(p, "spinBeats", 0);
+    out[F_SPIN5] = spinBeats > 1e-3 ? fract13(ctx.beats / spinBeats) * Math.PI * 2 : 0;
+  }
+};
+function modesFor(ctx, step, divBeats, p) {
+  const nMin = Math.max(1, Math.round(num18(p, "nMin", DEFAULT_N_MIN)));
+  const nMax = Math.max(nMin + 1, Math.round(num18(p, "nMax", DEFAULT_N_MAX)));
+  const pinnedN = intOrNull(p, "n");
+  const pinnedM = intOrNull(p, "m");
+  if (pinnedN !== null && pinnedM !== null) {
+    return separate(clampInt(pinnedN, nMin, nMax), clampInt(pinnedM, nMin, nMax), nMin, nMax);
+  }
+  const id = ctx.spec.id;
+  const held = latch.get(id);
+  if (held && held.step === step && held.div === divBeats) {
+    return separate(
+      clampInt(pinnedN ?? held.n, nMin, nMax),
+      clampInt(pinnedM ?? held.m, nMin, nMax),
+      nMin,
+      nMax
+    );
+  }
+  const bands = ctx.audio.bands;
+  let i0 = 0;
+  let i1 = 1;
+  let v0 = -1;
+  let v1 = -1;
+  for (let i = 0; i < BAND_ORDER3.length; i++) {
+    const name = BAND_ORDER3[i];
+    const v = name === void 0 ? 0 : bands[name];
+    if (v > v0) {
+      i1 = i0;
+      v1 = v0;
+      i0 = i;
+      v0 = v;
+    } else if (v > v1) {
+      i1 = i;
+      v1 = v;
+    }
+  }
+  const span = nMax - nMin;
+  let n = nMin + Math.round(clamp018((i0 + clamp018(v0)) / BAND_ORDER3.length) * span);
+  let m = nMin + Math.round(clamp018((i1 + clamp018(v1)) / BAND_ORDER3.length) * span);
+  m += Math.floor(hash2(ctx.seed, step) * 3) - 1;
+  const pair = separate(
+    pinnedN !== null ? clampInt(pinnedN, nMin, nMax) : n,
+    pinnedM !== null ? clampInt(pinnedM, nMin, nMax) : clampInt(m, nMin, nMax),
+    nMin,
+    nMax
+  );
+  n = pair[0];
+  m = pair[1];
+  if (latch.size >= LATCH_LIMIT && !latch.has(id)) {
+    const oldest = latch.keys().next();
+    if (!oldest.done) latch.delete(oldest.value);
+  }
+  latch.set(id, { step, div: divBeats, n, m });
+  return [n, m];
+}
+function separate(n, m, nMin, nMax) {
+  if (m !== n) return [n, m];
+  if (n + 1 <= nMax) return [n, n + 1];
+  return [n, n - 1 >= nMin ? n - 1 : nMax];
+}
+function clampInt(v, lo, hi) {
+  const r = Math.round(v);
+  return r < lo ? lo : r > hi ? hi : r;
+}
+function intOrNull(p, key) {
+  const v = p[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+function num18(p, key, fallback) {
+  const v = p[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+function clamp018(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+function fract13(v) {
+  return v - Math.floor(v);
+}
+
+// src/shaders/src-generative.wgsl
+var src_generative_default = "// Shared body for lightweight procedural sources. The later modes reconstruct\n// the contour, wire-mesh, hyperboloid and tunnel grammar from classic AV rigs.\n// Declarations for Common, audio, and Params are prepended by generative.ts.\n\nstruct Params {\n  mode : f32, amount : f32, scale : f32, density : f32,\n  detail : f32, speed : f32, spread : f32, pad : f32,\n};\n\nfn hash21(p : vec2<f32>) -> f32 {\n  var q = fract(vec3<f32>(p.xyx) * 0.1031);\n  q = q + dot(q, q.yzx + 33.33);\n  return fract((q.x + q.y) * q.z);\n}\n\nfn hash22(p : vec2<f32>) -> vec2<f32> {\n  return vec2<f32>(hash21(p), hash21(p + 17.17));\n}\n\nfn field(p : vec2<f32>) -> f32 {\n  let a = sin(p.x + sin(p.y * 1.7));\n  let b = cos(p.y - sin(p.x * 1.3));\n  return 0.5 + 0.5 * a * b;\n}\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  return fullscreenTriangle(vi);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let uv = fragUV(frag);\n  let p = vec2<f32>((uv.x * 2.0 - 1.0) * C.aspect, 1.0 - uv.y * 2.0);\n  let beatTime = C.beats * P.speed;\n  let bass = A.bands.y + A.bands.x * 0.55;\n  let high = A.bands.w + A.air * 0.65;\n  var ink = 0.0;\n\n  if (P.mode < 0.5) {\n    // Audio-pushed particle lattice: two nearest particles are enough to read\n    // as an emitter field without a persistent particle buffer.\n    let q = p * (4.0 + P.density * 8.0) / P.scale;\n    let cell = floor(q);\n    let local = fract(q) - 0.5;\n    for (var y : i32 = -1; y <= 1; y = y + 1) {\n      for (var x : i32 = -1; x <= 1; x = x + 1) {\n        let o = vec2<f32>(f32(x), f32(y));\n        let id = cell + o;\n        let seed = hash22(id + C.seed * 0.0001);\n        let drift = vec2<f32>(sin(beatTime + seed.x * 6.283), cos(beatTime * 0.73 + seed.y * 6.283));\n        let d = length(local - o - (seed - 0.5) * P.spread * 0.75 - drift * (0.08 + bass * 0.22));\n        ink = max(ink, smoothstep(0.10 + high * 0.055, 0.0, d));\n      }\n    }\n  } else if (P.mode < 1.5) {\n    // Stereo XY field: a pair of waveform-derived phases bends a Lissajous\n    // interference curve through the frame. This keeps the classic vector\n    // scope grammar but does not collapse to one dot when a track is quiet.\n    let w = waveAt(fract(uv.x * 0.57 + uv.y * 0.43 + beatTime * 0.015));\n    let ax = 5.0 + floor(P.detail * 3.0);\n    let ay = 7.0 + floor(P.scale * 3.0);\n    let curve = sin(p.x * ax + w.x * P.spread * 2.4 + beatTime * 0.18)\n      - sin(p.y * ay + w.y * P.spread * 2.4 + 1.5708);\n    let envelope = smoothstep(1.25, 0.16, length(p) / max(P.spread, 0.2));\n    ink = smoothstep(0.08 + 0.06 * high, 0.0, abs(curve)) * envelope * (0.52 + A.level * 1.6);\n  } else if (P.mode < 2.5) {\n    // A reaction-diffusion-like interference field. It is procedural rather\n    // than stateful, so it has no stale texture after seeking or a preset swap.\n    let q = p * (3.0 + P.scale * 3.0);\n    let a = field(q + vec2<f32>(beatTime * 0.11, -beatTime * 0.07));\n    let b = field(q.yx * (1.8 + P.detail) - vec2<f32>(bass * 1.8, high));\n    let reaction = abs(a - b);\n    let rings = sin((reaction + bass * 0.45) * (16.0 + P.density * 20.0));\n    ink = smoothstep(0.42, 0.92, rings * 0.5 + 0.5) * smoothstep(0.02, 0.55, reaction);\n  } else if (P.mode < 3.5) {\n    // Voronoi cells, biased by local spectrum energy so high-frequency content\n    // shatters the edges while bass keeps the cells anchored.\n    let q = p * (2.0 + P.density * 3.0) / P.scale;\n    let cell = floor(q);\n    let f = fract(q);\n    var nearest = 8.0;\n    var next = 8.0;\n    for (var y : i32 = -1; y <= 1; y = y + 1) {\n      for (var x : i32 = -1; x <= 1; x = x + 1) {\n        let o = vec2<f32>(f32(x), f32(y));\n        let h = hash22(cell + o + C.seed * 0.0001);\n        let wobble = vec2<f32>(sin(beatTime * 0.45 + h.x * 6.283), cos(beatTime * 0.35 + h.y * 6.283)) * (0.08 + high * 0.18);\n        let d = length(o + h - f + wobble);\n        if (d < nearest) { next = nearest; nearest = d; } else if (d < next) { next = d; }\n      }\n    }\n    let edge = next - nearest;\n    ink = smoothstep(0.035 + bass * 0.035, 0.0, edge) + smoothstep(0.23, 0.0, nearest) * 0.22;\n  } else if (P.mode < 4.5) {\n    // Flow-map contours: a circular void biases an otherwise smooth domain\n    // warp, making bands wrap and shear around a pronounced area of silence.\n    let eye = p + vec2<f32>(0.78, 0.08);\n    let eyeR = length(eye);\n    let bend = eye / max(eyeR * eyeR, 0.14) * (0.15 + bass * 0.14);\n    var q = p * (1.25 + P.scale * 0.85) + bend;\n    q = q + vec2<f32>(\n      sin(q.y * (2.2 + P.detail) + beatTime * 0.34),\n      cos(q.x * (2.8 + P.detail * 0.8) - beatTime * 0.21),\n    ) * (0.22 + high * 0.18) * P.spread;\n    let phase = q.x * 2.3 + q.y * 5.1 + sin(q.x * 3.0 - q.y * 2.0);\n    let bands = abs(fract(phase * (1.3 + P.density * 2.4)) - 0.5);\n    let filaments = smoothstep(0.12 + high * 0.055, 0.0, bands);\n    let wash = smoothstep(0.9, 0.18, abs(sin(phase * 0.8)));\n    let voidMask = smoothstep(0.30, 0.72, eyeR);\n    ink = (filaments * 1.25 + wash * 0.16) * voidMask;\n  } else if (P.mode < 5.5) {\n    // Perspective height mesh. Sampling a continuous height function instead\n    // of a texture keeps the wire grid stable through seeks and preset cuts.\n    let horizon = -0.16 + sin(beatTime * 0.11) * 0.035;\n    // In this coordinate system positive Y is the top of the frame. Distance\n    // therefore grows DOWNWARD from the horizon, putting the landscape in the\n    // foreground instead of painting an accidental ceiling grid.\n    let depth = clamp((horizon - p.y) * 0.78 + 0.06, 0.025, 1.15);\n    let world = vec2<f32>(p.x / depth, 1.0 / depth - beatTime * 0.16);\n    let height = sin(world.x * 1.45 + beatTime * 0.42)\n      + cos(world.y * 1.12 - beatTime * 0.27)\n      + sin((world.x + world.y) * 1.7 + bass * 3.0);\n    let rows = abs(fract((world.y + height * 0.12) * (0.34 + P.density * 0.13)) - 0.5);\n    let cols = abs(fract((world.x + sin(world.y * 0.5) * 0.16) * (0.24 + P.detail * 0.10)) - 0.5);\n    let diagonal = abs(fract((world.x * 0.55 + world.y * 0.42 + height * 0.12) * (0.27 + P.detail * 0.08)) - 0.5);\n    let line = max(\n      max(smoothstep(0.050 + high * 0.020, 0.0, rows), smoothstep(0.030, 0.0, cols)),\n      smoothstep(0.024, 0.0, diagonal),\n    );\n    let floorMask = smoothstep(horizon + 0.04, horizon - 0.03, p.y) * smoothstep(1.18, 0.16, depth);\n    let relief = 0.52 + smoothstep(0.18, 1.5, abs(height)) * 0.42 + bass * 0.88;\n    ink = line * floorMask * relief;\n  } else if (P.mode < 6.5) {\n    // A pinched cylinder viewed head-on. Angular and axial grid lines make a\n    // real wire cage while a narrow moving band supplies the scan energy.\n    let q = vec2<f32>(p.x * 0.82, p.y + sin(beatTime * 0.18) * 0.05);\n    let halfWidth = 0.30 + abs(q.y) * (0.18 + P.spread * 0.12) + sin(q.y * 5.0 + beatTime * 0.3) * 0.04;\n    let xNorm = q.x / max(halfWidth, 0.08);\n    let inside = smoothstep(1.05, 0.94, abs(xNorm)) * smoothstep(1.26, 0.34, abs(q.y));\n    let longitude = asin(clamp(xNorm, -0.999, 0.999)) / 3.14159265 + 0.5;\n    let axial = abs(fract(longitude * (7.0 + P.detail * 8.0) + sin(q.y * 2.2) * 0.12) - 0.5);\n    let rings = abs(fract(q.y * (4.0 + P.density * 5.0) + beatTime * 0.13 + longitude * 0.11) - 0.5);\n    let wire = max(smoothstep(0.075, 0.0, axial), smoothstep(0.065, 0.0, rings));\n    let silhouette = smoothstep(0.06 + high * 0.020, 0.0, abs(abs(xNorm) - 1.0));\n    let scan = smoothstep(0.12, 0.0, abs(q.y - sin(beatTime * 0.68) * 0.22)) * (0.35 + bass);\n    ink = inside * (wire * 0.92 + scan * 0.55) + silhouette * 0.88;\n  } else if (P.mode < 7.5) {\n    // Recursive tunnel: logarithmic rings converge at a moving vanishing point\n    // while radial spokes supply the unmistakable neon-grid perspective.\n    let center = vec2<f32>(sin(beatTime * 0.17) * 0.11, -0.06 + cos(beatTime * 0.13) * 0.06);\n    let q = p - center;\n    let r = max(length(q), 0.002);\n    let angle = atan2(q.y, q.x);\n    let rings = abs(fract(log(r) * (2.1 + P.density * 1.25) - beatTime * (0.34 + P.speed * 0.10)) - 0.5);\n    let spokes = abs(fract((angle / 6.2831853 + 0.5) * (10.0 + P.detail * 14.0) + sin(log(r) * 2.0) * 0.18) - 0.5);\n    let ringInk = smoothstep(0.075 + high * 0.025, 0.0, rings);\n    let spokeInk = smoothstep(0.040 + high * 0.016, 0.0, spokes);\n    let rails = smoothstep(0.045, 0.0, abs(q.x - sin(q.y * 3.0 + beatTime) * 0.22)) * smoothstep(0.35, 1.4, q.y);\n    ink = (max(ringInk, spokeInk) + rails * 0.5) * smoothstep(1.72, 0.06, r) * (0.42 + bass * 1.05);\n  } else if (P.mode < 8.5) {\n    // Wide synthwave dome: large, evenly spaced arches compress into a small\n    // central throat. It is deliberately separate from `gridtunnel` because\n    // this composition needs a visible architectural background, not a camera\n    // flying through a generic radial tunnel.\n    let center = vec2<f32>(0.0, -0.18);\n    let q = p - center;\n    let r = max(length(q), 0.003);\n    let angle = atan2(q.y, q.x);\n    let domeRings = abs(fract(log(r) * (2.8 + P.density * 0.9) - beatTime * 0.08) - 0.5);\n    let domeSpokes = abs(fract((angle / 6.2831853 + 0.5) * (12.0 + P.detail * 10.0)) - 0.5);\n    let arches = max(\n      smoothstep(0.038 + high * 0.016, 0.0, domeRings),\n      smoothstep(0.018 + high * 0.009, 0.0, domeSpokes),\n    );\n    let dome = arches * smoothstep(1.62, 0.045, r);\n\n    let throat = q - vec2<f32>(0.0, 0.08);\n    let halfWidth = 0.075 + abs(throat.y) * 0.31;\n    let normalizedX = throat.x / max(halfWidth, 0.05);\n    let inside = smoothstep(1.02, 0.91, abs(normalizedX)) * smoothstep(0.78, 0.08, abs(throat.y));\n    let longitude = asin(clamp(normalizedX, -0.999, 0.999)) / 3.14159265 + 0.5;\n    let cageVertical = abs(fract(longitude * (10.0 + P.detail * 8.0)) - 0.5);\n    let cageHorizontal = abs(fract((throat.y + 0.55) * (11.0 + P.density * 5.0)) - 0.5);\n    let cage = inside * max(smoothstep(0.045, 0.0, cageVertical), smoothstep(0.038, 0.0, cageHorizontal));\n    let eyes = max(\n      smoothstep(0.15, 0.11, length(throat - vec2<f32>(-0.105, 0.02))),\n      smoothstep(0.15, 0.11, length(throat - vec2<f32>(0.105, 0.02))),\n    );\n    ink = (dome * 0.80 + cage * 1.18) * (1.0 - eyes * 0.92) * (0.52 + bass * 0.92);\n  } else {\n    // Symmetrical spectrum pylons reserve the central vanishing point for the\n    // tunnel and make the music read as architectural light at either side.\n    let horizon = -0.14;\n    let side = abs(p.x);\n    let localX = clamp((side - 0.23) / 0.82, 0.0, 0.999);\n    let barCount = 18.0 + floor(P.detail * 24.0);\n    let band = floor(localX * barCount);\n    let position = fract(localX * barCount);\n    let spectrumEnergy = sqrt(max(fftAt(fract((band + 0.5) / barCount + C.seed * 0.000013)), 0.0));\n    let shape = 0.14 + spectrumEnergy * (0.24 + P.density * 0.24) + bass * 0.13;\n    let bar = smoothstep(0.16, 0.04, abs(position - 0.5));\n    let aboveHorizon = smoothstep(horizon - 0.045, horizon + 0.010, p.y) * smoothstep(horizon + shape, horizon + shape - 0.025, p.y);\n    let sideMask = smoothstep(0.22, 0.34, side) * smoothstep(1.20, 0.82, side);\n    let reflection = smoothstep(horizon - 0.08, horizon - 0.19, p.y) * bar * sideMask * 0.18;\n    ink = (bar * aboveHorizon * sideMask + reflection) * (0.82 + high * 0.72 + A.level * 0.55);\n  }\n\n  let energy = 0.32 + A.level * 1.45 + sqrt(max(fftAt(fract(uv.x)), 0.0)) * 0.45;\n  return vec4<f32>(C.color.rgb * ink * energy * P.amount * C.opacity, ink * P.amount * C.opacity);\n}\n";
+
+// src/sources/generative.ts
+var PARAMS = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Params;`;
+var FLOATS = 8;
+var MODES4 = {
+  particles: 0,
+  lissajous: 1,
+  reaction: 2,
+  voronoi: 3,
+  flowfield: 4,
+  heightmesh: 5,
+  hypercylinder: 6,
+  gridtunnel: 7,
+  dometunnel: 8,
+  pylons: 9
+};
+var GENERATIVE_DEFAULTS = {
+  amount: 1,
+  scale: 1,
+  density: 1,
+  detail: 1,
+  speed: 1,
+  spread: 1
+};
+function num19(p, key, fallback) {
+  const value = p[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+function pass(type) {
+  const shape = {
+    type,
+    family: "source",
+    input: "none",
+    usesAudio: true,
+    uniformFloats: FLOATS,
+    code: ""
+  };
+  return {
+    ...shape,
+    code: [PASS_COMMON_WGSL, AUDIO_WGSL, PARAMS, src_generative_default].join("\n"),
+    defaultResolutionScale: type === "reaction" || type === "flowfield" ? 0.5 : 1,
+    writeUniforms(out, ctx) {
+      const p = ctx.params;
+      out[0] = MODES4[type];
+      out[1] = Math.max(0, num19(p, "amount", GENERATIVE_DEFAULTS.amount));
+      out[2] = Math.max(0.05, num19(p, "scale", GENERATIVE_DEFAULTS.scale));
+      out[3] = Math.max(0.05, num19(p, "density", GENERATIVE_DEFAULTS.density));
+      out[4] = Math.max(0.05, num19(p, "detail", GENERATIVE_DEFAULTS.detail));
+      out[5] = Math.max(0, num19(p, "speed", GENERATIVE_DEFAULTS.speed));
+      out[6] = Math.max(0.05, num19(p, "spread", GENERATIVE_DEFAULTS.spread));
+      out[7] = 0;
+    }
+  };
+}
+var particlesPass = pass("particles");
+var lissajousPass = pass("lissajous");
+var reactionPass = pass("reaction");
+var voronoiPass = pass("voronoi");
+var flowfieldPass = pass("flowfield");
+var heightmeshPass = pass("heightmesh");
+var hypercylinderPass = pass("hypercylinder");
+var gridtunnelPass = pass("gridtunnel");
+var dometunnelPass = pass("dometunnel");
+var pylonsPass = pass("pylons");
+
+// src/shaders/visual-v2-sources/common.wgsl
+var common_default = "// Shared geometry/math for the authored V2 source modules. This file contains\r\n// no source modes and no source uniforms. Every animated phase starts from an\r\n// explicit rational period in bars supplied by its descriptor.\r\n\r\nconst V2_TAU : f32 = 6.28318530718;\r\n\r\nfn v2PhaseBars(periodBars : f32) -> f32 {\r\n  if (abs(periodBars) < 0.00001) {\r\n    return 0.0;\r\n  }\r\n  let direction = select(1.0, -1.0, periodBars < 0.0);\r\n  // Keep the base phase unwrapped: a 1/32 child phase must complete after 32\r\n  // parent cycles, not jump back to zero at every parent-cycle boundary.\r\n  return (C.bars / abs(periodBars)) * V2_TAU * direction;\r\n}\r\n\r\nfn v2PhaseRatio(phase : f32, numerator : f32, denominator : f32) -> f32 {\r\n  return phase * numerator / max(denominator, 1.0);\r\n}\r\n\r\nfn v2CycleRatio(phase : f32, numerator : f32, denominator : f32) -> f32 {\r\n  return (phase / V2_TAU) * numerator / max(denominator, 1.0);\r\n}\r\n\r\nfn v2Rot2(a : f32) -> mat2x2<f32> {\r\n  let c = cos(a);\r\n  let s = sin(a);\r\n  return mat2x2<f32>(c, -s, s, c);\r\n}\r\n\r\nfn v2Hash11(x : f32) -> f32 {\r\n  return fract(sin(x * 127.1 + C.seed * 0.013) * 43758.5453);\r\n}\r\n\r\nfn v2Atan2(p : vec2<f32>) -> f32 {\r\n  // atan2(0, 0) is indeterminate in WGSL. A fragment can land exactly on the\r\n  // subject centre on odd-sized attachments, so choose +X deterministically.\r\n  let safe = select(vec2<f32>(0.000001, 0.0), p, dot(p, p) > 0.000000000001);\r\n  return atan2(safe.y, safe.x);\r\n}\r\n\r\nfn v2LineAA(d : f32, width : f32) -> f32 {\r\n  let aa = max(fwidth(d) * 1.35, 0.00045);\r\n  return 1.0 - smoothstep(width, width + aa, abs(d));\r\n}\r\n\r\nfn v2SegmentDistance(p : vec2<f32>, a : vec2<f32>, b : vec2<f32>) -> f32 {\r\n  let pa = p - a;\r\n  let ba = b - a;\r\n  let h = clamp(dot(pa, ba) / max(dot(ba, ba), 0.00001), 0.0, 1.0);\r\n  return length(pa - ba * h);\r\n}\r\n\r\nfn v2EllipseMask(p : vec2<f32>, radii : vec2<f32>) -> f32 {\r\n  let d = length(p / max(radii, vec2<f32>(0.001)));\r\n  return 1.0 - smoothstep(0.92, 1.0, d);\r\n}\r\n\r\nfn v2SubjectPoint(frag : vec4<f32>, centerX : f32, centerY : f32) -> vec2<f32> {\r\n  let uv = fragUV(frag);\r\n  let p = vec2<f32>((uv.x * 2.0 - 1.0) * C.aspect, 1.0 - uv.y * 2.0);\r\n  return p - vec2<f32>(centerX * C.aspect, centerY);\r\n}\r\n\r\n@vertex\r\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\r\n  return fullscreenTriangle(vi);\r\n}\r\n";
+
+// src/shaders/visual-v2-sources/eclipse-corona.wgsl
+var eclipse_corona_default = "// ECLIPSE CORONA \u2014 a black disk with a spectrum-fed practical corona. The\r\n// angular spectrum scan is an explicit 1/64 division of the declared period.\r\n\r\nstruct Params {\r\n  coronaGain : f32,\r\n  diskScale : f32,\r\n  rayDensity : f32,\r\n  haloDetail : f32,\r\n  scanPeriodBars : f32,\r\n  coronaSpread : f32,\r\n  diskCenterX : f32,\r\n  diskCenterY : f32,\r\n  rimThickness : f32,\r\n  pad0 : f32,\r\n  pad1 : f32,\r\n  pad2 : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let q = v2SubjectPoint(frag, P.diskCenterX, P.diskCenterY);\r\n  let phase = v2PhaseBars(P.scanPeriodBars);\r\n  let treble = A.bands.w + A.air * 0.65;\r\n  let r = length(q);\r\n  let a = v2Atan2(q);\r\n  let f = fract(a / V2_TAU + 0.5 + v2CycleRatio(phase, 1.0, 64.0));\r\n  let spectral = sqrt(max(fftAt(f), 0.0));\r\n  let disk = 0.30 * P.diskScale;\r\n  let rim = v2LineAA(r - disk, 0.0035 * P.rimThickness) * (0.62 + spectral * 1.5);\r\n  let rayCell = abs(fract(f * (28.0 + P.rayDensity * 56.0)) - 0.5);\r\n  let ray = v2LineAA(rayCell, 0.055 * P.rimThickness);\r\n  let coronaExtent = disk + 0.055 + spectral * (0.11 + P.coronaSpread * 0.08);\r\n  let radial = smoothstep(disk - 0.004, disk + 0.008, r)\r\n    * (1.0 - smoothstep(coronaExtent, coronaExtent + 0.045, r));\r\n  let halo = exp(-abs(r - disk) * (30.0 / max(P.haloDetail, 0.25))) * 0.22;\r\n  let ink = rim + ray * radial * (0.18 + treble * 0.75) + halo;\r\n  let alpha = max(ink, 0.0) * P.coronaGain * C.opacity;\r\n  return vec4<f32>(C.color.rgb * alpha, alpha);\r\n}\r\n";
+
+// src/shaders/visual-v2-sources/harmonic-knot.wgsl
+var harmonic_knot_default = "// HARMONIC KNOT \u2014 a projected (2,3) torus knot. Its two camera axes use\r\n// explicit 1/32 and 1/64 divisions of the declared camera period.\r\n\r\nstruct Params {\r\n  knotGain : f32,\r\n  knotScale : f32,\r\n  resonanceDetail : f32,\r\n  tubeSpread : f32,\r\n  cameraPeriodBars : f32,\r\n  knotCenterX : f32,\r\n  knotCenterY : f32,\r\n  tubeThickness : f32,\r\n};\r\n\r\nfn knotPoint(t : f32, phase : f32, bass : f32) -> vec3<f32> {\r\n  let major = 0.31 * P.knotScale;\r\n  let minor = (0.072 + P.tubeSpread * 0.040 + bass * 0.032) * P.knotScale;\r\n  let ring = major + minor * cos(3.0 * t);\r\n  var v = vec3<f32>(ring * cos(2.0 * t), ring * sin(2.0 * t), minor * sin(3.0 * t));\r\n  let tiltX = 0.72 + v2PhaseRatio(phase, 1.0, 32.0);\r\n  let cx = cos(tiltX);\r\n  let sx = sin(tiltX);\r\n  v = vec3<f32>(v.x, v.y * cx - v.z * sx, v.y * sx + v.z * cx);\r\n  let tiltY = -0.44 + v2PhaseRatio(phase, 1.0, 64.0);\r\n  let cy = cos(tiltY);\r\n  let sy = sin(tiltY);\r\n  v = vec3<f32>(v.x * cy + v.z * sy, v.y, -v.x * sy + v.z * cy);\r\n  let perspective = 1.0 / max(0.72, 1.0 - v.z * 0.72);\r\n  return vec3<f32>(v.xy * perspective, v.z);\r\n}\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let q = v2SubjectPoint(frag, P.knotCenterX, P.knotCenterY);\r\n  let phase = v2PhaseBars(P.cameraPeriodBars);\r\n  let bass = A.bands.x * 0.65 + A.bands.y;\r\n  let mids = A.bands.z;\r\n  let treble = A.bands.w + A.air * 0.65;\r\n  var previous = knotPoint(0.0, phase, bass);\r\n  var nearest = 8.0;\r\n  var nearestDepth = 0.0;\r\n  for (var i : i32 = 1; i <= 64; i = i + 1) {\r\n    let current = knotPoint(f32(i) / 64.0 * V2_TAU, phase, bass);\r\n    let d = v2SegmentDistance(q, previous.xy, current.xy);\r\n    if (d < nearest) {\r\n      nearest = d;\r\n      nearestDepth = (previous.z + current.z) * 0.5;\r\n    }\r\n    previous = current;\r\n  }\r\n  let depthWeight = 0.54 + smoothstep(-0.16, 0.16, nearestDepth) * 0.56;\r\n  let tubeWidth = (0.0035 + 0.0022 * P.tubeThickness) * (1.0 + treble * 0.22);\r\n  let tube = v2LineAA(nearest, tubeWidth);\r\n  let resonance = v2LineAA(\r\n    nearest - (0.006 + P.resonanceDetail * 0.003),\r\n    tubeWidth * 0.38,\r\n  ) * (0.035 + P.resonanceDetail * 0.045);\r\n  let ink = (tube + resonance) * depthWeight * (0.48 + bass * 0.7 + mids * 0.85);\r\n  let alpha = max(ink, 0.0) * P.knotGain * C.opacity;\r\n  return vec4<f32>(C.color.rgb * alpha, alpha);\r\n}\r\n";
+
+// src/shaders/visual-v2-sources/ink-vortex.wgsl
+var ink_vortex_default = "// INK VORTEX \u2014 logarithmic streamlines around a displaced void. Evolution and\r\n// eddy phases are explicit 1/32 and 1/16 divisions of the declared period.\r\n\r\nstruct Params {\r\n  inkGain : f32,\r\n  vortexScale : f32,\r\n  filamentDensity : f32,\r\n  curlDetail : f32,\r\n  evolutionPeriodBars : f32,\r\n  vortexCenterX : f32,\r\n  vortexCenterY : f32,\r\n  filamentThickness : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let q = v2SubjectPoint(frag, P.vortexCenterX, P.vortexCenterY);\r\n  let phase = v2PhaseBars(P.evolutionPeriodBars);\r\n  let bass = A.bands.x * 0.65 + A.bands.y;\r\n  let mids = A.bands.z;\r\n  let r = max(length(q), 0.008);\r\n  let a = v2Atan2(q);\r\n  let evolution = v2PhaseRatio(phase, 1.0, 32.0);\r\n  let flow = a / V2_TAU + log(r) * (0.42 + P.curlDetail * 0.17)\r\n    + sin(a * 3.0 + log(r) * 4.2 + evolution) * 0.085\r\n    + sin(q.x * 2.3 - q.y * 1.7) * 0.035\r\n    - v2CycleRatio(phase, 1.0, 32.0);\r\n  let bands = abs(fract(flow * (6.0 + P.filamentDensity * 8.0)) - 0.5);\r\n  let filament = v2LineAA(bands, 0.035 * P.filamentThickness);\r\n  let eddy = sin(\r\n    (a + log(r) * 2.1) * 3.0 + v2PhaseRatio(phase, 1.0, 16.0),\r\n  ) * 0.5 + 0.5;\r\n  let ringMask = smoothstep(0.12, 0.25, r)\r\n    * (1.0 - smoothstep(0.72 * P.vortexScale, 1.08 * P.vortexScale, r));\r\n  let ink = filament * ringMask\r\n    * (0.12 + eddy * 0.22 + bass * 0.32 + mids * 0.24);\r\n  let alpha = max(ink, 0.0) * P.inkGain * C.opacity;\r\n  return vec4<f32>(C.color.rgb * alpha, alpha);\r\n}\r\n";
+
+// src/shaders/visual-v2-sources/magnetic-flux.wgsl
+var magnetic_flux_default = "// MAGNETIC FLUX \u2014 two-pole scalar-field contours around one off-centre\r\n// subject. Rotation and contour drift are rational divisions of one period.\r\n\r\nstruct Params {\r\n  fluxGain : f32,\r\n  fieldScale : f32,\r\n  contourDensity : f32,\r\n  poleSeparation : f32,\r\n  rotationPeriodBars : f32,\r\n  fieldCenterX : f32,\r\n  fieldCenterY : f32,\r\n  contourThickness : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let q = v2SubjectPoint(frag, P.fieldCenterX, P.fieldCenterY);\r\n  let phase = v2PhaseBars(P.rotationPeriodBars);\r\n  let bass = A.bands.x * 0.65 + A.bands.y;\r\n  let treble = A.bands.w + A.air * 0.65;\r\n  let axis = v2Rot2(v2PhaseRatio(phase, 1.0, 32.0))\r\n    * vec2<f32>(0.24 * P.poleSeparation, 0.0);\r\n  let qa = q - axis;\r\n  let qb = q + axis;\r\n  let ra = max(length(qa), 0.015);\r\n  let rb = max(length(qb), 0.015);\r\n  let potential = (v2Atan2(qa) - v2Atan2(qb)) / V2_TAU\r\n    + log(ra / rb) * 0.17;\r\n  let bands = abs(fract(potential * (5.0 + P.contourDensity * 11.0)\r\n    + v2PhaseRatio(phase, 1.0, 128.0)) - 0.5);\r\n  let flux = v2LineAA(bands, 0.025 * P.contourThickness);\r\n  let poleA = v2LineAA(ra - 0.035, 0.006 * P.contourThickness);\r\n  let poleB = v2LineAA(rb - 0.035, 0.006 * P.contourThickness);\r\n  let envelope = v2EllipseMask(q, vec2<f32>(0.86 * P.fieldScale, 0.68 * P.fieldScale));\r\n  let ink = (flux * 0.82 + poleA + poleB) * envelope\r\n    * (0.48 + bass * 1.1 + treble * 0.35);\r\n  let alpha = max(ink, 0.0) * P.fluxGain * C.opacity;\r\n  return vec4<f32>(C.color.rgb * alpha, alpha);\r\n}\r\n";
+
+// src/shaders/visual-v2-sources/moire-portal.wgsl
+var moire_portal_default = "// MOIRE PORTAL \u2014 two line screens clipped to a tilted oval. Screen B follows\r\n// an explicit 3/4 phase relation to screen A; the master turn is 1/32 of the\r\n// declared source cycle.\r\n\r\nstruct Params {\r\n  moireGain : f32,\r\n  portalScale : f32,\r\n  screenDensity : f32,\r\n  screenDetune : f32,\r\n  turnPeriodBars : f32,\r\n  portalCenterX : f32,\r\n  portalCenterY : f32,\r\n  screenThickness : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let q = v2SubjectPoint(frag, P.portalCenterX, P.portalCenterY);\r\n  let phase = v2PhaseBars(P.turnPeriodBars);\r\n  let mids = A.bands.z;\r\n  let treble = A.bands.w + A.air * 0.65;\r\n  let turn = v2PhaseRatio(phase, 1.0, 32.0);\r\n  let a = v2Rot2(0.31 + turn) * q;\r\n  let b = v2Rot2(-0.37 + v2PhaseRatio(turn, 3.0, 4.0)) * q;\r\n  let frequency = 15.0 + P.screenDensity * 28.0;\r\n  let screenA = v2LineAA(\r\n    abs(fract(a.x * frequency) - 0.5),\r\n    0.052 * P.screenThickness,\r\n  );\r\n  let screenB = v2LineAA(\r\n    abs(fract(b.x * frequency * (1.005 + P.screenDetune * 0.010)) - 0.5),\r\n    0.052 * P.screenThickness,\r\n  );\r\n  let interference = screenA * screenB + max(screenA, screenB) * 0.13;\r\n  let portal = v2EllipseMask(\r\n    v2Rot2(-0.18) * q,\r\n    vec2<f32>(0.54 * P.portalScale, 0.79 * P.portalScale),\r\n  );\r\n  let innerVoid = smoothstep(0.12, 0.28, length(q));\r\n  let ink = interference * portal * innerVoid\r\n    * (0.32 + mids * 0.92 + treble * 0.78);\r\n  let alpha = max(ink, 0.0) * P.moireGain * C.opacity;\r\n  return vec4<f32>(C.color.rgb * alpha, alpha);\r\n}\r\n";
+
+// src/shaders/visual-v2-sources/phosphor-orbit.wgsl
+var phosphor_orbit_default = "// PHOSPHOR ORBIT \u2014 a closed cathode trace whose radius is bent by waveform\r\n// samples. The orbit cycle is the declared period; scan/after-motion ratios are\r\n// written as rational divisions of that cycle.\r\n\r\nstruct Params {\r\n  orbitGain : f32,\r\n  orbitScale : f32,\r\n  harmonicDetail : f32,\r\n  waveformBend : f32,\r\n  orbitPeriodBars : f32,\r\n  orbitCenterX : f32,\r\n  orbitCenterY : f32,\r\n  traceThickness : f32,\r\n};\r\n\r\nconst ORBIT_SEAM_FRACTION : f32 = 1.0 / 32.0;\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let q = v2SubjectPoint(frag, P.orbitCenterX, P.orbitCenterY);\r\n  let phase = v2PhaseBars(P.orbitPeriodBars);\r\n  let treble = A.bands.w + A.air * 0.65;\r\n  let r = length(q);\r\n  let a = v2Atan2(q);\r\n  let t = fract(a / V2_TAU + 0.5 + v2CycleRatio(phase, 1.0, 32.0));\r\n  // waveAt is a finite, non-periodic analysis buffer. Mapping its unmatched\r\n  // endpoints directly around a closed polar curve creates a radial scar.\r\n  // This C1 window returns both displacement channels and their endpoint slope\r\n  // to zero before the wrap while leaving 15/16 of the trace unmodified.\r\n  let seamWindow = smoothstep(0.0, ORBIT_SEAM_FRACTION, t)\r\n    * (1.0 - smoothstep(1.0 - ORBIT_SEAM_FRACTION, 1.0, t));\r\n  let wave = waveAt(t) * seamWindow;\r\n  let harmonicOrder = 3.0 + floor(P.harmonicDetail * 2.0);\r\n  let harmonic = sin(a * harmonicOrder + phase) * 0.052\r\n    + sin(a * 2.0 - v2PhaseRatio(phase, 3.0, 8.0)) * 0.022;\r\n  let orbitRadius = (0.30 + harmonic + wave.x * 0.055 * P.waveformBend) * P.orbitScale;\r\n  let width = (0.0015 + 0.0017 * P.traceThickness) * (1.0 + treble * 0.35);\r\n  let trace = v2LineAA(r - orbitRadius, width);\r\n  let afterglow = v2LineAA(r - orbitRadius - wave.y * 0.012, width * 2.4) * 0.16;\r\n  let aperture = 1.0 - smoothstep(0.74 * P.orbitScale, 0.96 * P.orbitScale, r);\r\n  let ink = (trace + afterglow) * aperture * (0.58 + A.level * 1.25 + A.crest * 0.08);\r\n  let alpha = max(ink, 0.0) * P.orbitGain * C.opacity;\r\n  return vec4<f32>(C.color.rgb * alpha, alpha);\r\n}\r\n";
+
+// src/shaders/visual-v2-sources/quasicrystal.wgsl
+var quasicrystal_default = "// QUASICRYSTAL \u2014 a bounded five-axis interference specimen. The drift period\r\n// is explicit; every slower axis/translation term is a rational subdivision.\r\n\r\nstruct Params {\r\n  crystalGain : f32,\r\n  specimenScale : f32,\r\n  axisDensity : f32,\r\n  ridgeDetail : f32,\r\n  driftPeriodBars : f32,\r\n  specimenCenterX : f32,\r\n  specimenCenterY : f32,\r\n  ridgeThickness : f32,\r\n  nodeBias : f32,\r\n  pad0 : f32,\r\n  pad1 : f32,\r\n  pad2 : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let q = v2SubjectPoint(frag, P.specimenCenterX, P.specimenCenterY);\r\n  let phase = v2PhaseBars(P.driftPeriodBars);\r\n  let mids = A.bands.z;\r\n  let treble = A.bands.w + A.air * 0.65;\r\n  let z = q * (4.0 + P.axisDensity * 3.2) / P.specimenScale;\r\n  var overlap = 0.0;\r\n  var closest = 1.0;\r\n  for (var i : i32 = 0; i < 5; i = i + 1) {\r\n    let fi = f32(i);\r\n    let axisAngle = fi * V2_TAU / 5.0\r\n      + v2PhaseRatio(phase, 1.0, 16.0)\r\n      + fi * v2PhaseRatio(phase, 1.0, 256.0);\r\n    let dir = vec2<f32>(cos(axisAngle), sin(axisAngle));\r\n    let d = abs(fract(dot(z, dir) + fi * 0.173\r\n      + v2PhaseRatio(phase, 1.0, 128.0)\r\n      + fi * v2PhaseRatio(phase, 1.0, 1024.0)) - 0.5);\r\n    closest = min(closest, d);\r\n    overlap = overlap + (1.0 - smoothstep(0.035, 0.11, d));\r\n  }\r\n  let nodes = smoothstep(\r\n    mix(1.05, 1.65, P.nodeBias),\r\n    mix(1.55, 2.25, P.nodeBias),\r\n    overlap,\r\n  );\r\n  let wireWidth = (0.018 + P.ridgeDetail * 0.013) * P.ridgeThickness;\r\n  let wires = v2LineAA(closest, wireWidth) * smoothstep(0.20, 1.15, overlap)\r\n    * (0.38 + P.ridgeDetail * 0.18);\r\n  let specimen = v2EllipseMask(q, vec2<f32>(0.72 * P.specimenScale, 0.55 * P.specimenScale));\r\n  let quietCore = smoothstep(0.12, 0.28, length(q));\r\n  let ink = (nodes + wires) * specimen * quietCore * (0.35 + mids * 1.4 + treble * 0.55);\r\n  let alpha = max(ink, 0.0) * P.crystalGain * C.opacity;\r\n  return vec4<f32>(C.color.rgb * alpha, alpha);\r\n}\r\n";
+
+// src/shaders/visual-v2-sources/signal-garden.wgsl
+var signal_garden_default = "// SIGNAL GARDEN \u2014 a bounded stand of waveform-fed stems. All plants share a\r\n// single rational sway phase so the subject reads as one organism.\r\n\r\nstruct Params {\r\n  gardenGain : f32,\r\n  gardenScale : f32,\r\n  stemDensity : f32,\r\n  branchDetail : f32,\r\n  swayPeriodBars : f32,\r\n  swaySpread : f32,\r\n  gardenCenterX : f32,\r\n  gardenCenterY : f32,\r\n  stemThickness : f32,\r\n  pad0 : f32,\r\n  pad1 : f32,\r\n  pad2 : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let q = v2SubjectPoint(frag, P.gardenCenterX, P.gardenCenterY);\r\n  let phase = v2PhaseBars(P.swayPeriodBars);\r\n  let mids = A.bands.z;\r\n  let treble = A.bands.w + A.air * 0.65;\r\n  let width = 1.02 * P.gardenScale;\r\n  let baseY = -0.70;\r\n  let count = 7.0 + floor(P.stemDensity * 8.0);\r\n  let cell = floor((q.x / width * 0.5 + 0.5) * count);\r\n  var garden = 0.0;\r\n  for (var ox : i32 = -1; ox <= 1; ox = ox + 1) {\r\n    let id = cell + f32(ox);\r\n    let seed = v2Hash11(id);\r\n    let x = ((id + 0.5) / count * 2.0 - 1.0) * width;\r\n    let f = fract((id + 0.5) / count);\r\n    let energy = sqrt(max(fftAt(f), 0.0));\r\n    let top = baseY + 0.34 + energy * 0.75 + seed * 0.14;\r\n    let sway = sin(v2PhaseRatio(phase, 1.0, 16.0) + seed * V2_TAU)\r\n      * 0.035 * P.swaySpread;\r\n    let stem = v2SegmentDistance(q, vec2<f32>(x, baseY), vec2<f32>(x + sway, top));\r\n    let branchY = mix(baseY, top, 0.56 + seed * 0.18);\r\n    let side = select(-1.0, 1.0, fract(id * 0.618) > 0.5);\r\n    let branchReach = 0.065 + P.branchDetail * 0.055;\r\n    let branch = v2SegmentDistance(\r\n      q,\r\n      vec2<f32>(x + sway * 0.55, branchY),\r\n      vec2<f32>(\r\n        x + side * (branchReach + energy * 0.10),\r\n        branchY + branchReach + energy * 0.08,\r\n      ),\r\n    );\r\n    garden = max(garden, v2LineAA(\r\n      min(stem, branch),\r\n      (0.0025 + energy * 0.003) * P.stemThickness,\r\n    ));\r\n  }\r\n  let bounds = 1.0 - smoothstep(width - 0.03, width + 0.10, abs(q.x));\r\n  let ink = garden * bounds * (0.34 + mids * 0.75 + treble * 0.46);\r\n  let alpha = max(ink, 0.0) * P.gardenGain * C.opacity;\r\n  return vec4<f32>(C.color.rgb * alpha, alpha);\r\n}\r\n";
+
+// src/shaders/visual-v2-sources/spectral-cathedral.wgsl
+var spectral_cathedral_default = "// SPECTRAL CATHEDRAL \u2014 perspective arches with a fixed horizon. Forward travel\r\n// is an explicit 1/4 cycle relation to the declared architectural period.\r\n\r\nstruct Params {\r\n  cathedralGain : f32,\r\n  frameScale : f32,\r\n  bayDensity : f32,\r\n  columnDetail : f32,\r\n  travelPeriodBars : f32,\r\n  horizonCenterX : f32,\r\n  horizonCenterY : f32,\r\n  architectureThickness : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let q = v2SubjectPoint(frag, P.horizonCenterX, P.horizonCenterY);\r\n  let phase = v2PhaseBars(P.travelPeriodBars);\r\n  let bass = A.bands.x * 0.65 + A.bands.y;\r\n  let horizon = -0.22;\r\n  let z = clamp((q.y - horizon + 0.05) * 0.72, 0.03, 1.2);\r\n  let worldX = q.x / z;\r\n  let depth = 1.0 / z + v2CycleRatio(phase, 1.0, 4.0);\r\n  let bay = fract(depth * (0.48 + P.bayDensity * 0.16));\r\n  let archRadius = 0.46 + bay * 0.38;\r\n  let archY = q.y - horizon - 0.17;\r\n  let archD = abs(length(vec2<f32>(\r\n    q.x / max(archRadius, 0.1),\r\n    archY / max(archRadius * 0.92, 0.1),\r\n  )) - 1.0);\r\n  let upperHalf = smoothstep(horizon - 0.01, horizon + 0.07, q.y);\r\n  let arches = v2LineAA(archD, 0.014 * P.architectureThickness) * upperHalf;\r\n  let columns = v2LineAA(\r\n    abs(fract(worldX * (1.6 + P.columnDetail * 0.55)) - 0.5),\r\n    0.035 * P.architectureThickness,\r\n  ) * smoothstep(horizon - 0.04, horizon + 0.04, q.y);\r\n  let aisle = (1.0 - smoothstep(0.12, 0.42, abs(q.x)))\r\n    * smoothstep(horizon - 0.05, horizon + 0.03, q.y) * 0.16;\r\n  let f = clamp(abs(worldX) * 0.24, 0.0, 1.0);\r\n  let spectral = sqrt(max(fftAt(f), 0.0));\r\n  let frameMask = v2EllipseMask(\r\n    q - vec2<f32>(0.0, 0.10),\r\n    vec2<f32>(1.08 * P.frameScale, 0.92 * P.frameScale),\r\n  );\r\n  let ink = (max(arches, columns) + aisle) * frameMask\r\n    * (0.42 + spectral * 1.25 + bass * 0.35);\r\n  let alpha = max(ink, 0.0) * P.cathedralGain * C.opacity;\r\n  return vec4<f32>(C.color.rgb * alpha, alpha);\r\n}\r\n";
+
+// src/shaders/visual-v2-sources/spectral-loom.wgsl
+var spectral_loom_default = "// SPECTRAL LOOM \u2014 stereo spectrum becomes a bounded woven plane. Pan offsets\r\n// the warp, waveform bends the weft, and motion follows one declared period.\r\n\r\nstruct Params {\r\n  loomGain : f32,\r\n  loomScale : f32,\r\n  warpDensity : f32,\r\n  weftDensity : f32,\r\n  weavePeriodBars : f32,\r\n  stereoSpread : f32,\r\n  loomCenterX : f32,\r\n  loomCenterY : f32,\r\n  threadThickness : f32,\r\n  pad0 : f32,\r\n  pad1 : f32,\r\n  pad2 : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let q = v2SubjectPoint(frag, P.loomCenterX, P.loomCenterY);\r\n  let phase = v2PhaseBars(P.weavePeriodBars);\r\n  let treble = A.bands.w + A.air * 0.65;\r\n  let local = q / vec2<f32>(0.86 * P.loomScale, 0.58 * P.loomScale);\r\n  let inside = v2EllipseMask(q, vec2<f32>(0.90 * P.loomScale, 0.62 * P.loomScale));\r\n  let fx = clamp(local.x * 0.5 + 0.5, 0.0, 1.0);\r\n  let fy = clamp(local.y * 0.5 + 0.5, 0.0, 1.0);\r\n  let eX = sqrt(max(fftAt(fx), 0.0));\r\n  let eY = sqrt(max(fftAt(fy), 0.0));\r\n  let panShift = panAt(fx) * 0.16 * P.stereoSpread;\r\n  let warpX = local.x + panShift\r\n    + sin(local.y * 4.0 + v2PhaseRatio(phase, 1.0, 8.0)) * eY * 0.08;\r\n  let warpY = local.y + waveAt(fx).x * 0.12 * P.stereoSpread;\r\n  let warpCount = 18.0 + floor(P.warpDensity * 20.0);\r\n  let weftCount = 12.0 + floor(P.weftDensity * 18.0);\r\n  let warp = v2LineAA(abs(fract(warpX * warpCount) - 0.5), 0.055 * P.threadThickness)\r\n    * (0.25 + eX * 1.4);\r\n  let weft = v2LineAA(abs(fract(warpY * weftCount) - 0.5), 0.055 * P.threadThickness)\r\n    * (0.22 + eY * 1.15);\r\n  let overUnder = step(0.5, fract(floor(warpX * warpCount) + floor(warpY * weftCount)));\r\n  let ink = mix(warp, weft, overUnder) * inside\r\n    * (0.48 + A.width * 0.8 + treble * 0.35);\r\n  let alpha = max(ink, 0.0) * P.loomGain * C.opacity;\r\n  return vec4<f32>(C.color.rgb * alpha, alpha);\r\n}\r\n";
+
+// src/sources/visual-v2.ts
+var PARAMS_BINDING = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Params;`;
+var MUSICAL_PERIOD_BARS = [
+  1 / 16,
+  1 / 8,
+  1 / 4,
+  1 / 2,
+  1,
+  2,
+  4,
+  8,
+  16,
+  32,
+  64,
+  128
+];
+function finite(params, key) {
+  const value = params[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : void 0;
+}
+function semanticNumber(params, semanticKey, legacyKey, fallback, lo, hi) {
+  const value = finite(params, semanticKey) ?? finite(params, legacyKey) ?? fallback;
+  return value < lo ? lo : value > hi ? hi : value;
+}
+function snapPeriodBars(value) {
+  if (Math.abs(value) < 1e-8) return 0;
+  const direction = value < 0 ? -1 : 1;
+  const magnitude = Math.abs(value);
+  let closest = MUSICAL_PERIOD_BARS[0];
+  let distance = Math.abs(magnitude - closest);
+  for (const candidate of MUSICAL_PERIOD_BARS) {
+    const nextDistance = Math.abs(magnitude - candidate);
+    if (nextDistance < distance) {
+      closest = candidate;
+      distance = nextDistance;
+    }
+  }
+  return closest * direction;
+}
+function musicalPeriodBars(params, semanticKey, fallbackPeriodBars) {
+  const explicit = finite(params, semanticKey);
+  if (explicit !== void 0) return snapPeriodBars(explicit);
+  const legacyRate = finite(params, "rate");
+  if (legacyRate === void 0) return snapPeriodBars(fallbackPeriodBars);
+  if (Math.abs(legacyRate) < 1e-8) return 0;
+  return snapPeriodBars(1 / legacyRate);
+}
+function pass2(type) {
+  return (body, uniformFloats, defaultResolutionScale, writeUniforms) => ({
+    type,
+    family: "source",
+    input: "none",
+    usesAudio: true,
+    uniformFloats,
+    code: [PASS_COMMON_WGSL, AUDIO_WGSL, PARAMS_BINDING, common_default, body].join("\n"),
+    defaultResolutionScale,
+    writeUniforms
+  });
+}
+var phosphorOrbitPass = pass2("phosphor-orbit")(
+  phosphor_orbit_default,
+  8,
+  1,
+  (out, ctx) => {
+    const p = ctx.params;
+    out[0] = semanticNumber(p, "orbitGain", "amount", 1, 0, 4);
+    out[1] = semanticNumber(p, "orbitScale", "scale", 1, 0.1, 4);
+    out[2] = semanticNumber(p, "harmonicDetail", "detail", 1, 0.1, 4);
+    out[3] = semanticNumber(p, "waveformBend", "spread", 1, 0.05, 4);
+    out[4] = musicalPeriodBars(p, "orbitPeriodBars", 4);
+    out[5] = semanticNumber(p, "orbitCenterX", "focusX", -0.22, -1.5, 1.5);
+    out[6] = semanticNumber(p, "orbitCenterY", "focusY", 0.06, -1.5, 1.5);
+    out[7] = semanticNumber(p, "traceThickness", "thickness", 1, 0.25, 6);
+  }
+);
+var quasicrystalPass = pass2("quasicrystal")(
+  quasicrystal_default,
+  12,
+  0.5,
+  (out, ctx) => {
+    const p = ctx.params;
+    out[0] = semanticNumber(p, "crystalGain", "amount", 1, 0, 4);
+    out[1] = semanticNumber(p, "specimenScale", "scale", 1, 0.1, 4);
+    out[2] = semanticNumber(p, "axisDensity", "density", 1, 0.1, 4);
+    out[3] = semanticNumber(p, "ridgeDetail", "detail", 1, 0.1, 4);
+    out[4] = musicalPeriodBars(p, "driftPeriodBars", 4);
+    out[5] = semanticNumber(p, "specimenCenterX", "focusX", -0.22, -1.5, 1.5);
+    out[6] = semanticNumber(p, "specimenCenterY", "focusY", 0.06, -1.5, 1.5);
+    out[7] = semanticNumber(p, "ridgeThickness", "thickness", 1, 0.25, 6);
+    out[8] = semanticNumber(p, "nodeBias", "bias", 0.5, 0, 1);
+  }
+);
+var magneticFluxPass = pass2("magnetic-flux")(
+  magnetic_flux_default,
+  8,
+  0.5,
+  (out, ctx) => {
+    const p = ctx.params;
+    out[0] = semanticNumber(p, "fluxGain", "amount", 1, 0, 4);
+    out[1] = semanticNumber(p, "fieldScale", "scale", 1, 0.1, 4);
+    out[2] = semanticNumber(p, "contourDensity", "density", 1, 0.1, 4);
+    out[3] = semanticNumber(p, "poleSeparation", "spread", 1, 0.05, 4);
+    out[4] = musicalPeriodBars(p, "rotationPeriodBars", 4);
+    out[5] = semanticNumber(p, "fieldCenterX", "focusX", -0.22, -1.5, 1.5);
+    out[6] = semanticNumber(p, "fieldCenterY", "focusY", 0.06, -1.5, 1.5);
+    out[7] = semanticNumber(p, "contourThickness", "thickness", 1, 0.25, 6);
+  }
+);
+var spectralLoomPass = pass2("spectral-loom")(
+  spectral_loom_default,
+  12,
+  0.5,
+  (out, ctx) => {
+    const p = ctx.params;
+    out[0] = semanticNumber(p, "loomGain", "amount", 1, 0, 4);
+    out[1] = semanticNumber(p, "loomScale", "scale", 1, 0.1, 4);
+    out[2] = semanticNumber(p, "warpDensity", "density", 1, 0.1, 4);
+    out[3] = semanticNumber(p, "weftDensity", "detail", 1, 0.1, 4);
+    out[4] = musicalPeriodBars(p, "weavePeriodBars", 4);
+    out[5] = semanticNumber(p, "stereoSpread", "spread", 1, 0.05, 4);
+    out[6] = semanticNumber(p, "loomCenterX", "focusX", -0.22, -1.5, 1.5);
+    out[7] = semanticNumber(p, "loomCenterY", "focusY", 0.06, -1.5, 1.5);
+    out[8] = semanticNumber(p, "threadThickness", "thickness", 1, 0.25, 6);
+  }
+);
+var harmonicKnotPass = pass2("harmonic-knot")(
+  harmonic_knot_default,
+  8,
+  0.5,
+  (out, ctx) => {
+    const p = ctx.params;
+    out[0] = semanticNumber(p, "knotGain", "amount", 1, 0, 4);
+    out[1] = semanticNumber(p, "knotScale", "scale", 1, 0.1, 4);
+    out[2] = semanticNumber(p, "resonanceDetail", "detail", 1, 0.1, 4);
+    out[3] = semanticNumber(p, "tubeSpread", "spread", 1, 0.05, 4);
+    out[4] = musicalPeriodBars(p, "cameraPeriodBars", 4);
+    out[5] = semanticNumber(p, "knotCenterX", "focusX", -0.22, -1.5, 1.5);
+    out[6] = semanticNumber(p, "knotCenterY", "focusY", 0.06, -1.5, 1.5);
+    out[7] = semanticNumber(p, "tubeThickness", "thickness", 1, 0.25, 6);
+  }
+);
+var eclipseCoronaPass = pass2("eclipse-corona")(
+  eclipse_corona_default,
+  12,
+  1,
+  (out, ctx) => {
+    const p = ctx.params;
+    out[0] = semanticNumber(p, "coronaGain", "amount", 1, 0, 4);
+    out[1] = semanticNumber(p, "diskScale", "scale", 1, 0.1, 4);
+    out[2] = semanticNumber(p, "rayDensity", "density", 1, 0.1, 4);
+    out[3] = semanticNumber(p, "haloDetail", "detail", 1, 0.1, 4);
+    out[4] = musicalPeriodBars(p, "scanPeriodBars", 4);
+    out[5] = semanticNumber(p, "coronaSpread", "spread", 1, 0.05, 4);
+    out[6] = semanticNumber(p, "diskCenterX", "focusX", -0.22, -1.5, 1.5);
+    out[7] = semanticNumber(p, "diskCenterY", "focusY", 0.06, -1.5, 1.5);
+    out[8] = semanticNumber(p, "rimThickness", "thickness", 1, 0.25, 6);
+  }
+);
+var moirePortalPass = pass2("moire-portal")(
+  moire_portal_default,
+  8,
+  0.5,
+  (out, ctx) => {
+    const p = ctx.params;
+    out[0] = semanticNumber(p, "moireGain", "amount", 1, 0, 4);
+    out[1] = semanticNumber(p, "portalScale", "scale", 1, 0.1, 4);
+    out[2] = semanticNumber(p, "screenDensity", "density", 1, 0.1, 4);
+    out[3] = semanticNumber(p, "screenDetune", "detail", 1, 0.1, 4);
+    out[4] = musicalPeriodBars(p, "turnPeriodBars", 4);
+    out[5] = semanticNumber(p, "portalCenterX", "focusX", -0.22, -1.5, 1.5);
+    out[6] = semanticNumber(p, "portalCenterY", "focusY", 0.06, -1.5, 1.5);
+    out[7] = semanticNumber(p, "screenThickness", "thickness", 1, 0.25, 6);
+  }
+);
+var inkVortexPass = pass2("ink-vortex")(
+  ink_vortex_default,
+  8,
+  0.5,
+  (out, ctx) => {
+    const p = ctx.params;
+    out[0] = semanticNumber(p, "inkGain", "amount", 1, 0, 4);
+    out[1] = semanticNumber(p, "vortexScale", "scale", 1, 0.1, 4);
+    out[2] = semanticNumber(p, "filamentDensity", "density", 1, 0.1, 4);
+    out[3] = semanticNumber(p, "curlDetail", "detail", 1, 0.1, 4);
+    out[4] = musicalPeriodBars(p, "evolutionPeriodBars", 4);
+    out[5] = semanticNumber(p, "vortexCenterX", "focusX", -0.22, -1.5, 1.5);
+    out[6] = semanticNumber(p, "vortexCenterY", "focusY", 0.06, -1.5, 1.5);
+    out[7] = semanticNumber(p, "filamentThickness", "thickness", 1, 0.25, 6);
+  }
+);
+var signalGardenPass = pass2("signal-garden")(
+  signal_garden_default,
+  12,
+  0.5,
+  (out, ctx) => {
+    const p = ctx.params;
+    out[0] = semanticNumber(p, "gardenGain", "amount", 1, 0, 4);
+    out[1] = semanticNumber(p, "gardenScale", "scale", 1, 0.1, 4);
+    out[2] = semanticNumber(p, "stemDensity", "density", 1, 0.1, 4);
+    out[3] = semanticNumber(p, "branchDetail", "detail", 1, 0.1, 4);
+    out[4] = musicalPeriodBars(p, "swayPeriodBars", 4);
+    out[5] = semanticNumber(p, "swaySpread", "spread", 1, 0.05, 4);
+    out[6] = semanticNumber(p, "gardenCenterX", "focusX", -0.22, -1.5, 1.5);
+    out[7] = semanticNumber(p, "gardenCenterY", "focusY", 0.06, -1.5, 1.5);
+    out[8] = semanticNumber(p, "stemThickness", "thickness", 1, 0.25, 6);
+  }
+);
+var spectralCathedralPass = pass2("spectral-cathedral")(
+  spectral_cathedral_default,
+  8,
+  0.5,
+  (out, ctx) => {
+    const p = ctx.params;
+    out[0] = semanticNumber(p, "cathedralGain", "amount", 1, 0, 4);
+    out[1] = semanticNumber(p, "frameScale", "scale", 1, 0.1, 4);
+    out[2] = semanticNumber(p, "bayDensity", "density", 1, 0.1, 4);
+    out[3] = semanticNumber(p, "columnDetail", "detail", 1, 0.1, 4);
+    out[4] = musicalPeriodBars(p, "travelPeriodBars", 4);
+    out[5] = semanticNumber(p, "horizonCenterX", "focusX", -0.22, -1.5, 1.5);
+    out[6] = semanticNumber(p, "horizonCenterY", "focusY", 0.06, -1.5, 1.5);
+    out[7] = semanticNumber(p, "architectureThickness", "thickness", 1, 0.25, 6);
+  }
+);
+var VISUAL_V2_SOURCE_PASSES = [
+  phosphorOrbitPass,
+  quasicrystalPass,
+  magneticFluxPass,
+  spectralLoomPass,
+  harmonicKnotPass,
+  eclipseCoronaPass,
+  moirePortalPass,
+  inkVortexPass,
+  signalGardenPass,
+  spectralCathedralPass
+];
+
+// src/sources/index.ts
+var SOURCE_PASSES = [
+  // V2 authored subjects are first so the add-layer menu presents the current
+  // visual language before the compatibility library.
+  ...VISUAL_V2_SOURCE_PASSES,
+  // attractors — flows
+  lorenzPass,
+  rosslerPass,
+  thomasPass,
+  halvorsenPass,
+  // attractors — maps
+  cliffordPass,
+  dejongPass,
+  // waveform
+  scopePass,
+  ribbonPass,
+  spiralPass,
+  wavegridPass,
+  // spectrum
+  spectrumPass,
+  radialBarsPass,
+  butterflyPass,
+  stereoFieldPass,
+  // history
+  waterfallPass,
+  scopetunnelPass,
+  // geometry
+  chladniPass,
+  // procedural audio fields
+  particlesPass,
+  lissajousPass,
+  reactionPass,
+  voronoiPass,
+  flowfieldPass,
+  heightmeshPass,
+  hypercylinderPass,
+  gridtunnelPass,
+  dometunnelPass,
+  pylonsPass
+];
+
+// src/shaders/op-dither.wgsl
+var op_dither_default = "// The `dither` operator \u2014 quantise the accumulated frame through an ordered\r\n// threshold pattern.\r\n//\r\n// Independently authored from standard ordered-dither concepts. Bayer uses a\r\n// bit-interleaved threshold; the clustered screen below uses crossed cosine\r\n// fields rather than copied/reference-project coordinate or distance code.\r\n//\r\n// Why an OPERATOR and not a source: dithering is multiplicative. It transforms\r\n// whatever came before it, so one pass gives a dithered version of all 17\r\n// sources (plan \xA77 \u2014 sources add, operators multiply).\r\n//\r\n// Three patterns, and the differences are not cosmetic:\r\n//\r\n//   BAYER      an ordered 4x4 matrix. Even, neutral, no visible structure of\r\n//              its own. The default, and the right one under motion because a\r\n//              fixed threshold grid does not crawl.\r\n//   HALFTONE   crossed diagonal cosine carriers cluster lit cells into dots\r\n//              that grow with brightness. Print-like and deterministic.\r\n//   NOISE      a hashed per-cell threshold. Grain rather than pattern. Seeded\r\n//              from the layer, never from a clock, so a show replays identically\r\n//              (\xA74.7) \u2014 an unseeded noise dither is the fastest way to break the\r\n//              golden harness.\r\n//\r\n// Deliberately NOT here: Floyd-Steinberg. Error diffusion is inherently serial\r\n// \u2014 each pixel's error feeds its neighbour \u2014 so it cannot be done in a fragment\r\n// shader without a multi-pass scan, and a fake version that samples neighbours\r\n// is just a blurry ordered dither wearing its name.\r\n//\r\n// ---------------------------------------------------------------------------\r\n// BINDINGS ARE NOT DECLARED HERE. `ops/dither.ts` prepends PASS_COMMON_WGSL,\r\n// passBindingsWGSL (supplying `src` and `samp`) and the `Dither` uniform.\r\n// ---------------------------------------------------------------------------\r\n\r\nconst TAU : f32 = 6.28318530718;\r\n\r\n/**\r\n * Ordered 4x4 Bayer threshold, normalised to (0,1).\r\n *\r\n * Written as arithmetic on the index rather than a matrix constant: the classic\r\n * matrix is the bit-reversed interleave of x and y, and expressing it that way\r\n * means the 8x8 variant is one more term rather than sixteen more numbers.\r\n */\r\nfn bayer4(p : vec2<i32>) -> f32 {\r\n  let x = u32(p.x) & 3u;\r\n  let y = u32(p.y) & 3u;\r\n  // Bit-reverse-interleave: the standard recursive Bayer construction.\r\n  var v = 0u;\r\n  v = v | (((y >> 1u) & 1u) << 0u);\r\n  v = v | (((x >> 1u) & 1u) << 1u);\r\n  v = v | ((y & 1u) << 2u);\r\n  v = v | ((x & 1u) << 3u);\r\n  return (f32(v) + 0.5) / 16.0;\r\n}\r\n\r\n/** Clustered-dot screen from two independent diagonal cosine carriers. */\r\nfn halftone(cell : vec2<f32>) -> f32 {\r\n  let a = 0.5 + 0.5 * cos(TAU * (cell.x + cell.y));\r\n  let b = 0.5 + 0.5 * cos(TAU * (cell.x - cell.y));\r\n  return clamp(1.0 - a * b, 0.0, 1.0);\r\n}\r\n\r\nfn hash21(p : vec2<f32>) -> f32 {\r\n  var p3 = fract(vec3<f32>(p.xyx) * 0.1031);\r\n  p3 = p3 + dot(p3, p3.yzx + 33.33);\r\n  return fract((p3.x + p3.y) * p3.z);\r\n}\r\n\r\n@vertex\r\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\r\n  return fullscreenTriangle(vi);\r\n}\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let uv = fragUV(frag);\r\n  let plain = textureSampleLevel(src, samp, uv, 0.0);\r\n\r\n  // A true no-op at zero, and a CROSSFADE rather than a fade to black, so the\r\n  // operator can be dialled in without darkening the frame.\r\n  if (D.amount < 0.001) { return plain * C.opacity; }\r\n\r\n  // Quantise position FIRST. Dithering a full-resolution image just makes\r\n  // per-pixel noise; the pattern only reads once several output pixels share a\r\n  // source sample. This is the step that makes it look like a screen.\r\n  let px = max(D.cellPx, 1.0);\r\n  let cell = floor(frag.xy / px);\r\n  let snapUv = (cell + 0.5) * px / C.resolution;\r\n  var col = textureSampleLevel(src, samp, snapUv, 0.0).rgb;\r\n\r\n  // Tone-map before quantising, not after. The accumulator is HDR and a\r\n  // threshold test against an unbounded value is meaningless \u2014 everything above\r\n  // 1.0 quantises to \"on\" regardless of pattern, and the dither disappears\r\n  // exactly where the image is most interesting.\r\n  col = col / (1.0 + col);\r\n\r\n  var t : f32;\r\n  if (D.pattern < 0.5) {\r\n    t = bayer4(vec2<i32>(cell));\r\n  } else if (D.pattern < 1.5) {\r\n    t = halftone(cell * D.screenScale);\r\n  } else {\r\n    // Seeded from the LAYER, not from time. A per-frame reseed would crawl and\r\n    // would break byte-identical replay (\xA74.7).\r\n    t = hash21(cell + vec2<f32>(C.seed * 0.017, C.seed * 0.031));\r\n  }\r\n\r\n  // Bias the threshold so `levels` steps land evenly, then quantise per channel.\r\n  // Monochrome collapses to luminance first \u2014 the two look very different and\r\n  // both are wanted, so it is a parameter rather than a decision made here.\r\n  let steps = max(D.levels, 2.0);\r\n  var q : vec3<f32>;\r\n  if (D.mono > 0.5) {\r\n    let lum = dot(col, vec3<f32>(0.2126, 0.7152, 0.0722));\r\n    let v = floor(lum * (steps - 1.0) + t) / (steps - 1.0);\r\n    q = vec3<f32>(clamp(v, 0.0, 1.0));\r\n  } else {\r\n    q = clamp(floor(col * (steps - 1.0) + t) / (steps - 1.0), vec3<f32>(0.0), vec3<f32>(1.0));\r\n  }\r\n\r\n  // Back out of the tone map so the result composites in the same space it\r\n  // arrived in. Quantised values at 1.0 would otherwise divide by zero.\r\n  let safe = min(q, vec3<f32>(0.999));\r\n  var outCol = safe / (1.0 - safe);\r\n\r\n  // Tint toward the layer's palette slot. The frame arrives in whatever colours\r\n  // its sources used; a dither that ignores the palette is a dither that fights\r\n  // it (art-direction \xA72.5, layers reference slots rather than hardcoding).\r\n  outCol = mix(outCol, C.color.rgb * (safe.r + safe.g + safe.b) * 0.5, clamp(D.tint, 0.0, 1.0));\r\n\r\n  return vec4<f32>(mix(plain.rgb, outCol, D.amount), plain.a) * C.opacity;\r\n}\r\n";
+
+// src/ops/dither.ts
+var F_AMOUNT = 0;
+var F_PATTERN = 1;
+var F_CELL_PX = 2;
+var F_LEVELS = 3;
+var F_MONO = 4;
+var F_TINT = 5;
+var F_SCREEN_SCALE = 6;
+var F_PAD = 7;
+var DITHER_FLOATS = 8;
+var PATTERNS = ["bayer", "halftone", "noise"];
+var DITHER_DECL = `
+struct Dither {
+  amount      : f32,
+  pattern     : f32,
+  cellPx      : f32,
+  levels      : f32,
+  mono        : f32,
+  tint        : f32,
+  screenScale : f32,
+  pad         : f32,
+};
+@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> D : Dither;
+`;
+function num20(p, k, d) {
+  const v = p[k];
+  return typeof v === "number" && Number.isFinite(v) ? v : d;
+}
+function clamp9(v, lo, hi) {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+var SHAPE7 = {
+  type: "dither",
+  family: "operator",
+  /** The accumulated frame. This operator draws nothing of its own. */
+  input: "accumulator",
+  uniformFloats: DITHER_FLOATS,
+  code: ""
+};
+var DITHER_DEFAULTS = {
+  amount: 1,
+  pattern: "bayer",
+  cellPx: 3,
+  levels: 4,
+  mono: false,
+  tint: 0,
+  screenScale: 0.5
+};
+var ditherPass = {
+  ...SHAPE7,
+  code: [
+    PASS_COMMON_WGSL,
+    passBindingsWGSL(SHAPE7),
+    DITHER_DECL,
+    op_dither_default
+  ].join("\n"),
+  /**
+   * Full resolution, and this one genuinely needs it.
+   *
+   * The pass already quantises position itself through `cellPx`, so running the
+   * PASS at half resolution would dither a blurred copy and then be upsampled —
+   * two resamplings fighting, and the pattern that is the entire point comes
+   * back soft. If it needs to be cheaper, raise `cellPx`; that costs nothing
+   * and is what the parameter is for.
+   */
+  defaultResolutionScale: 1,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[F_AMOUNT] = clamp9(num20(p, "amount", DITHER_DEFAULTS.amount), 0, 1) * ctx.progress;
+    const pat = String(p["pattern"] ?? DITHER_DEFAULTS.pattern);
+    const pi = PATTERNS.indexOf(pat);
+    out[F_PATTERN] = pi < 0 ? 0 : pi;
+    out[F_CELL_PX] = Math.max(1, num20(p, "cellPx", DITHER_DEFAULTS.cellPx));
+    out[F_LEVELS] = Math.max(2, Math.round(num20(p, "levels", DITHER_DEFAULTS.levels)));
+    out[F_MONO] = p["mono"] === true ? 1 : 0;
+    out[F_TINT] = clamp9(num20(p, "tint", DITHER_DEFAULTS.tint), 0, 1);
+    out[F_SCREEN_SCALE] = Math.max(0.05, num20(p, "screenScale", DITHER_DEFAULTS.screenScale));
+    out[F_PAD] = 0;
+  }
+};
+
+// src/shaders/op-feedback.wgsl
+var op_feedback_default = "// The feedback operator \u2014 zoom, rotate, offset and decay of a layer's own\n// previous output.\n//\n// This is the mechanism behind AVS's liquid depth (plan \xA72): a warp applied to\n// the ACCUMULATED frame, recursively, forever. One pass; the recursion is the\n// ping-pong the renderer hands us in `hist`.\n//\n// What this shader deliberately does NOT do:\n//   - It does not composite itself onto the accumulator. `planStack` emits a\n//     separate entry for that, which is what lets a feedback layer carry any\n//     blend mode at all (layers.ts \xA7\"Pass and target allocation\").\n//   - It does not decide its own rates. Every number in `FeedbackParams`\n//     arrives already converted from BEATS at the live tempo by\n//     `ops/feedback.ts`. There is no `time * 0.37` here and there must never be\n//     (art direction \xA73.1).\n//   - It does not multiply the retained history by `C.opacity`, and that is the\n//     one place it knowingly departs from `PASS_COMMON_WGSL`'s house rule. See\n//     the note above `inject` below \u2014 it matters, and it compounds.\n\n// Byte-for-byte with `writeUniforms` in ops/feedback.ts. No vec3, ever:\n//   0  keep   4  inject   8  zoom   12 rot\n//   16 offset.xy          24 centre.xy\n//   32 knee   36 ceiling  40 edge   44 aspect      -> size 48\nstruct FeedbackParams {\n  /** exp(-dtBeats / tauBeats). 1.0 when the transport is paused, so a trail holds. */\n  keep    : f32,\n  /**\n   * How much of the frame beneath enters the trail THIS frame, opacity applied.\n   *\n   * Already scaled by (1 - keep) on the CPU, which is what makes the steady\n   * state independent of frame rate. An accumulator with retention k reaches\n   * B/(1-k); at 165 fps and a short tau that multiplier is ~36x, and a\n   * per-frame contribution tuned as if each frame stood alone whites the frame\n   * out in about a second. It has already happened once here.\n   */\n  inject  : f32,\n  /** Magnification of the previous frame per FRAME. 1.0 is pure fade, no motion. */\n  zoom    : f32,\n  /** Radians of rotation per frame. Derived from turns per BAR. */\n  rot     : f32,\n  /** Translation per frame, in aspect-corrected half-widths. */\n  offset  : vec2<f32>,\n  /** Warp origin in uv. Feedback is art direction \xA74.1's deliberate exception: a centre IS the mechanism. */\n  centre  : vec2<f32>,\n  /** Soft clip starts here. Below it the transfer curve is exactly identity. */\n  knee    : f32,\n  /** Asymptote of the soft clip. Loud passages roll off towards it, never flat-top onto it. */\n  ceiling : f32,\n  /** Border fade width in uv. Stops a clamped edge texel smearing into a streak. */\n  edge    : f32,\n  aspect  : f32,\n};\n\n@group(PASS_GROUP_PLACEHOLDER) @binding(PASS_PARAMS_PLACEHOLDER) var<uniform> P : FeedbackParams;\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  return fullscreenTriangle(vi);\n}\n\n/**\n * Fade towards the border instead of relying on clamp-to-edge.\n *\n * The sampler clamps, so a warp that reads outside [0,1] returns the edge texel\n * \u2014 and a feedback loop re-reading its own edge texel every frame stretches it\n * into a hard radial streak within a second or two. Fading to nothing instead\n * means material that leaves the frame simply leaves.\n *\n * `smoothstep` is undefined when edge0 >= edge1 (Pulse learned that one twice),\n * so `edge` is clamped away from zero on the CPU and again here.\n */\nfn borderMask(uv : vec2<f32>) -> f32 {\n  let e = max(P.edge, 1.0e-4);\n  let d = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));\n  return smoothstep(0.0, e, d);\n}\n\n/**\n * Soft clip, applied to the PEAK channel so hue survives.\n *\n * Clipping per channel drags anything loud towards white, which is both a hue a\n * third layer did not ask for (art direction \xA72.2 \u2014 three hues, maximum) and a\n * flat-topped highlight that reads as broken rather than bright. Scaling the\n * whole triple by one factor keeps the ratio between channels exactly.\n *\n * The curve is knee + head * (1 - exp(-over/head)): value and first derivative\n * are both continuous at the knee, so there is no visible crease where the roll\n * off begins, and it approaches `ceiling` without ever reaching it.\n */\nfn softClip(c : vec3<f32>) -> vec3<f32> {\n  let peak = max(max(c.r, c.g), c.b);\n  if (peak <= P.knee) { return c; }\n  let head = max(P.ceiling - P.knee, 1.0e-4);\n  let rolled = P.knee + head * (1.0 - exp(-(peak - P.knee) / head));\n  return c * (rolled / max(peak, 1.0e-6));\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let uv = fragUV(frag);\n  let stretch = vec2<f32>(P.aspect, 1.0);\n\n  // The INVERSE warp. The image is to appear zoomed by `zoom` and rotated by\n  // `rot`, so this fragment reads the history at the position that material has\n  // just moved FROM \u2014 divide by the zoom, rotate the other way.\n  //\n  // All of it in aspect-corrected space, or a rotation shears and a zoom turns\n  // circles into ellipses on a non-square canvas.\n  var q = (uv - P.centre) * stretch;\n  let cs = cos(P.rot);\n  let sn = sin(P.rot);\n  q = vec2<f32>(q.x * cs + q.y * sn, -q.x * sn + q.y * cs);\n  q = q / max(P.zoom, 1.0e-4);\n  q = q - P.offset;\n  let huv = q / stretch + P.centre;\n\n  // One bilinear tap. This is the line plan \xA72 is talking about when it lists\n  // \"bilinear feedback, sub-pixel stable\" as a way we beat AVS: AVS resampled\n  // its feedback nearest-neighbour, so any drift below half a texel per frame\n  // quantised to no motion at all and the image locked to the pixel grid in\n  // visible steps. A filtered tap moves by fractions of a texel, which is what\n  // makes a slow zoom read as continuous rather than as a stack of jumps.\n  let h = textureSampleLevel(hist, samp, huv, 0.0);\n\n  // Retention is NOT multiplied by C.opacity, deliberately. Opacity is folded\n  // into `inject` on the CPU instead. Applying it here too would multiply the\n  // trail by opacity once per frame \u2014 opacity^n after n frames \u2014 so any value\n  // below 1 would erase the trail entirely within a second while looking, for\n  // the first few frames, like it was merely dimmer.\n  var acc = h * (P.keep * borderMask(huv));\n\n  // The frame beneath, entering the trail. `src` is the accumulator; a feedback\n  // layer at the bottom of the stack gets a cleared one, which is correct.\n  acc = acc + textureSampleLevel(src, samp, uv, 0.0) * P.inject;\n\n  return vec4<f32>(softClip(acc.rgb), min(acc.a, 1.0));\n}\n";
+
+// src/ops/feedback.ts
+var UNIFORM_FLOATS7 = 12;
+var U_KEEP = 0;
+var U_INJECT = 1;
+var U_ZOOM = 2;
+var U_ROT = 3;
+var U_OFFSET = 4;
+var U_CENTRE = 6;
+var U_KNEE = 8;
+var U_CEILING = 9;
+var U_EDGE = 10;
+var U_ASPECT = 11;
+var TWO_PI = Math.PI * 2;
+var ZOOM_SAFETY = 0.94;
+var MAX_DT_BEATS5 = 0.5;
+function num21(params, key, fallback, lo, hi) {
+  const raw = params[key];
+  const v = typeof raw === "number" && Number.isFinite(raw) ? raw : fallback;
+  return v < lo ? lo : v > hi ? hi : v;
+}
+var SHAPE8 = {
+  type: "feedback",
+  family: "feedback",
+  /** The frame beneath, so a trail can capture what it is trailing. */
+  input: "accumulator",
+  /** The layer's own previous output. The recursion. */
+  history: true,
+  uniformFloats: UNIFORM_FLOATS7,
+  code: ""
+};
+function bindParams(source3) {
+  let out = source3;
+  for (const [token, value] of [
+    ["PASS_GROUP_PLACEHOLDER", String(PASS_GROUP)],
+    ["PASS_PARAMS_PLACEHOLDER", String(PASS_BINDING.params)]
+  ]) {
+    if (!out.includes(token)) {
+      throw new Error(
+        `op-feedback.wgsl no longer contains '${token}'. Its uniform block must be declared \`@group(PASS_GROUP_PLACEHOLDER) @binding(PASS_PARAMS_PLACEHOLDER)\`, never with literal binding numbers \u2014 renderer.ts owns the layout.`
+      );
+    }
+    out = out.replace(token, value);
+  }
+  return out;
+}
+var feedbackPass = {
+  ...SHAPE8,
+  code: `${PASS_COMMON_WGSL}
+${passBindingsWGSL(SHAPE8)}
+${bindParams(op_feedback_default)}`,
+  /**
+   * Half res by default. A trail is soft, low-frequency and already blurred by
+   * its own bilinear resampling, so it is the single best candidate in the whole
+   * stack for §4.11's "default new layers to ½ and promote deliberately" — and
+   * the pair of history targets it owns is 30 MB at 2560×1440, which halving
+   * turns into 7.5.
+   */
+  defaultResolutionScale: 0.5,
+  /**
+   * Convert this frame's musical rates into the shader's per-frame ones.
+   *
+   * Everything that could be per-frame is derived from `dtBeats`, never from
+   * `dtSeconds` directly and never from a frame count. `dtBeats` already carries
+   * the live tempo, so a tempo change mid-track needs no recalculation anywhere
+   * (plan §4.10) and a fixed-timestep golden run reproduces exactly (§4.7).
+   *
+   * When the transport is paused `dtBeats` is 0, and every derived value
+   * collapses to identity: keep = 1, inject = 0, zoom = 1, rot = 0. The trail
+   * holds untouched, which is precisely what §4.10 specifies for pause, and it
+   * falls out of the arithmetic rather than needing a branch.
+   */
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    const dtRaw = Number.isFinite(ctx.dtBeats) ? ctx.dtBeats : 0;
+    const dtBeats = dtRaw <= 0 ? 0 : Math.min(dtRaw, MAX_DT_BEATS5);
+    const tauBeats = num21(p, "tauBeats", 1.5, 0.05, 64);
+    const keep = Math.exp(-dtBeats / tauBeats);
+    const gain = num21(p, "gain", 0.85, 0, 4);
+    const inject = gain * (1 - keep) * ctx.opacity;
+    const zoomLimit = Math.exp(ZOOM_SAFETY / (2 * tauBeats));
+    const zoomBeat = Math.min(num21(p, "zoomPerBeat", 1, 0.25, 4), zoomLimit);
+    const zoom = dtBeats === 0 ? 1 : Math.pow(zoomBeat, dtBeats);
+    const barFraction = dtBeats / 4;
+    const rot = num21(p, "rotTurnsPerBar", 0, -4, 4) * TWO_PI * barFraction;
+    const driftX = num21(p, "driftX", 0, -2, 2) * barFraction;
+    const driftY = num21(p, "driftY", 0, -2, 2) * barFraction;
+    const knee = num21(p, "clipKnee", 0.8, 0, 4);
+    const ceiling = Math.max(num21(p, "clipCeiling", 1.3, 0, 8), knee + 0.05);
+    out[U_KEEP] = keep;
+    out[U_INJECT] = inject;
+    out[U_ZOOM] = zoom;
+    out[U_ROT] = rot;
+    out[U_OFFSET] = driftX;
+    out[U_OFFSET + 1] = driftY;
+    out[U_CENTRE] = num21(p, "centreX", 0.5, -1, 2);
+    out[U_CENTRE + 1] = num21(p, "centreY", 0.5, -1, 2);
+    out[U_KNEE] = knee;
+    out[U_CEILING] = ceiling;
+    out[U_EDGE] = num21(p, "edgeFade", 0.03, 2e-3, 0.5);
+    out[U_ASPECT] = ctx.aspect;
+  }
+};
+
+// src/shaders/kaleido.wgsl
+var kaleido_default = '// Kaleidoscope \u2014 the one operator in the vertical slice.\n//\n// Operators are MULTIPLICATIVE (plan \xA77): eight sources times five operators is\n// forty looks. This one is ~15 lines of real work and transforms literally\n// every source, which is why operators are built before sources.\n//\n// Note the deliberate exception in art-direction \xA74.1: nothing else in the\n// project radiates from the centre, because that reads as a cheap "pulse from\n// the middle". A kaleidoscope\'s entire point IS a centre \u2014 which is exactly why\n// it should not be applied to everything.\n//\n// ---------------------------------------------------------------------------\n// BINDINGS ARE NOT DECLARED HERE.\n//\n// `ops/kaleido.ts` prepends `PASS_COMMON_WGSL` (struct Common as `C`,\n// `fullscreenTriangle`, `fragUV`) and `passBindingsWGSL`, which supply `src` and\n// `samp`, and appends the `var<uniform> K : Kal` declaration at\n// `PASS_BINDING.params`. No binding number is typed in this file; renderer.ts\n// owns the layout and a hand-written number is how a shader ends up one binding\n// out of step, which validates cleanly and samples the wrong texture.\n//\n// The aspect ratio comes from `C.aspect` \u2014 the renderer already knows the\n// attachment size, and a param copy of it is a second value that can disagree\n// with the attachment actually being written when a resolution scale changes.\n// ---------------------------------------------------------------------------\n\nstruct Kal {\n  segments : f32,   // 0 = bypass\n  rotate   : f32,   // radians\n  mix      : f32,   // 0..1 blend against the untransformed source\n  pad      : f32,\n};\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  return fullscreenTriangle(vi);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let uv = fragUV(frag);\n  let plain = textureSampleLevel(src, samp, uv, 0.0);\n\n  if (K.segments < 1.5) { return plain * C.opacity; }\n\n  // Work in aspect-corrected polar space, or the wedges are sheared.\n  var p = (uv - 0.5) * vec2<f32>(C.aspect, 1.0);\n  let r = length(p);\n  var a = atan2(p.y, p.x) + K.rotate;\n\n  // Fold the angle into one wedge, then mirror alternate wedges so the seams\n  // meet instead of hard-cutting. The mirror is what makes it read as a\n  // kaleidoscope rather than a pie chart.\n  let wedge = 6.2831853 / K.segments;\n  a = a - floor(a / wedge) * wedge;\n  a = abs(a - wedge * 0.5);\n\n  var q = vec2<f32>(cos(a), sin(a)) * r;\n  q = q / vec2<f32>(C.aspect, 1.0) + 0.5;\n\n  // Outside the source, fold back rather than clamping \u2014 clamping smears the\n  // edge texel into a visible streak.\n  q = abs(fract(q * 0.5) * 2.0 - 1.0);\n\n  let folded = textureSampleLevel(src, samp, q, 0.0);\n  return mix(plain, folded, K.mix) * C.opacity;\n}\n';
+
+// src/ops/kaleido.ts
+var KAL_FLOATS = 4;
+var U_SEGMENTS = 0;
+var U_ROTATE = 1;
+var U_MIX = 2;
+var TAU9 = Math.PI * 2;
+var MAX_SEGMENTS3 = 64;
+var KALEIDO_DEFAULTS = {
+  /** Wedges. Below 2 the pass is a bypass, which is a legitimate state and is how the `1` key worked. */
+  segments: 6,
+  /**
+   * Bars per full revolution of the fold. Bars, not seconds — a rotation locked
+   * to the bar phrases with the music instead of ticking against it
+   * (art-direction §3.3). 64 reproduces the slice, where the shared spin angle
+   * (a revolution every 16 bars) was scaled by 0.25 on its way into this pass.
+   */
+  rotBars: 64,
+  /** 0..1 against the untransformed frame. Below ~0.5 the fold reads as a texture rather than a structure. */
+  mix: 0.7
+};
+function num22(params, key, lo, hi) {
+  const fallback = KALEIDO_DEFAULTS[key];
+  const raw = params[key] ?? fallback;
+  const v = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(v)) return typeof fallback === "number" ? fallback : lo;
+  return v < lo ? lo : v > hi ? hi : v;
+}
+function fract14(v) {
+  return v - Math.floor(v);
+}
+var SHAPE9 = {
+  /** Matches `LayerSpec.type` in the default preset. Not `'kaleido'`. */
+  type: "kaleidoscope",
+  family: "operator",
+  input: "accumulator",
+  uniformFloats: KAL_FLOATS
+};
+var PARAMS_DECL = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> K : Kal;`;
+var kaleidoPass = {
+  ...SHAPE9,
+  code: [
+    PASS_COMMON_WGSL,
+    passBindingsWGSL({ ...SHAPE9, code: "" }),
+    kaleido_default,
+    PARAMS_DECL
+  ].join("\n"),
+  /**
+   * Full resolution by default.
+   *
+   * A fold multiplies spatial frequency the same way tiling does — N wedges of
+   * the source packed into the same frame — so it is a poor candidate for
+   * §4.11's half-res path, and the aliasing it produces is radial, which is the
+   * kind the eye is best at seeing. Advisory only; a preset that needs the
+   * bandwidth back can still ask for it.
+   */
+  defaultResolutionScale: 1,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[U_SEGMENTS] = Math.floor(num22(p, "segments", 0, MAX_SEGMENTS3));
+    out[U_ROTATE] = fract14(ctx.bars / Math.max(num22(p, "rotBars", 1e-3, 4096), 1e-3)) * TAU9;
+    out[U_MIX] = num22(p, "mix", 0, 1);
+  }
+};
+
+// src/shaders/op-mirror.wgsl
+var op_mirror_default = '// Mirror \u2014 2/4/6/8-fold reflection of the accumulated frame about arbitrary\n// axes, plus a plain horizontal and vertical mode.\n//\n// Plan \xA77 pairs this with the kaleidoscope, and art direction \xA71.1 explicitly\n// allows a mirror in the Lab look where a kaleidoscope is "wrong". They are not\n// the same operator and this file is not a subset of `kaleido.wgsl`:\n//\n//   - A KALEIDOSCOPE folds the frame into one wedge and replicates that wedge\n//     everywhere. Whatever happens to be in the wedge becomes the entire image.\n//   - A MIRROR reflects. `folds` reflection lines through the origin generate a\n//     fundamental domain of 2*pi/folds, and the content of that domain keeps its\n//     own orientation on the side it came from. Half the frame is untouched.\n//\n// The practical difference is that a mirror is legible at 2-fold \u2014 one axis,\n// left half over right \u2014 which is a composition tool rather than an effect, and\n// which a kaleidoscope cannot express at all.\n//\n// What it deliberately does NOT do: draw, tint, tile, or rotate content that it\n// did not reflect. Rotation-plus-repeat is `tile`, and folding to a wedge is the\n// kaleidoscope; keeping them apart is what stops all three converging into one\n// unreadable parameter soup.\n//\n// Sampling, and the reason this file is longer than the maths:\n//\n//   - Every fetch is textureSampleGrad with derivatives taken from the\n//     coordinate BEFORE the fold. A reflection preserves the magnitude of the\n//     footprint and only flips its sign, so one output pixel is still one source\n//     texel \u2014 but the implicit derivative is computed from the folded value,\n//     which flips sign across the axis. A quad straddling the fold reports an\n//     enormous derivative, the hardware picks the smallest mip, and a blurred\n//     line is drawn down the mirror line. This bit Pulse and is documented in\n//     its wiki. Explicit gradients cost two constants.\n//   - The fold itself uses a rounded `abs`. A raw `abs` puts a\n//     derivative-discontinuity exactly on a pixel row, which is an aliased\n//     hairline by another name, and art direction bans those. `softAbs` rounds\n//     the crease over `softenPx` pixels and is exact everywhere else.\n\n// `struct Mirror` and the `M` binding are prepended by `src/ops/mirror.ts`,\n// which is also where the matching `writeUniforms` lives. They are declared\n// together there on purpose: a uniform struct and the code that packs it are one\n// thing with two halves, and the halves drift apart the moment they live in two\n// files.\n\nconst PI : f32 = 3.141592653589793;\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  return fullscreenTriangle(vi);\n}\n\n/** |x| with the corner rounded over `e`. Exact for |x| >> e, and C1 at zero. */\nfn softAbs(x : f32, e : f32) -> f32 {\n  return sqrt(x * x + e * e) - e;\n}\n\n/**\n * Reflect `x` into `[0, period]`, both creases rounded over `e`.\n *\n * Identity on `[0, period]` to within O(e^2), so a coordinate that never leaves\n * its domain is untouched \u2014 which matters, because the whole claim of this\n * operator is that half the frame passes through unmodified.\n *\n * Used twice: once on the angle to build the N-fold group, and once on the final\n * uv so that content pulled from outside the frame reflects back in rather than\n * clamping. Clamp-to-edge on an out-of-range fetch smears the border texel into\n * a radial streak, which reads as a bug.\n */\nfn mirrorFold(x : f32, period : f32, e : f32) -> f32 {\n  let p2 = 2.0 * period;\n  let t = x - floor(x / p2) * p2 - period;\n  return softAbs(softAbs(t, e) - period, e);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let uv = fragUV(frag);\n  let plain = textureSampleLevel(src, samp, uv, 0.0);\n\n  // Texel widths from the SOURCE (the accumulator, possibly a different size\n  // from this attachment when the layer renders scaled); screen-space steps from\n  // `C.resolution`.\n  let sdim = vec2<f32>(textureDimensions(src));\n  let bx = 1.0 / sdim.x;\n  let by = 1.0 / sdim.y;\n\n  let soften = max(M.softenPx, 0.0);\n  let ex = soften / C.resolution.x;\n  let ey = soften / C.resolution.y;\n\n  // One output pixel is one source texel, in both directions, regardless of how\n  // the coordinate is folded afterwards. See the header.\n  let ddx = vec2<f32>(1.0 / C.resolution.x, 0.0);\n  let ddy = vec2<f32>(0.0, 1.0 / C.resolution.y);\n\n  var q = uv;\n\n  if (M.mode < 0.5) {\n    // ---- N-fold about an origin -------------------------------------------\n    // `axes` reflection lines spaced pi/axes apart generate a dihedral group\n    // whose fundamental domain is pi/axes wide, i.e. 2*pi/folds. Folding the\n    // angle into that domain IS applying those reflections; doing it in one\n    // `mirrorFold` rather than a loop is the same map with no branches.\n    //\n    // Aspect-corrected, or the axes are not perpendicular where they should be\n    // and a 4-fold mirror comes out skewed.\n    let origin = vec2<f32>(M.posX, M.posY);\n    let asp = vec2<f32>(C.aspect, 1.0);\n    let p = (uv - origin) * asp;\n    let r = length(p);\n    let w = PI / max(M.axes, 1.0);\n    let a = atan2(p.y, p.x) - M.angle;\n\n    // `soften` is in pixels and the fold is in radians, so convert at this\n    // radius: one aspect-corrected unit spans `C.resolution.y` pixels. Near the\n    // origin this widens without bound, which is correct \u2014 that is exactly where\n    // the creases converge and where an unrounded fold aliases worst.\n    let eA = soften / max(r * C.resolution.y, 1.0e-4);\n    let a2 = mirrorFold(a, w, eA) + M.angle;\n\n    q = (vec2<f32>(cos(a2), sin(a2)) * r) / asp + origin;\n  } else if (M.mode < 1.5) {\n    // ---- horizontal: reflect across a VERTICAL line, left-right symmetry ---\n    // `flip` chooses which half survives. Default (-1) keeps the left half: for\n    // uv.x < posX the map is the identity, and beyond it the coordinate walks\n    // back the way it came.\n    let s = select(-1.0, 1.0, M.flip > 0.5);\n    q.x = M.posX + s * softAbs(uv.x - M.posX, ex);\n  } else {\n    // ---- vertical: reflect across a HORIZONTAL line, top-bottom symmetry ---\n    let s = select(-1.0, 1.0, M.flip > 0.5);\n    q.y = M.posY + s * softAbs(uv.y - M.posY, ey);\n  }\n\n  // Fold anything that left the frame back inside. Identity to O(texel^2) for\n  // coordinates that never did, so the untouched half stays untouched.\n  q = vec2<f32>(mirrorFold(q.x, 1.0, bx), mirrorFold(q.y, 1.0, by));\n\n  let mapped = textureSampleGrad(src, samp, q, ddx, ddy);\n\n  // Opacity as a CROSSFADE against the untouched frame, not as a multiplier \u2014\n  // see the same note in `op-polar.wgsl`. At opacity 0 this returns `plain`\n  // exactly, which is what makes a mirror at progress 0 a true no-op rather than\n  // a cheap one (Phase 5 DoD).\n  return mix(plain, mapped, clamp(C.opacity, 0.0, 1.0));\n}\n';
+
+// src/ops/mirror.ts
+var MIRROR_DECL = (
+  /* wgsl */
+  `
+struct Mirror {
+  mode     : f32,   // < 0.5 = N-fold, < 1.5 = horizontal, else vertical
+  axes     : f32,   // reflection lines through the origin = folds / 2
+  angle    : f32,   // radians, already wrapped into one fold period
+  posX     : f32,   // origin / mirror line in uv
+  posY     : f32,
+  flip     : f32,   // > 0.5 keeps the far side instead of the near one
+  softenPx : f32,   // crease rounding width, in pixels
+  _pad0    : f32,
+};
+
+@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> M : Mirror;
+`
+);
+var MIRROR_FLOATS = 8;
+var U_MODE = 0;
+var U_AXES = 1;
+var U_ANGLE = 2;
+var U_POS_X = 3;
+var U_POS_Y = 4;
+var U_FLIP = 5;
+var U_SOFTEN_PX = 6;
+var TAU10 = Math.PI * 2;
+var MAX_FOLDS = 16;
+var MIRROR_DEFAULTS = {
+  /** `'horizontal'` | `'vertical'` | `'fold'`. The first two ignore `folds` and `angle`. */
+  mode: "horizontal",
+  /**
+   * Reflection count for `'fold'`. Even values are the ones that close: 2, 4, 6,
+   * 8. An odd count is rounded up rather than rejected, because a preset from a
+   * URL hash should cost the layer its exact look and not the frame.
+   */
+  folds: 6,
+  /** Mirror line / origin, in uv. */
+  posX: 0.5,
+  posY: 0.5,
+  /** Static rotation of the axes, in TURNS. `'fold'` only. */
+  offsetTurns: 0,
+  /**
+   * Rotation of the axes, in turns per BAR. Bars rather than beats because a
+   * rotation at bar rate phrases with the music instead of ticking with it
+   * (art direction §3.3). `'fold'` only.
+   */
+  spinTurnsPerBar: 0,
+  /** Which half survives. False keeps the near side (left / top); true keeps the far one. */
+  flip: false,
+  /**
+   * Crease rounding, in pixels. A raw `abs` puts a derivative discontinuity
+   * exactly on a pixel row, which is an aliased hairline by another name and
+   * which art direction bans. Below ~0.5 the rounding is narrower than the
+   * pixel it is meant to cover and stops doing anything.
+   */
+  softenPx: 1
+};
+function num23(params, key, lo, hi) {
+  const fallback = MIRROR_DEFAULTS[key];
+  const raw = params[key] ?? fallback;
+  const v = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(v)) return typeof fallback === "number" ? fallback : lo;
+  return Math.min(hi, Math.max(lo, v));
+}
+function flag(params, key) {
+  const raw = params[key];
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw === "number") return raw > 0.5;
+  if (typeof raw === "string") return raw === "true" || raw === "1";
+  return false;
+}
+function modeOf(params) {
+  const raw = params["mode"];
+  if (raw === "fold") return 0;
+  if (raw === "vertical") return 2;
+  return 1;
+}
+function fract15(v) {
+  return v - Math.floor(v);
+}
+var SHAPE10 = {
+  type: "mirror",
+  family: "operator",
+  /** The accumulated frame. This operator draws nothing of its own. */
+  input: "accumulator",
+  uniformFloats: MIRROR_FLOATS,
+  code: ""
+};
+var mirrorPass = {
+  ...SHAPE10,
+  code: [
+    PASS_COMMON_WGSL,
+    passBindingsWGSL(SHAPE10),
+    MIRROR_DECL,
+    op_mirror_default
+  ].join("\n"),
+  /**
+   * Full resolution, and for a blunter reason than most.
+   *
+   * A reflection is a one-to-one map: one output pixel is one source texel, so
+   * there is no resampling softness to hide a half-res pass behind. Running this
+   * at 0.5 does not buy a cheaper mirror, it buys a blurred copy of the frame
+   * that happens to be symmetric, and §4.11's trade is not worth making for a
+   * pass that is two texture fetches wide. Advisory only.
+   */
+  defaultResolutionScale: 1,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[U_MODE] = modeOf(p);
+    const folds = Math.max(2, Math.min(MAX_FOLDS, Math.ceil(num23(p, "folds", 2, MAX_FOLDS) / 2) * 2));
+    out[U_AXES] = folds / 2;
+    const turns = num23(p, "offsetTurns", -64, 64) + ctx.bars * num23(p, "spinTurnsPerBar", -8, 8);
+    out[U_ANGLE] = fract15(turns) * TAU10;
+    out[U_POS_X] = num23(p, "posX", -1, 2);
+    out[U_POS_Y] = num23(p, "posY", -1, 2);
+    out[U_FLIP] = flag(p, "flip") ? 1 : 0;
+    out[U_SOFTEN_PX] = num23(p, "softenPx", 0, 8);
+  }
+};
+
+// src/shaders/op-polar.wgsl
+var op_polar_default = "// Polar swap \u2014 the cartesian <-> polar remap of the accumulated frame.\n//\n// Plan \xA77 lists this second among the operators and calls it free, which it is.\n// It makes ANY visualiser radial without that visualiser knowing anything about\n// it: a spectrum becomes a radial spectrum, a scope becomes a circular scope, a\n// landscape grid becomes a tunnel. Operators are multiplicative, and this is the\n// one with the highest ratio of new looks to lines in the whole document.\n//\n// What it deliberately does NOT do: draw anything of its own, touch colour, or\n// have any opinion about what is underneath it. It is a coordinate map and a\n// crossfade, and every pixel it emits came out of the accumulator.\n//\n// Art direction \xA74.1 forbids radiating from the screen centre by default. A\n// polar swap IS a centre in exactly the way a kaleidoscope and a feedback zoom\n// are \u2014 the centre is the mechanism, not decoration \u2014 so it inherits the same\n// warning, and it takes a centre offset so the origin can be pinned to something\n// meaningful (a band's pan, a source's own focus) rather than always the middle.\n//\n// Two hard-won details, both about sampling rather than about maths:\n//\n//   - Every fetch uses textureSampleGrad with ANALYTIC derivatives. The implicit\n//     ones are computed from the neighbouring fragment's final coordinate, and\n//     the final coordinate here goes through `floor`/`fract` at the angular\n//     seam. One quad straddling the seam therefore reports a derivative of\n//     nearly a whole texture, the hardware selects the smallest mip, and a\n//     blurred line is drawn down the image. This is the Pulse bug, it is in that\n//     project's wiki, and it costs nothing to avoid: the derivative of the\n//     UNWRAPPED coordinate is continuous everywhere and is four dot products.\n//   - The angular seam still needs blending even with correct derivatives,\n//     because the source is not periodic in x. Clamp-to-edge duplicates the edge\n//     texel on both sides of the seam, which reads as a hairline. The band below\n//     crossfades the two edges across the sub-pixel width of the seam, which is\n//     what a periodic bilinear filter would have done.\n\n// `struct Polar` and the `P` binding are prepended by `src/ops/polar.ts`, which\n// is also where the matching `writeUniforms` lives. They are declared together\n// there on purpose: a uniform struct and the code that packs it are one thing\n// with two halves, and the halves drift apart the moment they live in two files.\n\nconst TAU : f32 = 6.283185307179586;\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  return fullscreenTriangle(vi);\n}\n\n/** |x| with the corner rounded over `e`. Exact for |x| >> e, and C1 at zero. */\nfn softAbs(x : f32, e : f32) -> f32 {\n  return sqrt(x * x + e * e) - e;\n}\n\n/**\n * Reflect `x` into `[0, period]`, both creases rounded over `e`.\n *\n * Identity on `[0, period]` to within O(e^2), so the common case \u2014 a coordinate\n * that never leaves the frame \u2014 is untouched. Used here to fold the unwrapped\n * sample position back inside the source rather than clamping it: clamping\n * smears the border texel into a streak, which is the one artefact that makes an\n * operator look broken rather than stylised.\n */\nfn mirrorFold(x : f32, period : f32, e : f32) -> f32 {\n  let p2 = 2.0 * period;\n  let t = x - floor(x / p2) * p2 - period;\n  return softAbs(softAbs(t, e) - period, e);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let uv = fragUV(frag);\n  let plain = textureSampleLevel(src, samp, uv, 0.0);\n\n  // The input is the accumulator and may be a different size from this\n  // attachment when the layer renders at reduced resolution, so texel widths\n  // come from the SOURCE and screen-space derivatives from `C.resolution`.\n  let sdim = vec2<f32>(textureDimensions(src));\n\n  let centre = vec2<f32>(P.centreX, P.centreY);\n  // Aspect correction on the way in and out, or the circle is an ellipse and\n  // every radial thing built on top of it is sheared.\n  let asp = vec2<f32>(C.aspect, 1.0);\n  let zoom = max(P.zoom, 1.0e-4);\n\n  var q : vec2<f32>;\n  var ddx : vec2<f32>;\n  var ddy : vec2<f32>;\n  // Negative means \"this path has no periodic seam\". Only `wrap` does.\n  var seamU = -1.0;\n\n  if (P.direction < 0.5) {\n    // ---- wrap: the SCREEN is polar, the SOURCE stays cartesian. -----------\n    // Output (x, y) is read as (angle, radius) and fetched from the source at\n    // (angle -> u, radius -> v). A bar chart along the bottom of the source\n    // therefore lands on the rim; a scope line lands on a ring.\n    let p = (uv - centre) * asp;\n    let r2 = max(dot(p, p), 1.0e-12);\n    let r = sqrt(r2);\n    let a = atan2(p.y, p.x) + P.angle;\n\n    var u = a / TAU;\n    u = u - floor(u);\n    // `minRadius` is the singularity guard. At r -> 0 the angular sampling rate\n    // is unbounded \u2014 every source texel in one row competes for one screen pixel\n    // \u2014 and the result is a screaming cluster of aliased colour at the origin.\n    // Flooring the radius turns that into a smooth disc of the innermost ring.\n    let v = clamp(max(r, P.minRadius) * 2.0 * zoom, 0.0, 1.0);\n    q = vec2<f32>(u, v);\n\n    // Analytic derivatives of (u, v) with respect to screen pixels. Continuous\n    // through the seam, because they are taken before `u` is wrapped.\n    let dpx = vec2<f32>(C.aspect / C.resolution.x, 0.0);\n    let dpy = vec2<f32>(0.0, 1.0 / C.resolution.y);\n    let dadp = vec2<f32>(-p.y, p.x) / r2;\n    let drdp = p / r;\n    let k = 2.0 * zoom;\n    ddx = vec2<f32>(dot(dadp, dpx) / TAU, dot(drdp, dpx) * k);\n    ddy = vec2<f32>(dot(dadp, dpy) / TAU, dot(drdp, dpy) * k);\n    seamU = u;\n  } else {\n    // ---- unwrap: the SCREEN is cartesian, the SOURCE is read radially. ----\n    // The inverse map. A circular scope straightens into a line, a tunnel\n    // flattens into a strip. Useful on its own and essential as the way back\n    // out of `wrap` when two polar layers are stacked.\n    let a = (uv.x - 0.5) * TAU + P.angle;\n    let r = uv.y * 0.5 / zoom;\n    let dir = vec2<f32>(cos(a), sin(a));\n    let raw = (dir * r) / asp + centre;\n\n    let bx = 1.0 / sdim.x;\n    let by = 1.0 / sdim.y;\n    q = vec2<f32>(mirrorFold(raw.x, 1.0, bx), mirrorFold(raw.y, 1.0, by));\n\n    // d(source)/d(angle) and d(source)/d(radius), then chain onto pixels.\n    let dspdu = vec2<f32>(-dir.y, dir.x) * r * TAU;\n    let dspdv = dir * (0.5 / zoom);\n    ddx = (dspdu / C.resolution.x) / asp;\n    ddy = (dspdv / C.resolution.y) / asp;\n  }\n\n  var mapped = textureSampleGrad(src, samp, q, ddx, ddy);\n\n  if (seamU >= 0.0) {\n    // The angular seam. `d` is the signed distance to it in u, and the band is\n    // the seam's own width on screen \u2014 at least half a texel, so the blend never\n    // collapses to nothing near the rim where the angular rate is lowest.\n    let half = 0.5 / sdim.x;\n    let band = max(P.seamPx * max(abs(ddx.x), abs(ddy.x)), half);\n    let d = select(seamU - 1.0, seamU, seamU < 0.5);\n    if (abs(d) < band) {\n      let e0 = textureSampleGrad(src, samp, vec2<f32>(half, q.y), ddx, ddy);\n      let e1 = textureSampleGrad(src, samp, vec2<f32>(1.0 - half, q.y), ddx, ddy);\n      let t = clamp(d / (2.0 * band) + 0.5, 0.0, 1.0);\n      let wrapped = mix(e1, e0, t);\n      // Fade back to the ordinary fetch at the edges of the band so the join is\n      // continuous rather than trading one hairline for another.\n      mapped = mix(wrapped, mapped, clamp(abs(d) / band, 0.0, 1.0));\n    }\n  }\n\n  // Opacity as a CROSSFADE against the untouched frame, not as a multiplier.\n  // An operator that multiplied by `C.opacity` would fade the whole picture to\n  // black rather than fading its own effect out, and \"a layer at 0 is a true\n  // no-op\" (Phase 5 DoD) would be false in the most visible way possible. At\n  // opacity 0 this returns `plain` exactly.\n  return mix(plain, mapped, clamp(C.opacity, 0.0, 1.0));\n}\n";
+
+// src/ops/polar.ts
+var POLAR_DECL = (
+  /* wgsl */
+  `
+struct Polar {
+  direction : f32,   // < 0.5 = wrap (screen is polar), else unwrap
+  angle     : f32,   // radians, already wrapped into one turn
+  zoom      : f32,   // radial magnification
+  minRadius : f32,   // singularity guard, in aspect-corrected uv
+  centreX   : f32,
+  centreY   : f32,
+  seamPx    : f32,   // angular seam blend width, in pixels
+  _pad0     : f32,
+};
+
+@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Polar;
+`
+);
+var POLAR_FLOATS = 8;
+var U_DIRECTION = 0;
+var U_ANGLE2 = 1;
+var U_ZOOM2 = 2;
+var U_MIN_RADIUS = 3;
+var U_CENTRE_X4 = 4;
+var U_CENTRE_Y4 = 5;
+var U_SEAM_PX = 6;
+var TAU11 = Math.PI * 2;
+var POLAR_DEFAULTS = {
+  /**
+   * `'wrap'` reads the screen as (angle, radius) and fetches the source in
+   * cartesian — a bar chart along the bottom of the frame lands on the rim.
+   * `'unwrap'` is the inverse: a circular scope straightens into a line, and it
+   * is also the way back out when two polar layers are stacked.
+   */
+  direction: "wrap",
+  /** Origin in uv. 0.5, 0.5 is the centre; §4.1 would rather it were not, when there is somewhere better. */
+  centreX: 0.5,
+  centreY: 0.5,
+  /** Static angular offset, in TURNS. 0.25 puts the source's left edge at the top. */
+  offsetTurns: 0,
+  /**
+   * Rotation of the map, in turns per BAR. Bars rather than beats because a
+   * rotation at bar rate phrases with the music instead of ticking with it
+   * (art direction §3.3). ±0.05 is a drift; ±0.25 is a visible spin.
+   */
+  spinTurnsPerBar: 0,
+  /** Radial magnification. Above 1 the source's outer rows fall off the rim. */
+  zoom: 1,
+  /**
+   * Radial floor, in aspect-corrected uv. The angular sampling rate is unbounded
+   * as r -> 0 — every texel of one source row competing for one screen pixel —
+   * and this turns that into a smooth disc of the innermost ring. Only meaningful
+   * for `wrap`.
+   */
+  minRadius: 0.02,
+  /** Width of the angular seam crossfade, in pixels. Only meaningful for `wrap`. */
+  seamPx: 1.5
+};
+function num24(params, key, lo, hi) {
+  const fallback = POLAR_DEFAULTS[key];
+  const raw = params[key] ?? fallback;
+  const v = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(v)) return typeof fallback === "number" ? fallback : lo;
+  return Math.min(hi, Math.max(lo, v));
+}
+function isUnwrap(params) {
+  const raw = params["direction"];
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw === "string") return raw === "unwrap";
+  return false;
+}
+function fract16(v) {
+  return v - Math.floor(v);
+}
+var SHAPE11 = {
+  type: "polar",
+  family: "operator",
+  /** The accumulated frame. This operator draws nothing of its own. */
+  input: "accumulator",
+  uniformFloats: POLAR_FLOATS,
+  code: ""
+};
+var polarPass = {
+  ...SHAPE11,
+  code: [
+    PASS_COMMON_WGSL,
+    passBindingsWGSL(SHAPE11),
+    POLAR_DECL,
+    op_polar_default
+  ].join("\n"),
+  /**
+   * Full resolution, and this one is not a preference.
+   *
+   * The `wrap` map magnifies enormously near the origin and compresses near the
+   * rim, so a half-res pass is not "the same picture, softer" — it is a picture
+   * whose angular detail was thrown away before being stretched across the
+   * widest part of the frame, and §4.11's usual trade does not apply. Advisory
+   * only; a preset that needs the bandwidth back can still ask, and will see the
+   * rim go to mush first.
+   */
+  defaultResolutionScale: 1,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    const turns = num24(p, "offsetTurns", -64, 64) + ctx.bars * num24(p, "spinTurnsPerBar", -8, 8);
+    out[U_ANGLE2] = fract16(turns) * TAU11;
+    out[U_DIRECTION] = isUnwrap(p) ? 1 : 0;
+    out[U_ZOOM2] = num24(p, "zoom", 0.05, 8);
+    out[U_MIN_RADIUS] = num24(p, "minRadius", 0, 0.5);
+    out[U_CENTRE_X4] = num24(p, "centreX", -1, 2);
+    out[U_CENTRE_Y4] = num24(p, "centreY", -1, 2);
+    out[U_SEAM_PX] = num24(p, "seamPx", 0.5, 8);
+  }
+};
+
+// src/shaders/op-tile.wgsl
+var op_tile_default = "// Tile / repeat with per-tile variation \u2014 operator, plan \xA77.\n//\n// Operators are multiplicative: this one turns any source into a field of that\n// source, and unlike the kaleidoscope it has no centre, so art-direction \xA74.1\n// leaves it alone. Its job is to make one motif read as a composed surface, and\n// the whole difference between \"composed surface\" and \"wallpaper\" is that no two\n// tiles are quite the same tile.\n//\n// Four axes of per-tile variation, all from a SEEDED hash of the tile index\n// (plan \xA74.7 \u2014 nothing here may reach for a random number, and the golden\n// harness checks): rotation, flip, scale, and a temporal phase offset. The last\n// is the important one. Without it every tile breathes on the same frame and the\n// field reads as a single pulsing object, which is exactly the blob failure of\n// art-direction \xA73.3.\n//\n// What this deliberately does NOT do:\n//   - It does not TINT tiles. Per-tile hue would be the fastest possible route\n//     past art-direction \xA72.2's three-hue ceiling, and a tiling that needs\n//     colour variety to be interesting is a tiling of a boring source.\n//   - It does not sample its neighbours. Everything below is one texture fetch\n//     plus arithmetic; a seam resolved by blending two tiles would double the\n//     fetch count of an operator that may run over 3.7 megapixels.\n//   - It does not decide its own tile count. The count arrives already\n//     quantised to a clock division from `ops/tile.ts`, because a count that\n//     changes continuously is a count that changes off the beat.\n//   - It does not declare its own uniform binding. `ops/tile.ts` appends that\n//     line, so no binding number is ever typed in this file. See\n//     `PASS_BINDING` in `renderer.ts` for why that matters.\n//\n// `PASS_COMMON_WGSL` (struct Common as `C`, `fullscreenTriangle`, `fragUV`) and\n// the `src`/`samp` declarations are prepended by `ops/tile.ts`.\n\nconst TAU = 6.2831853;\n\nstruct Tile {\n  grid         : vec2<f32>,  // columns, rows. Integral; already division-quantised.\n  brick        : f32,        // per-row horizontal shift in tiles. 0.5 = half-drop bond.\n  rotateSteps  : f32,        // quantise rotation to N turns. < 1 = continuous.\n  rotateChance : f32,        // 0..1 fraction of tiles that rotate at all.\n  rotateDrift  : f32,        // turns per division tick, direction hashed per tile.\n  flipChance   : f32,        // 0..1 per axis.\n  scaleJitter  : f32,        // octaves either side of 1. 1.0 = half to double.\n  breathe      : f32,        // extra scale at the peak of a tile's own pulse.\n  decay        : f32,        // release rate of that pulse, per division tick.\n  offsetTicks  : f32,        // max per-tile phase offset, in division ticks.\n  gutter       : f32,        // 0 = tiles abut. > 0 = panels with negative space.\n  mixAmount    : f32,        // 0..1 against the untiled frame.\n  cyclePos     : f32,        // continuous position in division ticks, CPU-wrapped.\n  cycle        : f32,        // floor(cyclePos). Re-rolls the hash on the boundary.\n  tileAspect   : f32,        // pixel aspect of ONE tile, not of the frame.\n};\n\n// ---------------------------------------------------------------------------\n// Hash\n//\n// A port of `hashU32`/`hash2` from `rng.ts`. The integer arithmetic is identical\n// \u2014 WGSL u32 multiply wraps exactly as `Math.imul` does \u2014 so a test on the CPU\n// can predict which way any given tile is turned. Only the final conversion to\n// f32 rounds, and nothing here depends on that last bit.\n// ---------------------------------------------------------------------------\n\nfn hashU32(x : u32) -> u32 {\n  var h = x;\n  h = (h ^ (h >> 16u)) * 0x7feb352du;\n  h = (h ^ (h >> 15u)) * 0x846ca68bu;\n  h = h ^ (h >> 16u);\n  return h;\n}\n\nfn hash01(x : u32) -> f32 {\n  return f32(hashU32(x)) * 2.3283064365386963e-10; // / 2^32\n}\n\nfn hash2(a : u32, b : u32) -> f32 {\n  return hash01(hashU32(a) ^ (b * 0x9e3779b9u));\n}\n\n/** Positive modulo. `%` on a negative i32 is negative, and a negative tile index\n *  would hash to a different tile than the one it is a copy of. */\nfn wrapi(v : i32, n : i32) -> i32 {\n  let m = v % n;\n  return select(m, m + n, m < 0);\n}\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  return fullscreenTriangle(vi);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let uv = fragUV(frag);\n  let plain = textureSampleLevel(src, samp, uv, 0.0);\n  if (T.mixAmount <= 0.0) { return plain * C.opacity; }\n\n  let cols = max(1.0, floor(T.grid.x));\n  let rows = max(1.0, floor(T.grid.y));\n\n  // Grid space, then the brick shift.\n  //\n  // The shift is a running shear (offset x by brick * row), not an alternating\n  // one. `brick = 0.5` gives the classic half-drop bond because every second row\n  // lands back where it started; `1/3` gives a third bond; anything else gives a\n  // valid tiling too, because only the columns move and the row boundaries are\n  // untouched.\n  let g = uv * vec2<f32>(cols, rows);\n  let row = floor(g.y);\n  let gx = g.x + T.brick * row;\n  let col = floor(gx);\n  let q = vec2<f32>(gx - col, g.y - row);\n\n  // Wrapped so the shifted tiles at the edges hash as the tiles they are copies\n  // of, and so the pattern is the same width as the grid rather than the width\n  // of the shear.\n  let ci = wrapi(i32(col), i32(cols));\n  let ri = wrapi(i32(row), i32(rows));\n  let tileId = u32(ri) * u32(cols) + u32(ci);\n\n  // `cycle` is in the key, so the whole pattern re-rolls on a musical boundary\n  // and holds still in between. Re-rolling per frame would be a different image\n  // every frame, which is noise; never re-rolling is the visible loop of\n  // art-direction \xA75.\n  let key = hashU32(u32(C.seed) ^ hashU32(tileId ^ (u32(T.cycle) << 20u)));\n\n  let hRot   = hash2(key, 1u);\n  let hRotOn = hash2(key, 2u);\n  let hFlipX = hash2(key, 3u);\n  let hFlipY = hash2(key, 4u);\n  let hScale = hash2(key, 5u);\n  let hPhase = hash2(key, 6u);\n  let hSpin  = hash2(key, 7u);\n\n  // -- the tile's own clock ------------------------------------------------\n  //\n  // Every rate here is in DIVISION TICKS, never seconds (\xA74.6 / art-direction\n  // \xA73.1). `offsetTicks` staggers the tiles against each other: at 1.0 a tile\n  // can be a whole tick behind its neighbour, which is what stops the field\n  // pulsing in unison.\n  let pos = T.cyclePos - hPhase * T.offsetTicks;\n  let ph = pos - floor(pos);\n  // Instant attack, exponential release (art-direction \xA73.2). A linear or\n  // symmetric shape here reads as a metronome rather than as a transient.\n  // Scaled by the layer's envelope, so the whole field still obeys its trigger.\n  let pulse = exp(-ph * max(T.decay, 0.0)) * C.progress;\n\n  // -- scale ---------------------------------------------------------------\n  //\n  // Jitter in LOG space: half and double are then equal-magnitude changes,\n  // whereas a linear +/- j makes shrinking look far weaker than growing. The\n  // side effect is the point of art-direction \xA74.4 \u2014 a source drawn at four\n  // different scales has four different apparent line weights, for free.\n  let jitter = exp2(mix(-T.scaleJitter, T.scaleJitter, hScale));\n  let scale = max(jitter * (1.0 + T.breathe * pulse), 0.0001);\n\n  // -- rotation ------------------------------------------------------------\n  var turns = 0.0;\n  if (hRotOn < T.rotateChance) {\n    // Quantised by default. When `rotateSteps` is a multiple of 4 the content\n    // stays axis-aligned, which resamples exactly and keeps a crisp source\n    // crisp; an arbitrary angle costs a bilinear softening on every tile. The\n    // continuous case is deliberately reachable (steps < 1), not an oversight.\n    let steps = max(floor(T.rotateSteps), 1.0);\n    turns = select(hRot, floor(hRot * steps) / steps, T.rotateSteps >= 1.0);\n  }\n  // Drift is per tick and signed per tile, so neighbours counter-rotate instead\n  // of the whole field turning as one object.\n  turns = turns + T.rotateDrift * pos * select(-1.0, 1.0, hSpin < 0.5);\n\n  // -- transform -----------------------------------------------------------\n  var p = q - 0.5;\n\n  // Flip BEFORE rotating. A flip is not a rotation by another name: it changes\n  // handedness, and no amount of rotation produces a mirrored motif. A field of\n  // rotations alone still reads as one shape spun about.\n  p.x = p.x * select(1.0, -1.0, hFlipX < T.flipChance);\n  p.y = p.y * select(1.0, -1.0, hFlipY < T.flipChance);\n\n  // Rotate in a square space or the tile shears. A tile is width/cols by\n  // height/rows pixels and is almost never square, which is why the frame's\n  // aspect is the wrong number to use here.\n  p.x = p.x * T.tileAspect;\n  let a = turns * TAU;\n  let ca = cos(a);\n  let sa = sin(a);\n  p = vec2<f32>(p.x * ca - p.y * sa, p.x * sa + p.y * ca);\n  p.x = p.x / T.tileAspect;\n\n  p = p / scale;\n  var s = p + 0.5;\n  // Fold rather than clamp outside the tile. Clamping smears one edge texel into\n  // a streak; folding mirrors, which is at least made of picture.\n  s = abs(fract(s * 0.5) * 2.0 - 1.0);\n\n  let tiled = textureSampleLevel(src, samp, s, 0.0);\n\n  // -- seams ---------------------------------------------------------------\n  //\n  // Analytic coverage, and NOT fwidth().\n  //\n  // fwidth is the obvious tool and is wrong here. The tile-local coordinate\n  // jumps from 1 back to 0 across a boundary, so a 2x2 quad straddling one\n  // measures a derivative of a whole tile instead of a pixel and reports a seam\n  // several hundred times too wide. Per-tile rotation makes it worse: the\n  // sampled coordinate is discontinuous in DIRECTION as well as in value, so\n  // even a quad that stays inside one tile disagrees with its neighbour about\n  // which way is up. Either way the artefact is a line at every seam that\n  // shimmers whenever the grid changes \u2014 the exact thing the AA was added for.\n  //\n  // The width needs no derivatives at all: one pixel is exactly\n  // grid / resolution in tile-local units, which is correct at every tile count\n  // and continuous everywhere.\n  let px = vec2<f32>(cols, rows) / C.resolution;\n  let inset = T.gutter * 0.5;\n  let dx = (min(q.x, 1.0 - q.x) - inset) / max(px.x, 1e-6);\n  let dy = (min(q.y, 1.0 - q.y) - inset) / max(px.y, 1e-6);\n  let coverage = clamp(min(dx, dy) + 0.5, 0.0, 1.0);\n\n  // What the seam fades TO, and this is the subtle part.\n  //\n  // With no gutter the fade is sub-pixel and its only job is to kill the alias\n  // on a hard content discontinuity \u2014 so it falls back to the UNTILED frame,\n  // which is real picture and therefore invisible. Fading to black instead would\n  // draw a dark grid over the whole image, one half-pixel wide, at every tile\n  // boundary. That is a worse artefact than the one being fixed and it is the\n  // easy mistake to make here.\n  //\n  // With a gutter the fade is the whole point: the tiles become panels and the\n  // gutters are negative space (art-direction \xA74.3), so they go to nothing.\n  let fill = plain * step(T.gutter, 0.0);\n  let composed = mix(fill, tiled, coverage);\n\n  return mix(plain, composed, T.mixAmount) * C.opacity;\n}\n";
+
+// src/ops/tile.ts
+var TILE_FLOATS = 16;
+var U_GRID = 0;
+var U_BRICK = 2;
+var U_ROTATE_STEPS = 3;
+var U_ROTATE_CHANCE = 4;
+var U_ROTATE_DRIFT = 5;
+var U_FLIP_CHANCE = 6;
+var U_SCALE_JITTER = 7;
+var U_BREATHE = 8;
+var U_DECAY = 9;
+var U_OFFSET_TICKS = 10;
+var U_GUTTER = 11;
+var U_MIX2 = 12;
+var U_CYCLE_POS = 13;
+var U_CYCLE = 14;
+var U_TILE_ASPECT = 15;
+var CYCLE_WRAP = 4096;
+var MAX_TILES = 64;
+var TILE_DEFAULTS = {
+  /** Columns and rows, independently. */
+  cols: 3,
+  rows: 3,
+  /** Extra columns/rows, 0..N, re-hashed on each `division` tick. 0 = fixed grid. */
+  colsJitter: 0,
+  rowsJitter: 0,
+  /** The boundary the count and the pattern are allowed to change on. */
+  division: "bar",
+  /** Per-row horizontal shift, in tiles. 0 = straight grid, 0.5 = brick bond. */
+  brick: 0,
+  /** Quantise rotation to N turns. 4 = quarter turns and no resampling softness. */
+  rotateSteps: 4,
+  /** Fraction of tiles that rotate at all. 1 = all of them, which reads busier. */
+  rotateChance: 0.5,
+  /** Continuous drift in turns per tick, signed per tile. Small values only. */
+  rotateDrift: 0,
+  /** Mirror chance, per axis. */
+  flipChance: 0.25,
+  /** Scale variation in octaves either side of 1. 0.25 is ~0.84x to 1.19x. */
+  scaleJitter: 0.25,
+  /** Extra scale at the peak of a tile's own pulse. */
+  breathe: 0.06,
+  /** Release rate of that pulse, per tick. Higher is snappier. */
+  decay: 6,
+  /** Maximum per-tile phase offset in BEATS. This is the anti-blob control. */
+  offsetBeats: 1,
+  /** Panel inset as a fraction of the tile. 0 = tiles abut with sub-pixel AA. */
+  gutter: 0,
+  /** Blend against the untiled frame. */
+  mix: 1
+};
+function num25(params, key, lo, hi) {
+  const fallback = TILE_DEFAULTS[key];
+  const raw = params[key] ?? fallback;
+  const v = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(v)) return typeof fallback === "number" ? fallback : lo;
+  return Math.min(hi, Math.max(lo, v));
+}
+function divisionOf(params) {
+  const raw = params["division"];
+  if (typeof raw === "string" && raw in DIVISIONS) return raw;
+  return "bar";
+}
+function countFor(base2, jitter, salt, cycle) {
+  const extra = jitter > 0 ? Math.floor(hash2(salt, cycle) * (Math.floor(jitter) + 1)) : 0;
+  return Math.min(MAX_TILES, Math.max(1, Math.floor(base2) + extra));
+}
+function wrap(v, m) {
+  return (v % m + m) % m;
+}
+var SHAPE12 = {
+  type: "tile",
+  family: "operator",
+  input: "accumulator",
+  uniformFloats: TILE_FLOATS
+};
+var PARAMS_DECL2 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> T : Tile;`;
+var tilePass = {
+  ...SHAPE12,
+  code: [
+    PASS_COMMON_WGSL,
+    passBindingsWGSL({ ...SHAPE12, code: "" }),
+    op_tile_default,
+    PARAMS_DECL2
+  ].join("\n"),
+  /**
+   * Full resolution by default, unlike most transforms.
+   *
+   * A tiled field is high-frequency by construction — N x M copies of the source
+   * means N x M times the spatial frequency — so it is the worst possible
+   * candidate for the half-res path of §4.11. Advisory only; a preset that needs
+   * the bandwidth back can still ask, and will see the tiles go soft.
+   */
+  defaultResolutionScale: 1,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    const division = divisionOf(p);
+    const beatsPerTick = DIVISIONS[division] / SLOTS_PER_BEAT2;
+    const cyclePos = wrap(ctx.beats / beatsPerTick, CYCLE_WRAP);
+    const cycle = Math.floor(cyclePos);
+    const cols = countFor(num25(p, "cols", 1, MAX_TILES), num25(p, "colsJitter", 0, 8), ctx.seed ^ 32417, cycle);
+    const rows = countFor(num25(p, "rows", 1, MAX_TILES), num25(p, "rowsJitter", 0, 8), ctx.seed ^ 12729, cycle);
+    out[U_GRID] = cols;
+    out[U_GRID + 1] = rows;
+    out[U_BRICK] = num25(p, "brick", -1, 1);
+    out[U_ROTATE_STEPS] = num25(p, "rotateSteps", 0, 64);
+    out[U_ROTATE_CHANCE] = num25(p, "rotateChance", 0, 1);
+    out[U_ROTATE_DRIFT] = num25(p, "rotateDrift", -4, 4);
+    out[U_FLIP_CHANCE] = num25(p, "flipChance", 0, 1);
+    out[U_SCALE_JITTER] = num25(p, "scaleJitter", 0, 2);
+    out[U_BREATHE] = num25(p, "breathe", 0, 1);
+    out[U_DECAY] = num25(p, "decay", 0, 64);
+    out[U_OFFSET_TICKS] = num25(p, "offsetBeats", 0, 16) / beatsPerTick;
+    out[U_GUTTER] = num25(p, "gutter", 0, 0.5);
+    out[U_MIX2] = num25(p, "mix", 0, 1);
+    out[U_CYCLE_POS] = cyclePos;
+    out[U_CYCLE] = cycle;
+    out[U_TILE_ASPECT] = ctx.aspect * rows / cols;
+  }
+};
+
+// src/shaders/op-modernfx.wgsl
+var op_modernfx_default = "// Shared post-effect body. The layer amount is always a crossfade with the\n// untouched accumulator, so every effect is a true no-op at amount zero.\n\nstruct Params {\n  mode : f32, amount : f32, strength : f32, radius : f32,\n  speed : f32, detail : f32, mixAmount : f32, pad : f32,\n};\n\nfn hash21(p : vec2<f32>) -> f32 {\n  var q = fract(vec3<f32>(p.xyx) * 0.1031);\n  q = q + dot(q, q.yzx + 33.33);\n  return fract((q.x + q.y) * q.z);\n}\n\nfn lum(c : vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722)); }\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  return fullscreenTriangle(vi);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let uv = fragUV(frag);\n  let plain = textureSampleLevel(src, samp, uv, 0.0);\n  let px = 1.0 / C.resolution;\n  let beatTime = C.beats * P.speed;\n  let audio = A.level + A.bands.y * 0.65 + A.bands.w * 0.25;\n  var effect = plain.rgb;\n\n  if (P.mode < 0.5) {\n    // Bright-pass blur; the present pass still owns display bloom, while this\n    // one is deliberately a composable HDR glow layer inside the stack.\n    var glow = vec3<f32>(0.0);\n    for (var y : i32 = -1; y <= 1; y = y + 1) {\n      for (var x : i32 = -1; x <= 1; x = x + 1) {\n        let c = textureSampleLevel(src, samp, uv + vec2<f32>(f32(x), f32(y)) * px * P.radius * 3.0, 0.0).rgb;\n        glow = glow + max(c - vec3<f32>(0.55), vec3<f32>(0.0));\n      }\n    }\n    effect = plain.rgb + glow / 9.0 * P.strength * (0.4 + audio);\n  } else if (P.mode < 1.5) {\n    let dir = normalize(vec2<f32>(cos(beatTime * 0.2), sin(beatTime * 0.17)) + vec2<f32>(0.001));\n    let shift = dir * px * P.radius * (1.5 + P.strength * 9.0) * (0.45 + audio);\n    effect = vec3<f32>(textureSampleLevel(src, samp, uv + shift, 0.0).r, plain.g, textureSampleLevel(src, samp, uv - shift, 0.0).b);\n  } else if (P.mode < 2.5) {\n    let n = hash21(floor(uv * P.detail * 30.0) + C.seed);\n    let wave = sin((uv.y + beatTime * 0.03) * (18.0 + P.detail * 40.0));\n    let offset = vec2<f32>((n - 0.5) + wave * 0.5, sin(uv.x * 12.0 + beatTime) * 0.35) * px * P.radius * 18.0 * P.strength * (0.2 + audio);\n    effect = textureSampleLevel(src, samp, uv + offset, 0.0).rgb;\n  } else if (P.mode < 3.5) {\n    let rows = floor(uv.y * (16.0 + P.detail * 90.0));\n    let gate = step(0.72, hash21(vec2<f32>(rows, floor(beatTime * 2.0) + C.seed)));\n    let block = vec2<f32>(hash21(vec2<f32>(rows, C.seed)), hash21(vec2<f32>(rows + 4.0, C.seed))) - 0.5;\n    let offset = vec2<f32>(block.x * gate * P.strength * (0.02 + audio * 0.06), 0.0);\n    let dirty = textureSampleLevel(src, samp, uv + offset, 0.0).rgb;\n    effect = mix(dirty, dirty.bgr, gate * P.mixAmount * 0.45);\n  } else if (P.mode < 4.5) {\n    let toned = plain.rgb / (1.0 + plain.rgb);\n    let contrast = mix(toned, smoothstep(vec3<f32>(0.0), vec3<f32>(1.0), toned), P.strength);\n    let tinted = mix(contrast, C.color.rgb * lum(contrast), P.mixAmount * 0.38);\n    effect = tinted / max(vec3<f32>(0.02), vec3<f32>(1.0) - min(tinted, vec3<f32>(0.98)));\n  } else if (P.mode < 5.5) {\n    let scan = 0.86 + 0.14 * sin(frag.y * 3.14159265 * max(P.detail, 0.5));\n    let grille = 0.92 + 0.08 * sin(frag.x * 3.14159265 * 0.9);\n    let vignette = smoothstep(1.35, 0.28, length((uv - 0.5) * vec2<f32>(C.aspect, 1.0)));\n    let warped = (uv - 0.5) * (1.0 + length(uv - 0.5) * P.strength * 0.16) + 0.5;\n    let tube = textureSampleLevel(src, samp, warped, 0.0).rgb;\n    effect = tube * scan * grille * mix(1.0, vignette, P.mixAmount);\n  } else if (P.mode < 6.5) {\n    // Quantised tone plus a cheap Sobel-like edge. This is the inked contour\n    // treatment behind the flowing topographic reference rather than a blur.\n    let east = lum(textureSampleLevel(src, samp, uv + vec2<f32>(px.x, 0.0) * P.radius, 0.0).rgb);\n    let west = lum(textureSampleLevel(src, samp, uv - vec2<f32>(px.x, 0.0) * P.radius, 0.0).rgb);\n    let north = lum(textureSampleLevel(src, samp, uv + vec2<f32>(0.0, px.y) * P.radius, 0.0).rgb);\n    let south = lum(textureSampleLevel(src, samp, uv - vec2<f32>(0.0, px.y) * P.radius, 0.0).rgb);\n    let edge = abs(east - west) + abs(north - south);\n    let steps = 3.0 + floor(P.detail * 8.0);\n    let quant = floor(lum(plain.rgb) * steps) / steps;\n    let poster = plain.rgb * (0.34 + quant * (0.85 + P.strength * 0.55));\n    let contourInk = smoothstep(0.035, 0.15 + P.strength * 0.20, edge);\n    effect = mix(poster, C.color.rgb * (0.18 + quant * 0.72), P.mixAmount * 0.35)\n      + vec3<f32>(contourInk) * (0.18 + P.strength * 0.82);\n  } else if (P.mode < 7.5) {\n    // Multi-tap threshold halo. Display bloom later in the chain still handles\n    // the large glare; this adds the tight coloured tube around wire geometry.\n    let direction = normalize(vec2<f32>(0.77, 0.64) + vec2<f32>(sin(beatTime * 0.19), cos(beatTime * 0.23)) * 0.2);\n    let stepPx = direction * px * P.radius * (2.0 + P.detail * 3.5);\n    let nearA = textureSampleLevel(src, samp, uv + stepPx, 0.0).rgb;\n    let nearB = textureSampleLevel(src, samp, uv - stepPx, 0.0).rgb;\n    let farA = textureSampleLevel(src, samp, uv + stepPx * 2.5, 0.0).rgb;\n    let farB = textureSampleLevel(src, samp, uv - stepPx * 2.5, 0.0).rgb;\n    let halo = max((nearA + nearB) * 0.5 - vec3<f32>(0.10), vec3<f32>(0.0))\n      + max((farA + farB) * 0.25 - vec3<f32>(0.14), vec3<f32>(0.0));\n    let tint = mix(vec3<f32>(1.0), C.color.rgb * 1.45, P.mixAmount * 0.45);\n    effect = plain.rgb + halo * tint * P.strength * (0.65 + audio * 1.35);\n  } else {\n    // A rolling horizontal scan field re-samples the image in thin strips;\n    // separate red/blue offsets keep it legible as a motion treatment, not a\n    // full-frame glitch.\n    let density = 28.0 + P.detail * 110.0;\n    let row = floor(uv.y * density);\n    let phase = hash21(vec2<f32>(row, floor(beatTime * 2.5) + C.seed));\n    let beam = exp(-abs(fract(uv.y * density - beatTime * (0.55 + P.speed * 0.22)) - 0.5) * 10.0);\n    let stripe = sin(uv.y * density * 0.75 + beatTime * 2.0 + phase * 6.283);\n    let offset = vec2<f32>((stripe * 0.5 + phase - 0.5) * P.strength * (0.004 + audio * 0.012), 0.0);\n    let shifted = textureSampleLevel(src, samp, uv + offset, 0.0).rgb;\n    let split = px.x * P.radius * P.strength * (0.7 + beam * 2.0);\n    effect = vec3<f32>(\n      textureSampleLevel(src, samp, uv + offset + vec2<f32>(split, 0.0), 0.0).r,\n      shifted.g,\n      textureSampleLevel(src, samp, uv + offset - vec2<f32>(split, 0.0), 0.0).b,\n    ) * (0.90 + beam * 0.22);\n  }\n\n  return vec4<f32>(mix(plain.rgb, effect, clamp(P.amount, 0.0, 1.0)), plain.a) * C.opacity;\n}\n";
+
+// src/ops/modernfx.ts
+var PARAMS2 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Params;`;
+var FLOATS2 = 8;
+var MODES5 = {
+  bloom: 0,
+  chromatic: 1,
+  displace: 2,
+  glitch: 3,
+  grade: 4,
+  crt: 5,
+  contour: 6,
+  neon: 7,
+  scanwarp: 8
+};
+var MODERN_FX_DEFAULTS = { amount: 1, strength: 0.5, radius: 1, speed: 1, detail: 1, mix: 1 };
+function num26(p, key, fallback) {
+  const value = p[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+function pass3(type) {
+  const shape = {
+    type,
+    family: "operator",
+    input: "accumulator",
+    usesAudio: true,
+    uniformFloats: FLOATS2,
+    code: ""
+  };
+  return {
+    ...shape,
+    code: [PASS_COMMON_WGSL, AUDIO_WGSL, passBindingsWGSL(shape), PARAMS2, op_modernfx_default].join("\n"),
+    defaultResolutionScale: type === "bloom" ? 0.5 : 1,
+    writeUniforms(out, ctx) {
+      const p = ctx.params;
+      out[0] = MODES5[type];
+      out[1] = Math.max(0, num26(p, "amount", MODERN_FX_DEFAULTS.amount)) * ctx.progress;
+      out[2] = Math.max(0, num26(p, "strength", MODERN_FX_DEFAULTS.strength));
+      out[3] = Math.max(0.1, num26(p, "radius", MODERN_FX_DEFAULTS.radius));
+      out[4] = Math.max(0, num26(p, "speed", MODERN_FX_DEFAULTS.speed));
+      out[5] = Math.max(0.05, num26(p, "detail", MODERN_FX_DEFAULTS.detail));
+      out[6] = Math.max(0, Math.min(1, num26(p, "mix", MODERN_FX_DEFAULTS.mix)));
+      out[7] = 0;
+    }
+  };
+}
+var bloomPass = pass3("bloom");
+var chromaticPass = pass3("chromatic");
+var displacePass = pass3("displace");
+var glitchPass = pass3("glitch");
+var gradePass = pass3("grade");
+var crtPass = pass3("crt");
+var contourPass = pass3("contour");
+var neonPass = pass3("neon");
+var scanwarpPass = pass3("scanwarp");
+
+// src/shaders/visual-v2-ops/common.wgsl
+var common_default2 = "// Shared mechanics for the nine independent V2 spatial-operator modules.\r\n// Resource bindings and PassCommon are prepended by ops/visual-v2.ts.\r\n\r\nconst PI : f32 = 3.14159265359;\r\nconst TAU : f32 = 6.28318530718;\r\n\r\nfn rot2(angle : f32) -> mat2x2<f32> {\r\n  let c = cos(angle);\r\n  let s = sin(angle);\r\n  return mat2x2<f32>(c, -s, s, c);\r\n}\r\n\r\nfn luminance(rgb : vec3<f32>) -> f32 {\r\n  return dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));\r\n}\r\n\r\nfn safeSample(uv : vec2<f32>) -> vec3<f32> {\r\n  let bounded = clamp(uv, vec2<f32>(0.001), vec2<f32>(0.999));\r\n  return textureSampleLevel(src, samp, bounded, 0.0).rgb;\r\n}\r\n\r\nfn finishEffect(plain : vec4<f32>, effect : vec3<f32>, authoredMix : f32) -> vec4<f32> {\r\n  // The operator owns its crossfade. At an envelope of zero this returns the\r\n  // accumulator byte-for-byte instead of dimming a replace layer.\r\n  let t = clamp(authoredMix * C.opacity, 0.0, 1.0);\r\n  return vec4<f32>(mix(plain.rgb, effect, t), plain.a);\r\n}\r\n\r\n@vertex\r\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\r\n  return fullscreenTriangle(vi);\r\n}\r\n";
+
+// src/shaders/visual-v2-ops/negative-space.wgsl
+var negative_space_default = "struct NegativeSpaceParams {\r\n  apertureMix    : f32,\r\n  outsideDim     : f32,\r\n  apertureRadius : f32,\r\n  edgeDefinition : f32,\r\n  centreX        : f32,\r\n  centreY        : f32,\r\n  _pad0          : f32,\r\n  _pad1          : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let uv = fragUV(frag);\r\n  let plain = textureSampleLevel(src, samp, uv, 0.0);\r\n  let centreUv = vec2<f32>(0.5 + P.centreX * 0.5, 0.5 - P.centreY * 0.5);\r\n  let q = (uv - centreUv) * vec2<f32>(C.aspect, 1.0);\r\n  let radii = vec2<f32>(\r\n    0.30 + P.apertureRadius * 0.20,\r\n    0.24 + P.apertureRadius * 0.15,\r\n  );\r\n  let d = length(q / radii);\r\n  let mask = 1.0 - smoothstep(0.88, 1.03, d);\r\n  let edge = exp(-abs(d - 1.0) * (42.0 / max(P.edgeDefinition, 0.2)));\r\n  let outside = mix(1.0, 1.0 - clamp(P.outsideDim, 0.0, 1.0), 1.0 - mask);\r\n  let audioEdge = A.bands.y + A.bands.z * 0.7 + A.bands.w * 0.35;\r\n  let effect = plain.rgb * outside\r\n    + C.color.rgb * edge * 0.08 * (0.35 + audioEdge);\r\n  return finishEffect(plain, effect, P.apertureMix);\r\n}\r\n";
+
+// src/shaders/visual-v2-ops/diffraction.wgsl
+var diffraction_default = "struct DiffractionParams {\r\n  flareMix           : f32,\r\n  flareGain          : f32,\r\n  sampleRadiusPx     : f32,\r\n  sampleSpacing      : f32,\r\n  luminanceThreshold : f32,\r\n  spectralTint       : f32,\r\n  axisRadians        : f32,\r\n  _pad0              : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let uv = fragUV(frag);\r\n  let plain = textureSampleLevel(src, samp, uv, 0.0);\r\n  let px = 1.0 / C.resolution;\r\n  let dir = normalize(rot2(P.axisRadians) * vec2<f32>(1.0, 0.0));\r\n  var flare = vec3<f32>(0.0);\r\n  var weight = 0.0;\r\n  for (var i : i32 = -4; i <= 4; i = i + 1) {\r\n    let fi = f32(i);\r\n    let w = exp(-abs(fi) * 0.62);\r\n    let distancePx = fi * P.sampleRadiusPx * (4.0 + P.sampleSpacing * 3.0);\r\n    let sampleRgb = safeSample(uv + dir * px * distancePx);\r\n    flare = flare + max(sampleRgb - vec3<f32>(P.luminanceThreshold), vec3<f32>(0.0)) * w;\r\n    weight = weight + w;\r\n  }\r\n  flare = flare / max(weight, 0.001);\r\n  let audioGain = A.bands.y + A.bands.z * 0.7 + A.bands.w * 0.35;\r\n  let tint = mix(vec3<f32>(1.0), C.color.rgb, P.spectralTint * 0.55);\r\n  let effect = plain.rgb + flare * tint * P.flareGain * (0.5 + audioGain * 0.9);\r\n  return finishEffect(plain, effect, P.flareMix);\r\n}\r\n";
+
+// src/shaders/visual-v2-ops/engrave.wgsl
+var engrave_default = "struct EngraveParams {\r\n  engravingMix    : f32,\r\n  edgeGain        : f32,\r\n  gradientRadiusPx: f32,\r\n  hatchDefinition : f32,\r\n  markThreshold   : f32,\r\n  hatchRadians    : f32,\r\n  _pad0           : f32,\r\n  _pad1           : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let uv = fragUV(frag);\r\n  let plain = textureSampleLevel(src, samp, uv, 0.0);\r\n  let px = 1.0 / C.resolution;\r\n  let east = luminance(safeSample(uv + vec2<f32>(px.x, 0.0) * P.gradientRadiusPx));\r\n  let west = luminance(safeSample(uv - vec2<f32>(px.x, 0.0) * P.gradientRadiusPx));\r\n  let north = luminance(safeSample(uv + vec2<f32>(0.0, px.y) * P.gradientRadiusPx));\r\n  let south = luminance(safeSample(uv - vec2<f32>(0.0, px.y) * P.gradientRadiusPx));\r\n  let grad = vec2<f32>(east - west, north - south);\r\n  let edge = length(grad);\r\n  let tone = luminance(plain.rgb / (vec3<f32>(1.0) + plain.rgb));\r\n  // atan2(0, 0) is outside WGSL's defined domain. Flat/black regions use a\r\n  // stable horizontal fallback so one adapter cannot turn the hatch NaN.\r\n  let safeGrad = select(vec2<f32>(1.0, 0.0), grad, dot(grad, grad) > 0.00000001);\r\n  let hatchAngle = atan2(safeGrad.y, safeGrad.x) + P.hatchRadians;\r\n  let hatchUv = rot2(hatchAngle) * (uv * C.resolution / max(P.gradientRadiusPx, 0.25));\r\n  let spacing = 3.0 + P.hatchDefinition * 3.0;\r\n  let hatch = 1.0 - smoothstep(0.0, 0.18, abs(fract(hatchUv.x / spacing) - 0.5));\r\n  let markLow = P.markThreshold * 0.30;\r\n  let markHigh = max(max(P.markThreshold, 0.05), markLow + 0.0001);\r\n  let markGate = smoothstep(markLow, markHigh, edge * 2.5 + (1.0 - tone) * 0.45);\r\n  let paper = C.color.rgb * (0.06 + tone * 0.72);\r\n  let effect = paper\r\n    + C.color.rgb * edge * (1.8 + P.edgeGain * 4.0)\r\n    + hatch * markGate * (1.0 - tone) * C.color.rgb * 0.16;\r\n  return finishEffect(plain, effect, P.engravingMix);\r\n}\r\n";
+
+// src/shaders/visual-v2-ops/foldglass.wgsl
+var foldglass_default = "struct FoldglassParams {\r\n  glassMix           : f32,\r\n  refractionStrength : f32,\r\n  creaseWidth        : f32,\r\n  foldSlope          : f32,\r\n  centreX            : f32,\r\n  centreY            : f32,\r\n  axisRadians        : f32,\r\n  _pad0              : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let uv = fragUV(frag);\r\n  let plain = textureSampleLevel(src, samp, uv, 0.0);\r\n  let centreUv = vec2<f32>(0.5 + P.centreX * 0.5, 0.5 - P.centreY * 0.5);\r\n  let aspectQ = (uv - centreUv) * vec2<f32>(C.aspect, 1.0);\r\n  let q = rot2(P.axisRadians) * aspectQ;\r\n  let slope = 0.46 + P.foldSlope * 0.16;\r\n  let diagonal = q.y - abs(q.x) * slope;\r\n  let side = select(-1.0, 1.0, diagonal > 0.0);\r\n  let normal = normalize(vec2<f32>(-side * slope, 1.0));\r\n  let fold = exp(-abs(diagonal) * (22.0 / max(P.creaseWidth, 0.2)));\r\n  let audioRefraction = A.bands.y + A.bands.z * 0.7 + A.bands.w * 0.35;\r\n  let offset = normal / vec2<f32>(C.aspect, 1.0)\r\n    * fold * P.refractionStrength * (0.008 + audioRefraction * 0.010);\r\n  let refracted = safeSample(uv + offset);\r\n  let caustic = C.color.rgb * fold * (0.12 + P.refractionStrength * 0.24);\r\n  return finishEffect(plain, refracted + caustic, P.glassMix);\r\n}\r\n";
+
+// src/shaders/visual-v2-ops/rank-stretch.wgsl
+var rank_stretch_default = "struct RankStretchParams {\r\n  rankMix          : f32,\r\n  extremaMix       : f32,\r\n  searchRadiusPx   : f32,\r\n  sampleSpread     : f32,\r\n  contrastThreshold: f32,\r\n  stripeWidthPx    : f32,\r\n  axisRadians      : f32,\r\n  _pad0            : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let uv = fragUV(frag);\r\n  let plain = textureSampleLevel(src, samp, uv, 0.0);\r\n  let px = 1.0 / C.resolution;\r\n  let dir = normalize(rot2(P.axisRadians) * vec2<f32>(1.0, 0.0));\r\n  var hi = plain.rgb;\r\n  var lo = plain.rgb;\r\n  var hiLum = luminance(hi);\r\n  var loLum = hiLum;\r\n  for (var i : i32 = -3; i <= 3; i = i + 1) {\r\n    let distancePx = f32(i) * P.searchRadiusPx * (2.0 + P.sampleSpread * 3.0);\r\n    let sampleRgb = safeSample(uv + dir * px * distancePx);\r\n    let sampleLum = luminance(sampleRgb);\r\n    if (sampleLum > hiLum) {\r\n      hi = sampleRgb;\r\n      hiLum = sampleLum;\r\n    }\r\n    if (sampleLum < loLum) {\r\n      lo = sampleRgb;\r\n      loLum = sampleLum;\r\n    }\r\n  }\r\n  let stripe = step(0.5, fract(dot(uv * C.resolution, dir) / P.stripeWidthPx));\r\n  let ranked = mix(lo, hi, stripe);\r\n  let gateLow = P.contrastThreshold * 0.45;\r\n  let gateHigh = max(P.contrastThreshold, gateLow + 0.0001);\r\n  let gate = smoothstep(gateLow, gateHigh, abs(hiLum - loLum));\r\n  let effect = mix(plain.rgb, ranked, gate * P.extremaMix);\r\n  return finishEffect(plain, effect, P.rankMix);\r\n}\r\n";
+
+// src/shaders/visual-v2-ops/riso.wgsl
+var riso_default = "struct RisoParams {\r\n  printMix            : f32,\r\n  registrationStrength: f32,\r\n  registrationRadiusPx: f32,\r\n  dotDefinition       : f32,\r\n  plateBalance        : f32,\r\n  inkThreshold        : f32,\r\n  registrationRadians : f32,\r\n  _pad0               : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let uv = fragUV(frag);\r\n  let plain = textureSampleLevel(src, samp, uv, 0.0);\r\n  let px = 1.0 / C.resolution;\r\n  let shift = rot2(P.registrationRadians) * px * P.registrationRadiusPx\r\n    * (1.0 + P.registrationStrength * 6.0)\r\n    * vec2<f32>(1.0 + A.width, 1.0);\r\n  let plateAValue = luminance(safeSample(uv + shift));\r\n  let plateBValue = luminance(safeSample(uv - shift));\r\n  let cell = uv * C.resolution / (2.5 + P.dotDefinition * 3.5);\r\n  let dotScreen = 1.0 - smoothstep(0.16, 0.44, length(fract(cell) - 0.5));\r\n  let plateA = C.color.rgb\r\n    * smoothstep(0.05, max(P.inkThreshold, 0.06), plateAValue)\r\n    * (0.54 + dotScreen * 0.46);\r\n  let plateBColor = mix(\r\n    vec3<f32>(0.92, 0.20, 0.10),\r\n    vec3<f32>(0.10, 0.56, 0.82),\r\n    P.plateBalance,\r\n  );\r\n  let plateB = plateBColor\r\n    * smoothstep(0.04, max(P.inkThreshold * 1.12, 0.06), plateBValue)\r\n    * (0.45 + (1.0 - dotScreen) * 0.55);\r\n  return finishEffect(plain, plateA + plateB + plain.rgb * 0.08, P.printMix);\r\n}\r\n";
+
+// src/shaders/visual-v2-ops/edgeflow.wgsl
+var edgeflow_default = "struct EdgeflowParams {\r\n  flowMix          : f32,\r\n  advectionStrength: f32,\r\n  gradientRadiusPx : f32,\r\n  travelDetail     : f32,\r\n  structureMix     : f32,\r\n  forwardBias      : f32,\r\n  reverseTravel    : f32,\r\n  _pad0            : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let uv = fragUV(frag);\r\n  let plain = textureSampleLevel(src, samp, uv, 0.0);\r\n  let px = 1.0 / C.resolution;\r\n  let ex = luminance(safeSample(uv + vec2<f32>(px.x, 0.0) * P.gradientRadiusPx))\r\n    - luminance(safeSample(uv - vec2<f32>(px.x, 0.0) * P.gradientRadiusPx));\r\n  let ey = luminance(safeSample(uv + vec2<f32>(0.0, px.y) * P.gradientRadiusPx))\r\n    - luminance(safeSample(uv - vec2<f32>(0.0, px.y) * P.gradientRadiusPx));\r\n  let tangentRaw = vec2<f32>(-ey, ex);\r\n  let tangent = tangentRaw / max(length(tangentRaw), 0.0001);\r\n  let audioTravel = A.bands.y + A.bands.z * 0.7 + A.bands.w * 0.35;\r\n  let distancePx = P.advectionStrength\r\n    * (2.0 + P.travelDetail * 7.0)\r\n    * (0.35 + audioTravel);\r\n  let forward = safeSample(uv + tangent * px * distancePx);\r\n  let backward = safeSample(uv - tangent * px * distancePx * P.reverseTravel);\r\n  let edge = min(1.0, length(vec2<f32>(ex, ey)) * 5.0);\r\n  let advected = mix(backward, forward, P.forwardBias);\r\n  let effect = mix(plain.rgb, advected, edge * P.structureMix);\r\n  return finishEffect(plain, effect, P.flowMix);\r\n}\r\n";
+
+// src/shaders/visual-v2-ops/lensfield.wgsl
+var lensfield_default = "struct LensfieldParams {\r\n  lensMix           : f32,\r\n  refractionStrength: f32,\r\n  lensRadius        : f32,\r\n  rimDefinition     : f32,\r\n  refractionMix     : f32,\r\n  centreX           : f32,\r\n  centreY           : f32,\r\n  _pad0             : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let uv = fragUV(frag);\r\n  let plain = textureSampleLevel(src, samp, uv, 0.0);\r\n  let centreUv = vec2<f32>(0.5 + P.centreX * 0.5, 0.5 - P.centreY * 0.5);\r\n  let q = (uv - centreUv) * vec2<f32>(C.aspect, 1.0);\r\n  let radius = 0.18 + P.lensRadius * 0.17;\r\n  let r = length(q);\r\n  let inside = 1.0 - smoothstep(radius * 0.94, radius, r);\r\n  let normal = q / max(r, 0.001);\r\n  let bulge = sqrt(max(0.0, 1.0 - (r / radius) * (r / radius)));\r\n  let offset = normal / vec2<f32>(C.aspect, 1.0)\r\n    * bulge * P.refractionStrength * 0.035;\r\n  let refracted = safeSample(uv - offset);\r\n  let rim = exp(-abs(r - radius) * (90.0 / max(P.rimDefinition, 0.2)));\r\n  let audioRim = A.bands.y + A.bands.z * 0.7 + A.bands.w * 0.35;\r\n  let effect = mix(plain.rgb, refracted, inside * P.refractionMix)\r\n    + C.color.rgb * rim * (0.08 + audioRim * 0.12);\r\n  return finishEffect(plain, effect, P.lensMix);\r\n}\r\n";
+
+// src/shaders/visual-v2-ops/drop-rest.wgsl
+var drop_rest_default = "struct DropRestParams {\r\n  restMix : f32,\r\n  blackout: f32,\r\n  _pad0   : f32,\r\n  _pad1   : f32,\r\n};\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let uv = fragUV(frag);\r\n  let plain = textureSampleLevel(src, samp, uv, 0.0);\r\n  let effect = plain.rgb * (1.0 - clamp(P.blackout, 0.0, 1.0));\r\n  return finishEffect(plain, effect, P.restMix);\r\n}\r\n";
+
+// src/ops/visual-v2.ts
+function rawNumber(params, key) {
+  const raw = params[key];
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : void 0;
+}
+function num27(params, key, legacyKey, fallback, lo, hi) {
+  const value = rawNumber(params, key) ?? (legacyKey ? rawNumber(params, legacyKey) : void 0) ?? fallback;
+  return value < lo ? lo : value > hi ? hi : value;
+}
+function fract17(value) {
+  return value - Math.floor(value);
+}
+var TAU12 = Math.PI * 2;
+function musicalAxisRadians(params, ctx, spec) {
+  const offsetTurns = rawNumber(params, spec.offsetKey) ?? (rawNumber(params, "angle") ?? 0) * 0.5;
+  const hasExplicitRatio = rawNumber(params, spec.numeratorKey) !== void 0 || rawNumber(params, spec.denominatorKey) !== void 0;
+  let numerator;
+  let denominator;
+  if (hasExplicitRatio) {
+    numerator = Math.trunc(num27(
+      params,
+      spec.numeratorKey,
+      void 0,
+      spec.defaultNumerator,
+      -256,
+      256
+    ));
+    denominator = Math.max(1, Math.trunc(num27(
+      params,
+      spec.denominatorKey,
+      void 0,
+      spec.defaultDenominator,
+      1,
+      4096
+    )));
+  } else if (rawNumber(params, "rate") !== void 0) {
+    numerator = Math.round(num27(params, "rate", void 0, 0.25, -4, 4) * 8);
+    denominator = spec.legacyRateDivisor * 8;
+  } else {
+    numerator = spec.defaultNumerator;
+    denominator = spec.defaultDenominator;
+  }
+  return fract17(offsetTurns + ctx.bars * numerator / denominator) * TAU12;
+}
+function pass4(type) {
+  return (module) => {
+    const shape = {
+      type,
+      family: "operator",
+      input: "accumulator",
+      usesAudio: module.usesAudio,
+      uniformFloats: module.uniformFloats,
+      code: ""
+    };
+    const params = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : ${module.structName};`;
+    return {
+      ...shape,
+      code: [
+        PASS_COMMON_WGSL,
+        module.usesAudio ? AUDIO_WGSL : "",
+        passBindingsWGSL(shape),
+        common_default2,
+        module.shader,
+        params
+      ].filter(Boolean).join("\n"),
+      // Replace operators stay full resolution: a lower-scale identity would be
+      // a down/up-sampled copy, not the byte-preserving accumulator.
+      defaultResolutionScale: 1,
+      writeUniforms: module.writeUniforms
+    };
+  };
+}
+var negativeSpacePass = pass4("negative-space")({
+  structName: "NegativeSpaceParams",
+  uniformFloats: 8,
+  shader: negative_space_default,
+  usesAudio: true,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[0] = num27(p, "apertureMix", "amount", 1, 0, 1);
+    out[1] = num27(p, "outsideDim", "strength", 0.5, 0, 1);
+    out[2] = num27(p, "apertureRadius", "radius", 1, 0.1, 8);
+    out[3] = num27(p, "edgeDefinition", "detail", 1, 0.1, 6);
+    out[4] = num27(p, "centreX", "focusX", -0.22, -1.5, 1.5);
+    out[5] = num27(p, "centreY", "focusY", 0.06, -1.5, 1.5);
+  }
+});
+var diffractionPass = pass4("diffraction")({
+  structName: "DiffractionParams",
+  uniformFloats: 8,
+  shader: diffraction_default,
+  usesAudio: true,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[0] = num27(p, "flareMix", "amount", 1, 0, 1);
+    out[1] = num27(p, "flareGain", "strength", 0.5, 0, 4);
+    out[2] = num27(p, "sampleRadiusPx", "radius", 1, 0.1, 8);
+    out[3] = num27(p, "sampleSpacing", "detail", 1, 0.1, 6);
+    out[4] = num27(p, "luminanceThreshold", "threshold", 0.55, 0, 4);
+    out[5] = num27(p, "spectralTint", "mix", 1, 0, 1);
+    out[6] = musicalAxisRadians(p, ctx, {
+      offsetKey: "axisOffsetTurns",
+      numeratorKey: "axisTurnNumerator",
+      denominatorKey: "axisBarDenominator",
+      defaultNumerator: 1,
+      defaultDenominator: 128,
+      legacyRateDivisor: 32
+    });
+  }
+});
+var engravePass = pass4("engrave")({
+  structName: "EngraveParams",
+  uniformFloats: 8,
+  shader: engrave_default,
+  usesAudio: false,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[0] = num27(p, "engravingMix", "amount", 1, 0, 1);
+    out[1] = num27(p, "edgeGain", "strength", 0.5, 0, 4);
+    out[2] = num27(p, "gradientRadiusPx", "radius", 1, 0.1, 8);
+    out[3] = num27(p, "hatchDefinition", "detail", 1, 0.1, 6);
+    out[4] = num27(p, "markThreshold", "threshold", 0.55, 0, 4);
+    out[5] = (rawNumber(p, "hatchOffsetTurns") ?? (rawNumber(p, "angle") ?? 0) * 0.5) * TAU12;
+  }
+});
+var foldglassPass = pass4("foldglass")({
+  structName: "FoldglassParams",
+  uniformFloats: 8,
+  shader: foldglass_default,
+  usesAudio: true,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[0] = num27(p, "glassMix", "amount", 1, 0, 1);
+    out[1] = num27(p, "refractionStrength", "strength", 0.5, 0, 4);
+    out[2] = num27(p, "creaseWidth", "radius", 1, 0.1, 8);
+    out[3] = num27(p, "foldSlope", "detail", 1, 0.1, 6);
+    out[4] = num27(p, "centreX", "focusX", -0.22, -1.5, 1.5);
+    out[5] = num27(p, "centreY", "focusY", 0.06, -1.5, 1.5);
+    out[6] = musicalAxisRadians(p, ctx, {
+      offsetKey: "foldOffsetTurns",
+      numeratorKey: "foldTurnNumerator",
+      denominatorKey: "foldBarDenominator",
+      defaultNumerator: 1,
+      defaultDenominator: 256,
+      legacyRateDivisor: 64
+    });
+  }
+});
+var rankStretchPass = pass4("rank-stretch")({
+  structName: "RankStretchParams",
+  uniformFloats: 8,
+  shader: rank_stretch_default,
+  usesAudio: false,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    const detail = num27(p, "sampleSpread", "detail", 1, 0.1, 6);
+    out[0] = num27(p, "rankMix", "amount", 1, 0, 1);
+    out[1] = num27(p, "extremaMix", "strength", 0.5, 0, 1);
+    out[2] = num27(p, "searchRadiusPx", "radius", 1, 0.1, 8);
+    out[3] = detail;
+    out[4] = num27(p, "contrastThreshold", "threshold", 0.55, 0, 4);
+    out[5] = num27(p, "stripeWidthPx", void 0, 7 + detail * 9, 1, 128);
+    out[6] = musicalAxisRadians(p, ctx, {
+      offsetKey: "scanOffsetTurns",
+      numeratorKey: "scanTurnNumerator",
+      denominatorKey: "scanBarDenominator",
+      defaultNumerator: 1,
+      defaultDenominator: 256,
+      legacyRateDivisor: 64
+    });
+  }
+});
+var risoPass = pass4("riso")({
+  structName: "RisoParams",
+  uniformFloats: 8,
+  shader: riso_default,
+  usesAudio: true,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[0] = num27(p, "printMix", "amount", 1, 0, 1);
+    out[1] = num27(p, "registrationStrength", "strength", 0.5, 0, 4);
+    out[2] = num27(p, "registrationRadiusPx", "radius", 1, 0.1, 8);
+    out[3] = num27(p, "dotDefinition", "detail", 1, 0.1, 6);
+    out[4] = num27(p, "plateBalance", "mix", 1, 0, 1);
+    out[5] = num27(p, "inkThreshold", "threshold", 0.55, 0, 4);
+    out[6] = (rawNumber(p, "registrationOffsetTurns") ?? (rawNumber(p, "angle") ?? 0) * 0.5) * TAU12;
+  }
+});
+var edgeflowPass = pass4("edgeflow")({
+  structName: "EdgeflowParams",
+  uniformFloats: 8,
+  shader: edgeflow_default,
+  usesAudio: true,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[0] = num27(p, "flowMix", "amount", 1, 0, 1);
+    out[1] = num27(p, "advectionStrength", "strength", 0.5, 0, 4);
+    out[2] = num27(p, "gradientRadiusPx", "radius", 1, 0.1, 8);
+    out[3] = num27(p, "travelDetail", "detail", 1, 0.1, 6);
+    out[4] = num27(p, "structureMix", "mix", 1, 0, 1);
+    out[5] = num27(p, "forwardBias", void 0, 0.66, 0, 1);
+    out[6] = num27(p, "reverseTravel", void 0, 0.55, 0, 2);
+  }
+});
+var lensfieldPass = pass4("lensfield")({
+  structName: "LensfieldParams",
+  uniformFloats: 8,
+  shader: lensfield_default,
+  usesAudio: true,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[0] = num27(p, "lensMix", "amount", 1, 0, 1);
+    out[1] = num27(p, "refractionStrength", "strength", 0.5, 0, 4);
+    out[2] = num27(p, "lensRadius", "radius", 1, 0.1, 8);
+    out[3] = num27(p, "rimDefinition", "detail", 1, 0.1, 6);
+    out[4] = num27(p, "refractionMix", "mix", 1, 0, 1);
+    out[5] = num27(p, "centreX", "focusX", -0.22, -1.5, 1.5);
+    out[6] = num27(p, "centreY", "focusY", 0.06, -1.5, 1.5);
+  }
+});
+var dropRestPass = pass4("drop-rest")({
+  structName: "DropRestParams",
+  uniformFloats: 4,
+  shader: drop_rest_default,
+  usesAudio: false,
+  writeUniforms(out, ctx) {
+    const p = ctx.params;
+    out[0] = num27(p, "restMix", "amount", 1, 0, 1);
+    out[1] = num27(p, "blackout", "strength", 0.5, 0, 1);
+  }
+});
+var VISUAL_V2_OPERATOR_PASSES = [
+  negativeSpacePass,
+  diffractionPass,
+  engravePass,
+  foldglassPass,
+  rankStretchPass,
+  risoPass,
+  edgeflowPass,
+  lensfieldPass,
+  dropRestPass
+];
+
+// src/shaders/op-temporal-v2.wgsl
+var op_temporal_v2_default = "// AAAVS V2 history operators. Common/audio/input/history bindings and Params\r\n// are prepended by ops/temporal-v2.ts. Opacity is applied by the composite pass.\r\n\r\nstruct Params {\r\n  mode : f32, keep : f32, inject : f32, driftX : f32,\r\n  driftY : f32, split : f32, rate : f32, detail : f32,\r\n  focusX : f32, focusY : f32, knee : f32, ceiling : f32,\r\n};\r\n\r\nconst TAU : f32 = 6.28318530718;\r\nconst CLOCK_HALF : f32 = 1.0 / 2.0;\r\n\r\nfn hash21(p : vec2<f32>) -> f32 {\r\n  var q = fract(vec3<f32>(p.xyx) * 0.1031);\r\n  q = q + dot(q, q.yzx + 33.33);\r\n  return fract((q.x + q.y) * q.z);\r\n}\r\n\r\nfn softClip(v : vec3<f32>) -> vec3<f32> {\r\n  let head = max(v - vec3<f32>(P.knee), vec3<f32>(0.0));\r\n  let room = max(P.ceiling - P.knee, 0.05);\r\n  return min(v, vec3<f32>(P.knee)) + (vec3<f32>(1.0) - exp(-head / room)) * room;\r\n}\r\n\r\n@vertex\r\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\r\n  return fullscreenTriangle(vi);\r\n}\r\n\r\n@fragment\r\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\r\n  let uv = fragUV(frag);\r\n  let plain = textureSampleLevel(src, samp, uv, 0.0).rgb;\r\n  let baseShift = vec2<f32>(P.driftX, -P.driftY);\r\n  var memory = vec3<f32>(0.0);\r\n\r\n  if (P.mode < 0.5) {\r\n    // TEMPORAL PRISM \u2014 the three channels follow subtly different history\r\n    // paths around one off-centre origin. This creates time separation, not a\r\n    // one-frame chromatic aberration.\r\n    let focus = vec2<f32>(0.5 + P.focusX * 0.5, 0.5 - P.focusY * 0.5);\r\n    let q = uv - focus;\r\n    let radial = q / max(length(q), 0.0001);\r\n    let tangent = vec2<f32>(-radial.y, radial.x);\r\n    let pulse = 0.65 + 0.35 * sin(C.bars * P.rate * TAU + length(q) * (8.0 + P.detail * 4.0));\r\n    let split = tangent * P.split * pulse * (0.55 + A.width * 0.9);\r\n    let oldR = textureSampleLevel(hist, samp, clamp(uv + baseShift + split, vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).r;\r\n    let oldG = textureSampleLevel(hist, samp, clamp(uv + baseShift, vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).g;\r\n    let oldB = textureSampleLevel(hist, samp, clamp(uv + baseShift - split, vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).b;\r\n    memory = vec3<f32>(oldR, oldG, oldB) * P.keep + plain * P.inject;\r\n  } else {\r\n    // SLIT MEMORY \u2014 vertical strips sample different positions from one\r\n    // recursively accumulated history texture. This is spatially offset\r\n    // feedback, not a multi-age history atlas. The sweep is bar-locked.\r\n    let strips = 8.0 + floor(P.detail * 18.0);\r\n    let strip = floor(uv.x * strips);\r\n    let seed = hash21(vec2<f32>(strip, C.seed));\r\n    let sweep = fract(C.bars * P.rate + seed);\r\n    let ageOffset = vec2<f32>(0.0, (sweep - 0.5) * P.split * (8.0 + P.detail * 4.0));\r\n    let old = textureSampleLevel(hist, samp, clamp(uv + baseShift + ageOffset, vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb;\r\n    let slit = exp(-abs(fract(uv.x * strips - C.bars * P.rate * CLOCK_HALF) - 0.5) * 14.0);\r\n    memory = old * P.keep + plain * P.inject * (0.48 + slit * 1.35);\r\n  }\r\n\r\n  return vec4<f32>(softClip(max(memory, vec3<f32>(0.0))), 1.0);\r\n}\r\n";
+
+// src/ops/temporal-v2.ts
+var PARAMS3 = `@group(${PASS_GROUP}) @binding(${PASS_BINDING.params}) var<uniform> P : Params;`;
+var UNIFORM_FLOATS8 = 12;
+var MODES6 = { "temporal-prism": 0, "slit-memory": 1 };
+function num28(params, key, fallback, lo, hi) {
+  const raw = params[key];
+  const value = typeof raw === "number" && Number.isFinite(raw) ? raw : fallback;
+  return value < lo ? lo : value > hi ? hi : value;
+}
+function pass5(type) {
+  const shape = {
+    type,
+    family: "feedback",
+    input: "accumulator",
+    history: true,
+    usesAudio: true,
+    uniformFloats: UNIFORM_FLOATS8,
+    code: ""
+  };
+  return {
+    ...shape,
+    code: [PASS_COMMON_WGSL, AUDIO_WGSL, passBindingsWGSL(shape), PARAMS3, op_temporal_v2_default].join("\n"),
+    defaultResolutionScale: 0.5,
+    writeUniforms(out, ctx) {
+      const p = ctx.params;
+      const dt = Math.max(0, Math.min(Number.isFinite(ctx.dtBeats) ? ctx.dtBeats : 0, 0.5));
+      const tau = num28(p, "tauBeats", 1.5, 0.05, 32);
+      const keep = Math.exp(-dt / tau);
+      const gain = num28(p, "gain", 0.72, 0, 2.5);
+      const energy = ctx.audio.bands.mid + ctx.audio.bands.high * 0.45;
+      const knee = num28(p, "clipKnee", 0.78, 0, 4);
+      out[0] = MODES6[type];
+      out[1] = keep;
+      out[2] = gain * (1 - keep) * (0.62 + energy * 0.72);
+      const barStep = dt / 4;
+      out[3] = num28(p, "driftX", 0, -2, 2) * barStep;
+      out[4] = num28(p, "driftY", 0, -2, 2) * barStep;
+      out[5] = num28(p, "splitPx", 2, 0, 64) / Math.max(1, Math.min(ctx.width, ctx.height));
+      out[6] = num28(p, "rate", 0.25, -4, 4);
+      out[7] = num28(p, "detail", 1, 0.1, 6);
+      out[8] = num28(p, "focusX", -0.18, -1.5, 1.5);
+      out[9] = num28(p, "focusY", 0.08, -1.5, 1.5);
+      out[10] = knee;
+      out[11] = Math.max(num28(p, "clipCeiling", 1.24, 0, 6), knee + 0.05);
+    }
+  };
+}
+var temporalPrismPass = pass5("temporal-prism");
+var slitMemoryPass = pass5("slit-memory");
+var TEMPORAL_V2_PASSES = [temporalPrismPass, slitMemoryPass];
+
+// src/ops/index.ts
+var OPERATOR_PASSES = [
+  // V2 first: authored composition and genuine temporal treatments.
+  ...VISUAL_V2_OPERATOR_PASSES,
+  ...TEMPORAL_V2_PASSES,
+  ditherPass,
+  feedbackPass,
+  kaleidoPass,
+  mirrorPass,
+  polarPass,
+  tilePass,
+  bloomPass,
+  chromaticPass,
+  displacePass,
+  glitchPass,
+  gradePass,
+  crtPass,
+  contourPass,
+  neonPass,
+  scanwarpPass
+];
+
+// src/ui.ts
+var FAMILIES2 = ["source", "warp", "color", "feedback", "operator"];
+var BLENDS2 = [
+  "replace",
+  "add",
+  "max",
+  "min",
+  "50/50",
+  "subtract",
+  "multiply",
+  "xor",
+  "adjustable",
+  "alpha"
+];
+var PALETTE_SLOTS = ["bg", "primary", "secondary", "accent"];
+var DIVISION_NAMES2 = Object.keys(DIVISIONS);
+var DEFAULT_RESOLUTION_SCALE = 0.5;
+var DEFAULT_STYLE_HREF = new URL("./ui.css", import.meta.url).href;
+var DEFAULT_TOGGLE_KEY = "l";
+function hotSet(spec, key, value) {
+  spec[key] = value;
+}
+function defaultLayerSpec(id, type, family, resolutionScale = DEFAULT_RESOLUTION_SCALE) {
+  return {
+    id,
+    type,
+    family,
+    params: {},
+    // A source with `replace` would erase everything under it, which reads as
+    // "adding a layer broke the stack". Additive is the AVS default and the
+    // forgiving one; everything else transforms what is already there.
+    blend: family === "source" ? "add" : "replace",
+    opacity: 1,
+    envelope: { attackBeats: 0.125, holdBeats: 0, releaseBeats: 1 },
+    trigger: { division: "beat", euclidK: 1, euclidN: 1, probability: 1, offsetSteps: 0 },
+    anchor: "peak",
+    palette: "primary",
+    enabled: true,
+    resolutionScale
+  };
+}
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className !== void 0) node.className = className;
+  if (text !== void 0) node.textContent = text;
+  return node;
+}
+function fillSelect(node, values, current) {
+  for (const v of values) {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = v;
+    node.append(opt);
+  }
+  node.value = current;
+}
+function iconButton(glyph, label, extra = "") {
+  const b = el("button", `ui-icon ${extra}`.trim(), glyph);
+  b.type = "button";
+  b.title = label;
+  b.setAttribute("aria-label", label);
+  return b;
+}
+function isTextEntry(node) {
+  if (!(node instanceof HTMLElement)) return false;
+  if (node.isContentEditable) return true;
+  if (node instanceof HTMLTextAreaElement || node instanceof HTMLSelectElement) return true;
+  if (node instanceof HTMLInputElement) {
+    return node.type !== "button" && node.type !== "checkbox" && node.type !== "radio";
+  }
+  return false;
+}
+function clamp10(v, lo, hi) {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+function slug(name) {
+  const s = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return s.length > 0 ? s : "preset";
+}
+var LayerUI = class {
+  root;
+  /** Present only when a preset bank was supplied. */
+  presetSelect = null;
+  autoBox = null;
+  opts;
+  stack;
+  toggleKey;
+  /** The parts of a preset `LayerStack` does not hold. */
+  presetName;
+  presetSeed;
+  palette;
+  body;
+  toggleBtn;
+  list;
+  statusLine;
+  addSelect;
+  addButton;
+  nameInput;
+  seedInput;
+  /** Transport readouts. Written per frame, so they are held rather than queried. */
+  outBpm;
+  outLock;
+  outPos;
+  lastBpmText = "";
+  lastLockText = "";
+  lastPosText = "";
+  openState;
+  /** Id of the row being dragged, or null. The only drag state that needs to outlive an event. */
+  dragId = null;
+  /** Monotonic, for `for`/`id` pairs. Not a layer identity — layer ids can contain anything. */
+  uid = 0;
+  constructor(opts) {
+    this.opts = opts;
+    this.stack = opts.stack;
+    this.toggleKey = (opts.toggleKey ?? DEFAULT_TOGGLE_KEY).toLowerCase();
+    this.presetName = opts.preset.name;
+    this.presetSeed = opts.preset.seed;
+    this.palette = opts.preset.palette;
+    this.openState = opts.open ?? true;
+    ensureStylesheet(opts.styleHref ?? DEFAULT_STYLE_HREF);
+    this.root = el("section");
+    this.root.id = "aaavs-ui";
+    this.root.setAttribute("aria-label", "Layer stack");
+    const head = el("div", "ui-head");
+    const title = el("h2", "ui-title");
+    title.innerHTML = "<b>aaavs</b><span>live set</span>";
+    this.toggleBtn = el("button", "ui-icon", "\u2013");
+    this.toggleBtn.type = "button";
+    this.toggleBtn.title = `Collapse or expand (${this.toggleKey})`;
+    this.toggleBtn.setAttribute("aria-label", "Collapse or expand the layer stack panel");
+    this.toggleBtn.addEventListener("click", () => this.toggle());
+    head.append(title, this.toggleBtn);
+    this.body = el("div", "ui-body");
+    this.body.id = "aaavs-ui-body";
+    this.toggleBtn.setAttribute("aria-controls", this.body.id);
+    const transport = el("div", "ui-section ui-transport-section");
+    const transportLegend = el("span", "ui-legend", "live transport");
+    const stats2 = el("dl", "ui-transport");
+    const bpmStat = this.stat("tempo", "bpm");
+    const lockStat = this.stat("lock", "confidence");
+    const posStat = this.stat("position", "bar . beat");
+    this.outBpm = bpmStat.value;
+    this.outLock = lockStat.value;
+    this.outPos = posStat.value;
+    stats2.append(bpmStat.node, lockStat.node, posStat.node);
+    transport.append(transportLegend, stats2);
+    const presetSection = el("div", "ui-section ui-preset-section");
+    if (opts.presets && opts.presets.length > 0) {
+      const presetLegend = el("span", "ui-legend", "look");
+      const row = el("div", "ui-preset-row");
+      const pid = this.nextId("preset");
+      const plabel = el("label", "ui-sr-only", "Preset bank");
+      plabel.htmlFor = pid;
+      this.presetSelect = el("select");
+      this.presetSelect.id = pid;
+      this.presetSelect.className = "ui-preset-select";
+      for (const p of opts.presets) {
+        const o = el("option");
+        o.value = p.name;
+        o.textContent = p.name;
+        this.presetSelect.append(o);
+      }
+      this.presetSelect.value = opts.preset.name;
+      this.presetSelect.addEventListener("change", () => {
+        opts.onPickPreset?.(this.presetSelect.value);
+      });
+      const autoId = this.nextId("auto");
+      const autoWrap = el("label", "ui-check ui-auto");
+      this.autoBox = el("input");
+      this.autoBox.type = "checkbox";
+      this.autoBox.id = autoId;
+      this.autoBox.addEventListener("change", () => {
+        opts.onAutoChange?.(this.autoBox.checked);
+      });
+      autoWrap.append(this.autoBox, document.createTextNode("auto / responsive 2\u201312 bars"));
+      row.append(plabel, this.presetSelect);
+      presetSection.append(presetLegend, row, autoWrap);
+    }
+    const layers = el("div", "ui-section ui-layers-section");
+    const layersLegend = el(
+      "span",
+      "ui-legend",
+      "layer stack"
+    );
+    this.list = el("ul", "ui-list");
+    const addRow = el("div", "ui-actions");
+    const addId = this.nextId("add-type");
+    const addLabel = el("label", "ui-legend", "add layer");
+    addLabel.htmlFor = addId;
+    this.addSelect = el("select");
+    this.addSelect.id = addId;
+    this.addSelect.className = "ui-grow";
+    this.addButton = el("button", "ui-primary", "add layer");
+    this.addButton.type = "button";
+    this.addButton.addEventListener("click", () => this.addLayer());
+    const addWrap = el("div", "ui-field is-wide");
+    addWrap.append(addLabel);
+    addRow.append(this.addSelect, this.addButton);
+    addWrap.append(addRow);
+    layers.append(layersLegend, this.list, addWrap);
+    const preset2 = el("details", "ui-section ui-preset-tools");
+    const presetSummary = el("summary", "ui-disclosure", "preset tools");
+    preset2.append(presetSummary);
+    const nameId = this.nextId("name");
+    const nameField = el("div", "ui-field is-wide");
+    const nameLabel = el("label", void 0, "name");
+    nameLabel.htmlFor = nameId;
+    this.nameInput = el("input");
+    this.nameInput.id = nameId;
+    this.nameInput.type = "text";
+    this.nameInput.value = this.presetName;
+    this.nameInput.addEventListener("input", () => {
+      this.presetName = this.nameInput.value;
+      this.edited();
+    });
+    nameField.append(nameLabel, this.nameInput);
+    const seedId = this.nextId("seed");
+    const seedField = el("div", "ui-field is-wide");
+    const seedLabel = el("label", void 0, "seed \u2014 changing it reloads the stack");
+    seedLabel.htmlFor = seedId;
+    this.seedInput = el("input");
+    this.seedInput.id = seedId;
+    this.seedInput.type = "number";
+    this.seedInput.min = "0";
+    this.seedInput.max = String(4294967295);
+    this.seedInput.step = "1";
+    this.seedInput.value = String(this.presetSeed);
+    this.seedInput.addEventListener("change", () => this.applySeed());
+    seedField.append(seedLabel, this.seedInput);
+    const actions = el("div", "ui-actions");
+    const saveBtn = el("button", "ui-primary", "save file");
+    saveBtn.type = "button";
+    saveBtn.addEventListener("click", () => this.savePreset());
+    const fileId = this.nextId("load");
+    const fileLabel = el("label", "ui-file", "load file");
+    fileLabel.htmlFor = fileId;
+    const fileInput = el("input");
+    fileInput.id = fileId;
+    fileInput.type = "file";
+    fileInput.accept = "application/json,.json";
+    fileInput.addEventListener("change", () => {
+      void this.loadPresetFile(fileInput);
+    });
+    fileLabel.append(fileInput);
+    const urlBtn = el("button", "ui-quiet", "copy URL");
+    urlBtn.type = "button";
+    urlBtn.addEventListener("click", () => {
+      void this.copyUrl();
+    });
+    actions.append(saveBtn, fileLabel, urlBtn);
+    this.statusLine = el("p", "ui-status");
+    this.statusLine.setAttribute("role", "status");
+    this.statusLine.setAttribute("aria-live", "polite");
+    preset2.append(nameField, seedField, actions, this.statusLine);
+    this.body.append(transport, presetSection, layers, preset2);
+    this.root.append(head, this.body);
+    (opts.host ?? document.body).append(this.root);
+    this.attachListDropTarget();
+    this.fillTypeMenu();
+    this.refresh();
+    this.setOpen(this.openState);
+    window.addEventListener("keydown", this.onKeyCapture, true);
+  }
+  // -------------------------------------------------------------------------
+  // Public surface
+  // -------------------------------------------------------------------------
+  get open() {
+    return this.openState;
+  }
+  setOpen(open) {
+    this.openState = open;
+    this.body.hidden = !open;
+    this.toggleBtn.textContent = open ? "\u2013" : "+";
+    this.toggleBtn.setAttribute("aria-expanded", String(open));
+  }
+  toggle() {
+    this.setOpen(!this.openState);
+  }
+  /**
+   * Adopt a preset the host has already loaded into the stack.
+   *
+   * Deliberately does NOT call `stack.load` itself. The host has more to reset
+   * than the stack does — feedback targets, renderer caches, the palette the
+   * shaders read — and a panel that reloaded the stack behind the host's back
+   * would leave those pointing at the old preset, which renders as a stack that
+   * looks right and is coloured wrong.
+   */
+  setPreset(preset2) {
+    this.presetName = preset2.name;
+    this.presetSeed = preset2.seed;
+    this.palette = preset2.palette;
+    this.nameInput.value = preset2.name;
+    this.seedInput.value = String(preset2.seed);
+    if (this.presetSelect) {
+      const has = [...this.presetSelect.options].some((o) => o.value === preset2.name);
+      if (has) this.presetSelect.value = preset2.name;
+    }
+    this.refresh();
+  }
+  /** Reflect the director's enabled state, which the keyboard can also change. */
+  setAuto(enabled) {
+    if (this.autoBox) this.autoBox.checked = enabled;
+  }
+  /** The preset as it stands: stack order plus the metadata this panel holds. */
+  getPreset() {
+    return {
+      version: PRESET_VERSION,
+      name: this.presetName,
+      seed: this.presetSeed,
+      layers: this.stack.all.map((l) => l.spec),
+      palette: this.palette
+    };
+  }
+  /** Rebuild the layer list from the stack. Call after any external mutation. */
+  refresh() {
+    this.list.replaceChildren();
+    const layers = this.stack.all;
+    if (layers.length === 0) {
+      const empty = el("li", "ui-empty", "no layers \u2014 the stack renders black.");
+      this.list.append(empty);
+      return;
+    }
+    layers.forEach((layer2, i) => this.list.append(this.buildRow(layer2.spec, i)));
+  }
+  /**
+   * Per-frame transport readout.
+   *
+   * Writes only when the rendered text actually changes. At 120 fps three
+   * unconditional `textContent` assignments per frame is three style
+   * invalidations per frame for a number that changes at ~2 Hz, and the panel
+   * is not allowed to cost the render budget it sits next to (§4.11).
+   */
+  update(readout) {
+    if (!this.openState) return;
+    const bpmText = readout.bpm > 0 ? readout.bpm.toFixed(1) : "\u2014";
+    if (bpmText !== this.lastBpmText) {
+      this.outBpm.textContent = bpmText;
+      this.outBpm.classList.toggle("is-idle", readout.bpm <= 0);
+      this.lastBpmText = bpmText;
+    }
+    const pct = Math.round(clamp10(readout.confidence, 0, 1) * 100);
+    const lockText = readout.locked ? `${pct}%` : "listening";
+    if (lockText !== this.lastLockText) {
+      this.outLock.textContent = lockText;
+      this.outLock.classList.toggle("is-idle", !readout.locked);
+      this.lastLockText = lockText;
+    }
+    const beats = Math.max(0, readout.beats);
+    const bar = Math.floor(beats / 4) + 1;
+    const beat = Math.floor(beats % 4) + 1;
+    const posText = `${bar}.${beat}`;
+    if (posText !== this.lastPosText) {
+      this.outPos.textContent = posText;
+      this.lastPosText = posText;
+    }
+  }
+  dispose() {
+    window.removeEventListener("keydown", this.onKeyCapture, true);
+    this.root.remove();
+  }
+  // -------------------------------------------------------------------------
+  // Keyboard
+  // -------------------------------------------------------------------------
+  /**
+   * Capture phase on `window`, so it runs before the bubble-phase shortcut
+   * handler `main.ts` installed on the same node — capture always precedes
+   * bubble, whichever was registered first, and `stopPropagation` here means the
+   * event never reaches the bubble phase at all.
+   *
+   * The event is stopped, not prevented: the keystroke still reaches the field
+   * and still types. Only the page's listeners are cut out. `stopPropagation`
+   * rather than `stopImmediatePropagation` because other capture-phase
+   * listeners on `window` are none of this panel's business.
+   */
+  onKeyCapture = (e) => {
+    if (isTextEntry(e.target)) {
+      e.stopPropagation();
+      return;
+    }
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key.toLowerCase() === this.toggleKey) {
+      this.toggle();
+      e.stopPropagation();
+    }
+  };
+  // -------------------------------------------------------------------------
+  // Rows
+  // -------------------------------------------------------------------------
+  buildRow(spec, index) {
+    const li = el("li", "ui-layer");
+    li.dataset["id"] = spec.id;
+    const layer2 = this.stack.find(spec.id);
+    const muted = layer2?.muted ?? false;
+    if (muted) li.classList.add("is-muted");
+    const head = el("div", "ui-layer-head");
+    const grip = iconButton("\u2059", `Drag to reorder ${spec.type}`, "ui-grip");
+    grip.draggable = true;
+    grip.addEventListener("dragstart", (e) => {
+      this.dragId = spec.id;
+      li.classList.add("is-dragging");
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", spec.id);
+      }
+    });
+    grip.addEventListener("dragend", () => {
+      this.dragId = null;
+      this.clearDropMarks();
+      li.classList.remove("is-dragging");
+    });
+    const name = el("span", "ui-type", spec.type);
+    const idx = el("span", "ui-index", String(index));
+    const enable = el("button", "ui-icon", spec.enabled ? "\u25CF" : "\u25CB");
+    enable.type = "button";
+    enable.title = "Enabled";
+    enable.setAttribute("aria-label", `Enable ${spec.type}`);
+    enable.setAttribute("aria-pressed", String(spec.enabled));
+    enable.addEventListener("click", () => {
+      const next = !spec.enabled;
+      hotSet(spec, "enabled", next);
+      enable.setAttribute("aria-pressed", String(next));
+      enable.textContent = next ? "\u25CF" : "\u25CB";
+      this.edited();
+    });
+    const solo = iconButton("S", `Solo ${spec.type}`, "ui-solo");
+    solo.setAttribute("aria-pressed", String(this.stack.isSoloed(spec.id)));
+    solo.addEventListener("click", () => {
+      const next = !this.stack.isSoloed(spec.id);
+      this.stack.setSolo(spec.id, next);
+      solo.setAttribute("aria-pressed", String(next));
+      this.edited();
+    });
+    const mute = iconButton("M", `Mute ${spec.type}`);
+    mute.setAttribute("aria-pressed", String(muted));
+    mute.addEventListener("click", () => {
+      const next = !(this.stack.find(spec.id)?.muted ?? false);
+      this.stack.setMuted(spec.id, next);
+      mute.setAttribute("aria-pressed", String(next));
+      li.classList.toggle("is-muted", next);
+      this.edited();
+    });
+    const up = iconButton("\u25B2", `Move ${spec.type} earlier`);
+    up.disabled = index === 0;
+    up.addEventListener("click", () => this.move(spec.id, index - 1));
+    const down = iconButton("\u25BC", `Move ${spec.type} later`);
+    down.disabled = index >= this.stack.length - 1;
+    down.addEventListener("click", () => this.move(spec.id, index + 1));
+    const del = iconButton("\xD7", `Remove ${spec.type}`, "ui-danger");
+    del.addEventListener("click", () => {
+      this.stack.remove(spec.id);
+      this.refresh();
+      this.edited();
+    });
+    head.append(grip, idx, name, enable, solo, mute, up, down, del);
+    const fields = el("div", "ui-fields");
+    const familySelect = el("select");
+    fillSelect(familySelect, FAMILIES2, spec.family);
+    const familyNote = el("p", "ui-note");
+    familyNote.hidden = true;
+    const checkFamily = () => {
+      const registered = this.opts.registry?.get(spec.type);
+      const wrong = registered !== void 0 && registered.family !== spec.family;
+      familyNote.hidden = !wrong;
+      if (wrong && registered) {
+        familyNote.textContent = `${spec.type} is registered as '${registered.family}'. The renderer will refuse this pass.`;
+      }
+    };
+    familySelect.addEventListener("change", () => {
+      hotSet(spec, "family", familySelect.value);
+      checkFamily();
+      this.edited();
+    });
+    checkFamily();
+    const blendSelect = el("select");
+    fillSelect(blendSelect, BLENDS2, spec.blend);
+    blendSelect.addEventListener("change", () => {
+      hotSet(spec, "blend", blendSelect.value);
+      mixField.hidden = blendSelect.value !== "adjustable";
+      this.edited();
+    });
+    const opacityRow = this.rangeField("opacity", spec.opacity, 0, 1, 0.01, (v) => {
+      hotSet(spec, "opacity", v);
+    });
+    const divisionSelect = el("select");
+    fillSelect(divisionSelect, DIVISION_NAMES2, spec.trigger.division);
+    divisionSelect.addEventListener("change", () => {
+      this.rebuild(spec.id, {
+        ...spec,
+        trigger: { ...spec.trigger, division: divisionSelect.value }
+      });
+    });
+    const paletteSelect = el("select");
+    fillSelect(paletteSelect, PALETTE_SLOTS, spec.palette);
+    paletteSelect.addEventListener("change", () => {
+      hotSet(spec, "palette", paletteSelect.value);
+      this.edited();
+    });
+    const scaleRow = this.rangeField("res scale", spec.resolutionScale, 0.05, 1, 0.05, (v) => {
+      hotSet(spec, "resolutionScale", v);
+    });
+    const envField = el("div", "ui-field is-wide");
+    const envGrid = el("div", "ui-triple");
+    const envIds = [this.nextId("atk"), this.nextId("hold"), this.nextId("rel")];
+    const envLabel = el("label", void 0, "envelope \u2014 attack / hold / release, in beats");
+    envLabel.htmlFor = envIds[0] ?? "";
+    const envKeys = ["attackBeats", "holdBeats", "releaseBeats"];
+    envKeys.forEach((key, i) => {
+      const input = el("input");
+      input.id = envIds[i] ?? "";
+      input.type = "number";
+      input.min = "0";
+      input.max = "256";
+      input.step = "0.125";
+      input.value = String(spec.envelope[key]);
+      input.title = key;
+      input.setAttribute("aria-label", `${key} in beats`);
+      input.addEventListener("input", () => {
+        const v = Number(input.value);
+        if (!Number.isFinite(v)) return;
+        hotSet(spec, "envelope", { ...spec.envelope, [key]: clamp10(v, 0, 256) });
+        this.edited();
+      });
+      envGrid.append(input);
+    });
+    envField.append(envLabel, envGrid);
+    const mixField = this.rangeField("blend mix", numberParam(spec, "mix", 0.5), 0, 1, 0.01, (v) => {
+      hotSet(spec, "params", { ...spec.params, mix: v });
+    });
+    mixField.hidden = spec.blend !== "adjustable";
+    fields.append(
+      this.field("family", familySelect),
+      this.field("blend", blendSelect),
+      opacityRow,
+      scaleRow,
+      this.field("clock", divisionSelect),
+      this.field("palette", paletteSelect),
+      envField,
+      mixField,
+      familyNote
+    );
+    li.append(head, fields);
+    this.attachDropTarget(li, spec.id);
+    return li;
+  }
+  /** `<div class="ui-field"><label for><control></div>`, with the pairing done once. */
+  field(labelText, control, wide = false) {
+    const id = this.nextId(labelText.replace(/\s+/g, "-"));
+    control.id = id;
+    const wrap2 = el("div", wide ? "ui-field is-wide" : "ui-field");
+    const label = el("label", void 0, labelText);
+    label.htmlFor = id;
+    wrap2.append(label, control);
+    return wrap2;
+  }
+  /**
+   * A labelled slider with a live numeric readout.
+   *
+   * `input`, not `change`: these all write hot fields, so dragging shows the
+   * result on the next frame, which is the entire reason hot fields exist.
+   */
+  rangeField(labelText, value, min, max, step, apply) {
+    const id = this.nextId(labelText.replace(/\s+/g, "-"));
+    const wrap2 = el("div", "ui-field");
+    const label = el("label", void 0, labelText);
+    label.htmlFor = id;
+    const readout = el("span", "ui-readout", value.toFixed(2));
+    label.append(readout);
+    const input = el("input");
+    input.id = id;
+    input.type = "range";
+    input.min = String(min);
+    input.max = String(max);
+    input.step = String(step);
+    input.value = String(value);
+    input.addEventListener("input", () => {
+      const v = Number(input.value);
+      if (!Number.isFinite(v)) return;
+      const clamped = clamp10(v, min, max);
+      readout.textContent = clamped.toFixed(2);
+      apply(clamped);
+      this.edited();
+    });
+    wrap2.append(label, input);
+    return wrap2;
+  }
+  stat(label, hint) {
+    const node = el("div", "ui-stat");
+    const dt = el("dt", void 0, label);
+    dt.title = hint;
+    const dd = el("dd", "is-idle", "\u2014");
+    node.append(dt, dd);
+    return { node, value: dd };
+  }
+  // -------------------------------------------------------------------------
+  // Mutation
+  // -------------------------------------------------------------------------
+  edited() {
+    this.opts.onEdit?.();
+  }
+  /**
+   * Replace a layer's spec wholesale, keeping its position and its mixing-desk
+   * state.
+   *
+   * Solo and mute are runtime gestures rather than preset data, so they are not
+   * carried by the spec and would otherwise be silently dropped by a rebuild —
+   * a muted layer coming back at full volume because its clock division changed
+   * is exactly the kind of surprise that makes a UI feel untrustworthy.
+   */
+  rebuild(id, next) {
+    const index = this.stack.all.findIndex((l) => l.id === id);
+    if (index < 0) return;
+    const soloed = this.stack.isSoloed(id);
+    const muted = this.stack.find(id)?.muted ?? false;
+    this.stack.remove(id);
+    this.stack.add(next, index);
+    this.stack.setMuted(next.id, muted);
+    this.stack.setSolo(next.id, soloed);
+    this.refresh();
+    this.edited();
+  }
+  move(id, toIndex) {
+    if (!this.stack.reorder(id, toIndex)) return;
+    this.refresh();
+    this.edited();
+  }
+  addLayer() {
+    const type = this.addSelect.value;
+    if (type.length === 0) return;
+    const desc = this.opts.registry?.get(type);
+    const family = desc?.family ?? "source";
+    const spec = defaultLayerSpec(
+      this.freeId(type),
+      type,
+      family,
+      desc?.defaultResolutionScale ?? DEFAULT_RESOLUTION_SCALE
+    );
+    this.stack.add(spec);
+    this.refresh();
+    this.edited();
+    this.status(`added ${type}`);
+  }
+  /**
+   * The lowest free `type-n`.
+   *
+   * Not a counter and not a timestamp: ids seed per-layer hashed variation
+   * (§4.7), so the same sequence of gestures must produce the same ids on any
+   * machine and in any session, or two people building "the same" preset get
+   * two different-looking shows.
+   */
+  freeId(type) {
+    const taken = new Set(this.stack.all.map((l) => l.id));
+    for (let n = 1; ; n++) {
+      const id = `${type}-${n}`;
+      if (!taken.has(id)) return id;
+    }
+  }
+  applySeed() {
+    const raw = Number(this.seedInput.value);
+    if (!Number.isFinite(raw)) {
+      this.seedInput.value = String(this.presetSeed);
+      return;
+    }
+    const seed = clamp10(Math.trunc(raw), 0, 4294967295);
+    this.seedInput.value = String(seed);
+    if (seed === this.presetSeed) return;
+    this.presetSeed = seed;
+    this.opts.onLoadPreset(this.getPreset());
+    this.status("seed changed \u2014 stack reloaded");
+  }
+  // -------------------------------------------------------------------------
+  // Drag and drop
+  // -------------------------------------------------------------------------
+  /**
+   * The row as a drop target.
+   *
+   * The insertion point is decided by which half of the row the pointer is over
+   * and shown as a line, rather than by shuffling rows out of the way. A list
+   * that reflows under the pointer moves the target away from where the user is
+   * aiming, and the drop lands one row off often enough to be maddening.
+   */
+  attachDropTarget(li, id) {
+    li.addEventListener("dragover", (e) => {
+      if (this.dragId === null || this.dragId === id) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+      const before = this.isBefore(li, e);
+      li.classList.toggle("is-over-before", before);
+      li.classList.toggle("is-over-after", !before);
+    });
+    li.addEventListener("dragleave", (e) => {
+      const to = e.relatedTarget;
+      if (to instanceof Node && li.contains(to)) return;
+      li.classList.remove("is-over-before", "is-over-after");
+    });
+    li.addEventListener("drop", (e) => {
+      const dragged = this.dragId;
+      if (dragged === null || dragged === id) return;
+      e.preventDefault();
+      const before = this.isBefore(li, e);
+      this.clearDropMarks();
+      this.dragId = null;
+      this.dropOn(dragged, id, before);
+    });
+  }
+  /**
+   * The list as the drop target of last resort: "put it at the end".
+   *
+   * Without this, the only droppable pixels in the panel are the rows
+   * themselves, and the natural gesture for "move this to the bottom" — drag it
+   * past the last row into the empty space below — lands on the `<ul>`, which
+   * accepts nothing, so the drag is cancelled and the stack is unchanged. The
+   * inter-row gaps have the same problem in miniature. A drag that visibly
+   * completes and then does nothing is worse than one that is refused, because
+   * the user's next move is to try it again rather than to aim differently.
+   *
+   * Rows bubble their events up to here, so this defers whenever the pointer is
+   * over one — the row handler has already decided, and more precisely.
+   */
+  attachListDropTarget() {
+    const overRow = (e) => e.target instanceof Element && e.target.closest(".ui-layer") !== null;
+    this.list.addEventListener("dragover", (e) => {
+      if (this.dragId === null || overRow(e)) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+      this.markLast();
+    });
+    this.list.addEventListener("drop", (e) => {
+      const dragged = this.dragId;
+      if (dragged === null || overRow(e)) return;
+      e.preventDefault();
+      this.clearDropMarks();
+      this.dragId = null;
+      if (this.stack.all[this.stack.length - 1]?.id === dragged) return;
+      this.move(dragged, this.stack.length - 1);
+    });
+  }
+  /** Show the end-of-list insertion point on the trailing edge of the last row. */
+  markLast() {
+    this.clearDropMarks();
+    const last2 = this.list.lastElementChild;
+    if (last2 instanceof HTMLElement && last2.classList.contains("ui-layer")) {
+      last2.classList.add("is-over-after");
+    }
+  }
+  isBefore(li, e) {
+    const r = li.getBoundingClientRect();
+    return e.clientY < r.top + r.height / 2;
+  }
+  /**
+   * `LayerStack.reorder` removes first and then inserts at `toIndex`, so the
+   * target index is computed against the list WITHOUT the dragged layer. Doing
+   * it any other way is off by one in exactly one direction, which is why it
+   * survives casual testing.
+   */
+  dropOn(dragId, overId, before) {
+    const ids = this.stack.all.map((l) => l.id).filter((x) => x !== dragId);
+    const at = ids.indexOf(overId);
+    if (at < 0) return;
+    this.move(dragId, before ? at : at + 1);
+  }
+  clearDropMarks() {
+    for (const node of this.list.querySelectorAll(".is-over-before, .is-over-after")) {
+      node.classList.remove("is-over-before", "is-over-after");
+    }
+  }
+  // -------------------------------------------------------------------------
+  // Presets
+  // -------------------------------------------------------------------------
+  fillTypeMenu() {
+    const registry = this.opts.registry;
+    const types = registry ? [...registry.keys()].sort() : [];
+    this.addSelect.replaceChildren();
+    if (types.length === 0) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "no pass types registered";
+      this.addSelect.append(opt);
+      this.addSelect.disabled = true;
+      this.addButton.disabled = true;
+      return;
+    }
+    for (const type of types) {
+      const desc = registry?.get(type);
+      const opt = document.createElement("option");
+      opt.value = type;
+      opt.textContent = desc ? `${type} (${desc.family})` : type;
+      this.addSelect.append(opt);
+    }
+    this.addSelect.value = types[0] ?? "";
+  }
+  savePreset() {
+    const preset2 = this.getPreset();
+    const blob = new Blob([serialise(preset2, true)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = el("a");
+    a.href = url;
+    a.download = `${slug(preset2.name)}.aaavs.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+    this.status(`saved ${a.download}`);
+  }
+  async loadPresetFile(input) {
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
+    try {
+      const preset2 = deserialise(await file.text());
+      this.opts.onLoadPreset(preset2);
+      this.status(`loaded ${preset2.name}`);
+    } catch (err2) {
+      const why = err2 instanceof PresetError || err2 instanceof PresetVersionError ? err2.message : String(err2);
+      this.status(why, true);
+    }
+  }
+  async copyUrl() {
+    let hash;
+    try {
+      hash = encodeHash(this.getPreset());
+    } catch (err2) {
+      this.status(`could not encode preset: ${String(err2)}`, true);
+      return;
+    }
+    location.hash = hash;
+    try {
+      await navigator.clipboard.writeText(location.href);
+      this.status("URL copied to the clipboard");
+    } catch {
+      this.status("URL is in the address bar \u2014 the clipboard was refused");
+    }
+  }
+  status(message, isError = false) {
+    this.statusLine.textContent = message;
+    this.statusLine.classList.toggle("is-error", isError);
+  }
+  nextId(kind) {
+    this.uid += 1;
+    return `aaavs-ui-${kind}-${this.uid}`;
+  }
+};
+function numberParam(spec, key, fallback) {
+  const raw = spec.params[key];
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : fallback;
+}
+function ensureStylesheet(href) {
+  if (document.querySelector("link[data-aaavs-ui]")) return;
+  const link = document.createElement("link");
+  link.rel = "stylesheet";
+  link.href = href;
+  link.dataset["aaavsUi"] = "";
+  link.addEventListener("error", () => {
+    console.warn(`aaavs: layer panel stylesheet not found at ${href}. Pass styleHref to LayerUI.`);
+  });
+  document.head.append(link);
+}
+
+// src/shaders/present.wgsl
+var present_default = "// Final pass: HDR accumulation -> swapchain.\n//\n// Everything upstream is rgba16float and freely exceeds 1.0. This is the only\n// place that becomes a displayable image, so it owns bloom, tone mapping and\n// the vignette, and it is the only place that should.\n\nstruct Post {\n  bloom    : f32,\n  exposure : f32,\n  vignette : f32,\n  aspect   : f32,\n  grain    : f32,\n  time     : f32,\n  pad0     : f32,\n  pad1     : f32,\n};\n\n@group(0) @binding(0) var src : texture_2d<f32>;\n@group(0) @binding(1) var samp : sampler;\n@group(0) @binding(2) var<uniform> P : Post;\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  let p = array<vec2<f32>, 3>(\n    vec2<f32>(-1.0, -1.0), vec2<f32>( 3.0, -1.0), vec2<f32>(-1.0,  3.0),\n  );\n  return vec4<f32>(p[vi], 0.0, 1.0);\n}\n\n// Narkowicz ACES. A *look*, not a correction \u2014 it rolls highlights off so\n// additive accumulation stops clipping to flat white.\nfn aces(x: vec3<f32>) -> vec3<f32> {\n  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;\n  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));\n}\n\nfn hash21(p: vec2<f32>) -> f32 {\n  var p3 = fract(vec3<f32>(p.xyx) * 0.1031);\n  p3 = p3 + dot(p3, p3.yzx + 33.33);\n  return fract((p3.x + p3.y) * p3.z);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let dims = vec2<f32>(textureDimensions(src));\n  let uv = frag.xy / dims;\n  let texel = 1.0 / dims;\n\n  var col = textureSampleLevel(src, samp, uv, 0.0).rgb;\n\n  // Cheap threshold bloom. A real mip chain belongs here (plan \xA74.11) \u2014 this is\n  // a fixed 12-tap ring, which is honest for a vertical slice and would be the\n  // wrong answer at 2K120.\n  if (P.bloom > 0.001) {\n    var sum = vec3<f32>(0.0);\n    let radius = 9.0;\n    for (var i = 0; i < 12; i = i + 1) {\n      let a = f32(i) * 0.5235988;           // 2pi/12\n      let o = vec2<f32>(cos(a), sin(a)) * radius * texel;\n      let s = textureSampleLevel(src, samp, uv + o, 0.0).rgb;\n      sum = sum + max(s - vec3<f32>(0.6), vec3<f32>(0.0));\n    }\n    col = col + sum * (P.bloom / 12.0);\n  }\n\n  col = col * P.exposure;\n\n  // Vignette. Multiplicative and gentle \u2014 art-direction \xA74.3 wants most of the\n  // frame near-black, and this helps without eating the subject.\n  let d = length((uv - 0.5) * vec2<f32>(P.aspect, 1.0));\n  col = col * mix(1.0, smoothstep(1.05, 0.25, d), P.vignette);\n\n  col = aces(col);\n\n  // Grain after tone mapping, so it lives in display space and does not get\n  // crushed by the curve.\n  if (P.grain > 0.001) {\n    let n = hash21(frag.xy + vec2<f32>(P.time * 60.0, P.time * 37.0)) - 0.5;\n    col = col + vec3<f32>(n * P.grain * 0.06);\n  }\n\n  return vec4<f32>(col, 1.0);\n}\n";
+
+// src/main.ts
+var $ = (id) => document.getElementById(id);
+var canvas = $("stage");
+var hud = $("hud");
+var err = $("err");
+var post = {
+  bloom: 0.28,
+  exposure: 1,
+  vignette: 0.7,
+  grain: 0.35
+};
+var stats = {
+  scheduledEvents: 0,
+  lateBy: 0
+};
+var loopbackTestHost = location.hostname === "localhost" || location.hostname === "127.0.0.1" || location.hostname === "[::1]";
+var testSearch = loopbackTestHost ? location.search : "";
+var testQuery = new URLSearchParams(testSearch);
+var golden = goldenConfig(testSearch);
+var transitionTest = testQuery.get("transitionTest") === "1";
+var ledStyleTest = testQuery.get("ledStyleTest");
+var presetTest = testQuery.get("presetTest");
+var sourceTest = testQuery.get("sourceTest");
+var operatorTest = testQuery.get("operatorTest");
+var uiTest = testQuery.get("uiTest") === "1";
+var audio = new AudioEngine();
+var tempo = new TempoTracker();
+var detector = new WorkletDetector();
+var tierB = new TierBTimeline(tempo);
+var timeline = golden && (presetTest || sourceTest || operatorTest) ? StaticTimeline.fromTempo(golden.bpm, 0, Math.max(32, golden.frames * golden.dt + 4)) : tierB;
+var scheduler = new Scheduler();
+var requests = [];
+var lastPoll = 0;
+var onsetCounts = { kick: 0, snare: 0, hat: 0, tonal: 0 };
+var overlay = new DebugOverlay();
+audio.onOnset = (o) => {
+  if (detector.attached) return;
+  tempo.addOnset(o.time);
+  onsetCounts[o.klass] = (onsetCounts[o.klass] ?? 0) + 1;
+  overlay.pushOnset(o);
+};
+detector.onOnset = (o) => {
+  tempo.addOnset(o.time);
+  onsetCounts[o.klass] = (onsetCounts[o.klass] ?? 0) + 1;
+  overlay.pushOnset(o);
+};
+var detectorError = "";
+async function ensureDetector() {
+  const ctx = audio.ctx;
+  const tap = audio.tap;
+  if (!ctx || !tap || detector.attached) return;
+  try {
+    await detector.attach(ctx, tap);
+  } catch (e) {
+    detectorError = e instanceof Error ? e.message : String(e);
+    console.warn("[aaavs] worklet detector unavailable, falling back:", detectorError);
+  }
+}
+function resetTransport(now) {
+  tempo.reset();
+  tierB.reset();
+  scheduler.reset();
+  stack.reset();
+  renderer.resetLayerState();
+  detector.reset();
+  lastPoll = now;
+  stats.scheduledEvents = 0;
+  stats.lateBy = 0;
+}
+var DEFAULT_PRESET = {
+  version: 1,
+  name: "first-light",
+  seed: 1,
+  layers: [
+    {
+      // The floor. A geometric-axis spectrum across the bottom third — the GRID
+      // look of art-direction §1.2, kept quiet so it frames the subject.
+      id: "grid",
+      type: "spectrum",
+      family: "source",
+      params: {
+        mode: "bars",
+        bars: 40,
+        gain: 1,
+        gamma: 0.6,
+        gap: 0.4,
+        height: 0.3,
+        bodyLevel: 0.5,
+        capLevel: 0.9
+      },
+      blend: "add",
+      opacity: 0.8,
+      // Breathing, once per bar. Release 12 beats against a 4-beat period, so
+      // the floor falls to ~0.4 and swells back on every downbeat.
+      envelope: { attackBeats: 0.35, holdBeats: 1, releaseBeats: 12 },
+      trigger: { division: "bar", euclidK: 1, euclidN: 1, probability: 1, offsetSteps: 0 },
+      anchor: "peak",
+      palette: "secondary",
+      enabled: true,
+      resolutionScale: 1
+    },
+    {
+      // The subject. Everything the vertical slice's compute+points pair did,
+      // now one descriptor: `src/sources/lorenz.ts`.
+      id: "attractor",
+      type: "lorenz",
+      family: "source",
+      params: {
+        trajectories: 24e3,
+        substeps: 6,
+        simPerBeat: 0.85,
+        spinBars: 16,
+        hueBars: 48,
+        rhoLow: 14,
+        rhoPulse: 6,
+        // Raised well above LORENZ_DEFAULTS, and this is the one set of numbers
+        // in the preset that had to change rather than move. In the old chain
+        // the accumulator itself retained the trail, so a per-frame brightness
+        // of ~0.03 reached a steady state around fifty times that. Here the
+        // trail is a separate `feedback` layer whose steady state is `gain`
+        // times the frame beneath — a multiplier of ~1.85 in total, not ~50 —
+        // so the per-frame figure has to carry the brightness itself.
+        // Derived, not measured: NOBODY HAS LOOKED AT THIS ON A SCREEN.
+        brightBase: 0.1,
+        brightLevel: 0.3,
+        brightEnv: 0.2,
+        fit: 0.022,
+        thickness: 16e-4
+      },
+      blend: "add",
+      opacity: 1,
+      // Breathing, once per beat. Release 3 beats against a 1-beat period puts
+      // the trough near 0.64 — a pulse, not a strobe. `progress` also drives
+      // `rhoPulse`, so the attractor changes SHAPE on the beat rather than only
+      // getting brighter (§3.3).
+      envelope: { attackBeats: 0.12, holdBeats: 0.55, releaseBeats: 3 },
+      trigger: { division: "beat", euclidK: 1, euclidN: 1, probability: 1, offsetSteps: 0 },
+      anchor: "peak",
+      palette: "primary",
+      enabled: true,
+      resolutionScale: 1
+    },
+    {
+      // What `fade.wgsl` used to be. A feedback layer owns its own ping-pong
+      // pair, decays in BEATS, and composites additively — the same trail, with
+      // a stability-clamped zoom the hand-written version never had.
+      id: "trail",
+      type: "feedback",
+      family: "feedback",
+      params: {
+        tauBeats: 1.2,
+        gain: 0.85,
+        zoomPerBeat: 1,
+        // Off-centre. The centred version is the "everything radiates from the
+        // middle" composition art-direction §4.1 rejects, and feedback is the
+        // one effect where moving the origin costs nothing.
+        centreX: 0.42,
+        centreY: 0.56,
+        clipCeiling: 1.15,
+        edgeFade: 0.04
+      },
+      blend: "add",
+      // 1, deliberately. `feedback.ts` already multiplies its injection by
+      // `ctx.opacity`, and the renderer's composite blit multiplies by it again,
+      // so any value below 1 is applied twice. Documented in HANDOFF.md.
+      opacity: 1,
+      // Sustained: hold 4.5 beats against a 4-beat trigger, so progress never
+      // leaves 1. A trail that re-attacked would visibly restart every bar.
+      envelope: { attackBeats: 0, holdBeats: 4.5, releaseBeats: 2 },
+      trigger: { division: "bar", euclidK: 1, euclidN: 1, probability: 1, offsetSteps: 0 },
+      anchor: "start",
+      palette: "primary",
+      enabled: true,
+      // Half res. A trail is soft and low-frequency, and its history pair is
+      // 30 MB at 2560x1440 — the best candidate in the stack for §4.11.
+      resolutionScale: 0.5
+    },
+    {
+      // The operator, unchanged in intent from the slice.
+      id: "fold",
+      type: "kaleidoscope",
+      family: "operator",
+      params: { segments: 6, rotBars: 64, mix: 0.55 },
+      blend: "replace",
+      opacity: 1,
+      // Sustained, and it MUST be: this shader multiplies its output by
+      // `C.opacity`, so a dipping envelope on a `replace` blend is a black flash.
+      envelope: { attackBeats: 0, holdBeats: 4.5, releaseBeats: 2 },
+      trigger: { division: "bar", euclidK: 1, euclidN: 1, probability: 1, offsetSteps: 0 },
+      anchor: "start",
+      palette: "primary",
+      enabled: true,
+      resolutionScale: 1
+    }
+  ],
+  palette: {
+    name: "first-light",
+    bg: { l: 0.035, c: 0.018, h: 268, intensity: 1 },
+    primary: { l: 0.7, c: 0.17, h: 330, intensity: 1.7 },
+    secondary: { l: 0.55, c: 0.11, h: 214, intensity: 0.7 },
+    // The subject's hue with headroom, not a fourth colour.
+    accent: { l: 0.9, c: 0.2, h: 330, intensity: 2.4 },
+    ramp: [
+      { at: 0, color: { l: 0.05, c: 0.02, h: 268, intensity: 1 } },
+      { at: 0.55, color: { l: 0.55, c: 0.11, h: 214, intensity: 0.9 } },
+      { at: 1, color: { l: 0.88, c: 0.18, h: 330, intensity: 2 } }
+    ]
+  }
+};
+var stack = new LayerStack();
+var preset = DEFAULT_PRESET;
+var presetError = "";
+try {
+  preset = PRESET_BANK.find((entry) => entry.preset.name === presetTest)?.preset ?? presetFromLocation(location.hash) ?? (golden ? DEFAULT_PRESET : PRESET_BANK[0].preset);
+} catch (e) {
+  presetError = e instanceof Error ? e.message : String(e);
+}
+if (ledStyleTest) {
+  preset = {
+    ...preset,
+    name: `${preset.name}-${ledStyleTest}`,
+    layers: preset.layers.map((layer2) => layer2.type !== "spectrum" ? layer2 : {
+      ...layer2,
+      params: { ...layer2.params, ledStyle: ledStyleTest, segments: 12, segGap: 0.32, ledOff: 0.12 }
+    })
+  };
+}
+if (sourceTest) {
+  preset = {
+    version: 1,
+    name: `audit-${sourceTest}`,
+    seed: 699671,
+    palette: preset.palette,
+    layers: [{
+      id: "audit",
+      type: sourceTest,
+      family: "source",
+      params: {},
+      blend: "add",
+      opacity: 1,
+      envelope: { attackBeats: 0.05, holdBeats: 64, releaseBeats: 1 },
+      trigger: { division: "beat", euclidK: 1, euclidN: 1, probability: 1, offsetSteps: 0 },
+      anchor: "peak",
+      palette: "primary",
+      enabled: true,
+      resolutionScale: 1
+    }]
+  };
+}
+if (operatorTest) {
+  preset = {
+    version: 1,
+    name: `audit-operator-${operatorTest}`,
+    seed: 696562,
+    palette: preset.palette,
+    layers: [
+      {
+        id: "audit-source",
+        type: "phosphor-orbit",
+        family: "source",
+        params: {},
+        blend: "add",
+        opacity: 1,
+        envelope: { attackBeats: 0, holdBeats: 64, releaseBeats: 1 },
+        trigger: { division: "4bar", euclidK: 1, euclidN: 1, probability: 1, offsetSteps: 0 },
+        anchor: "start",
+        palette: "primary",
+        enabled: true,
+        resolutionScale: 1
+      },
+      {
+        id: "audit-operator",
+        type: operatorTest,
+        family: "operator",
+        params: {},
+        blend: "replace",
+        opacity: 1,
+        envelope: { attackBeats: 0, holdBeats: 64, releaseBeats: 1 },
+        trigger: { division: "4bar", euclidK: 1, euclidN: 1, probability: 1, offsetSteps: 0 },
+        anchor: "start",
+        palette: "accent",
+        enabled: true,
+        resolutionScale: 1
+      }
+    ]
+  };
+}
+stack.load(preset);
+rebuildRequests();
+var director = new PresetDirector([...PRESET_BANK], {
+  dynamic: true,
+  minBars: 2,
+  maxBars: 12,
+  seed: 42149
+});
+var transition = new Transition();
+var outgoingFrame = null;
+var captureOutgoing = false;
+function applyPreset(next, spec, now = 0, bpm = 120) {
+  preset = next;
+  stack.load(next);
+  rebuildRequests();
+  renderer.prune(stack.all.map((l) => l.id));
+  renderer.resetLayerState();
+  knownLayerIds = stack.all.map((l) => l.id).join("|");
+  presetError = "";
+  ui.setPreset(next);
+  if (spec) {
+    transition.begin(spec, now, bpm, next.seed);
+    captureOutgoing = transition.active && needsBothChains(spec.kind);
+  }
+}
+var plan = stack.frame(0).plan;
+function rebuildRequests() {
+  requests = preset.layers.map((spec) => ({
+    key: spec.id,
+    trigger: spec.trigger,
+    anchor: spec.anchor,
+    envelope: spec.envelope,
+    swing: 0,
+    seed: preset.seed
+  }));
+}
+var gpu;
+try {
+  const dpr = golden ? 1 : Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = golden ? golden.width : Math.round(window.innerWidth * dpr);
+  canvas.height = golden ? golden.height : Math.round(window.innerHeight * dpr);
+  gpu = await initGpu(canvas);
+} catch (e) {
+  const msg = e instanceof GpuInitError ? e.message : String(e);
+  err.textContent = msg;
+  err.hidden = false;
+  goldenFail(e);
+  throw e;
+}
+var device = gpu.device;
+var sampler = createSampler(gpu);
+var timer = new GpuTimer(device, gpu.hasTimestamp);
+var audioGpu = new AudioGpu(device);
+var harness = golden ? new GoldenHarness(golden) : null;
+var renderer = new Renderer({ gpu, timer, audioGpu });
+renderer.register(...SOURCE_PASSES, ...OPERATOR_PASSES);
+renderer.prune(stack.all.map((l) => l.id));
+var knownLayerIds = stack.all.map((l) => l.id).join("|");
+var presentPipeline = createFullscreenPipeline(gpu, "present", present_default, gpu.swapFormat);
+var postParams = device.createBuffer({
+  label: "post-params",
+  size: 32,
+  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+});
+var presentBinds = /* @__PURE__ */ new Map();
+function presentBindFor(view) {
+  const existing = presentBinds.get(view);
+  if (existing) return existing;
+  const created = device.createBindGroup({
+    label: "present",
+    layout: presentPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: view },
+      { binding: 1, resource: sampler },
+      { binding: 2, resource: { buffer: postParams } }
+    ]
+  });
+  if (presentBinds.size >= 64) presentBinds.clear();
+  presentBinds.set(view, created);
+  return created;
+}
+if (!golden) {
+  window.addEventListener("resize", () => {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    if (!resize(gpu, window.innerWidth, window.innerHeight, dpr)) return;
+    renderer.resize();
+    presentBinds.clear();
+  });
+}
+var ui = new LayerUI({
+  stack,
+  preset,
+  registry: renderer.types,
+  presets: PRESET_BANK.map((e) => ({ name: e.preset.name })),
+  onPickPreset(name) {
+    const i = PRESET_BANK.findIndex((e) => e.preset.name === name);
+    if (i < 0) return;
+    const c = director.step(i - director.currentIndex, audio.currentTime);
+    applyPreset(c.preset, c.transition, audio.currentTime, timeline.bpm(audio.currentTime) || 120);
+  },
+  onAutoChange(on) {
+    director.enabled = on;
+  },
+  onLoadPreset(next) {
+    preset = next;
+    stack.load(next);
+    rebuildRequests();
+    renderer.prune(stack.all.map((l) => l.id));
+    renderer.resetLayerState();
+    knownLayerIds = stack.all.map((l) => l.id).join("|");
+    presetError = "";
+    ui.setPreset(next);
+  },
+  // Fires on EVERY edit, including each step of a slider drag, so it must not do
+  // per-edit work. `prune` clears the whole bind-group cache, which is a frame
+  // of rebuilds — cheap once, wasteful sixty times a second — so it only runs
+  // when the set of layers has actually changed.
+  onEdit() {
+    const ids = stack.all.map((l) => l.id).join("|");
+    if (ids === knownLayerIds) return;
+    knownLayerIds = ids;
+    renderer.prune(stack.all.map((l) => l.id));
+  },
+  // Golden captures keep the panel out of image baselines, except the dedicated
+  // UI test, which needs the production layout visibly open for page capture.
+  open: !golden || uiTest
+});
+var f32 = new Float32Array(8);
+var last = performance.now();
+var frames = 0;
+var fpsAcc = 0;
+var fps = 0;
+var frameCount = 0;
+var peakLevel = 0;
+function snapshot(t) {
+  return {
+    time: t,
+    level: audio.level,
+    beat: detector.attached ? detector.beat : audio.beat,
+    bands: audio.bands,
+    pan: audio.pan,
+    width: audio.width,
+    crest: audio.crest,
+    centroid: audio.centroid,
+    flatness: audio.flatness,
+    waveform: audio.waveform,
+    spectrum: audio.spectrum,
+    bandPan: audio.bandPan,
+    spectrogram: audio.spectrogram,
+    spectrogramRow: audio.spectrogramRow,
+    peaks: audio.peaks
+  };
+}
+function frame(nowMs) {
+  try {
+    renderFrame(nowMs);
+  } catch (e) {
+    if (harness) {
+      goldenFail(e);
+      return;
+    }
+    throw e;
+  }
+}
+function renderFrame(nowMs) {
+  const dt = harness ? harness.dt : Math.min((nowMs - last) / 1e3, 1 / 20);
+  last = nowMs;
+  scheduler.outputLatency = audio.ctx?.outputLatency ?? 0;
+  let a;
+  let t;
+  if (harness) {
+    t = harness.time;
+    a = harness.audio;
+    for (const o of harness.audio.onsets) {
+      tempo.addOnset(o.time);
+      onsetCounts[o.klass] = (onsetCounts[o.klass] ?? 0) + 1;
+    }
+  } else {
+    audio.update(dt);
+    detector.poll(dt);
+    t = audio.currentTime;
+    a = snapshot(t);
+  }
+  tierB.update(t);
+  const tlBpm = timeline.bpm(t);
+  const bpm = tlBpm > 0 ? tlBpm : 120;
+  const dBeats = dt / (60 / bpm);
+  director.outputLatency = scheduler.outputLatency;
+  transition.update(t);
+  if (!transition.active && outgoingFrame) {
+    renderer.releaseTarget(outgoingFrame);
+    outgoingFrame = null;
+  }
+  {
+    const change = director.update(timeline, t, a.level, a.beat);
+    if (change) applyPreset(change.preset, change.transition, t, bpm);
+  }
+  if (transitionTest && frameCount === 108) {
+    applyPreset(PRESET_BANK[1].preset, { kind: "crossfade", beats: 8, curve: "equalPower" }, t, bpm);
+  }
+  for (const req of requests) {
+    for (const ev of scheduler.due(timeline, t, req)) {
+      stats.scheduledEvents++;
+      stats.lateBy = ev.lateBy;
+    }
+  }
+  void scheduler.content(timeline, lastPoll, t);
+  lastPoll = t;
+  peakLevel = Math.max(a.level, peakLevel - dt * 0.9);
+  const nowBeats = timeline.slotAt(t) / SLOTS_PER_BEAT;
+  stack.update(nowBeats);
+  const framed = stack.frame(nowBeats);
+  plan = framed.plan;
+  timer.beginFrame();
+  const encoder = device.createCommandEncoder();
+  if (captureOutgoing) {
+    if (outgoingFrame) renderer.releaseTarget(outgoingFrame);
+    outgoingFrame = renderer.captureOutput(encoder);
+    captureOutgoing = false;
+  }
+  audioGpu.upload(a, device.queue);
+  const frameState = {
+    resolved: framed.resolved,
+    audio: a,
+    palette: preset.palette,
+    time: t,
+    beats: nowBeats,
+    bpm,
+    dtBeats: dBeats,
+    dtSeconds: dt,
+    frame: frameCount
+  };
+  let output = renderer.execute(encoder, plan, frameState);
+  if (transition.active && outgoingFrame && needsBothChains(transition.kind)) {
+    const composite = renderer.transition(
+      encoder,
+      outgoingFrame,
+      output,
+      transition.current,
+      transition.mix,
+      transition.seed,
+      frameState
+    );
+    output = composite;
+    renderer.releaseTarget(composite);
+  }
+  const aspect = gpu.width / gpu.height;
+  f32.set([post.bloom, post.exposure, post.vignette, aspect, post.grain, t, 0, 0]);
+  device.queue.writeBuffer(postParams, 0, f32);
+  {
+    const pass6 = timer.beginPass(encoder, gpu.context.getCurrentTexture().createView(), "present", "clear");
+    pass6.setPipeline(presentPipeline);
+    pass6.setBindGroup(0, presentBindFor(output.view));
+    pass6.draw(3);
+    timer.endPass(pass6);
+  }
+  timer.endFrame(encoder);
+  device.queue.submit([encoder.finish()]);
+  timer.poll();
+  frameCount++;
+  fpsAcc += dt;
+  frames++;
+  if (fpsAcc >= 0.5) {
+    fps = frames / fpsAcc;
+    frames = 0;
+    fpsAcc = 0;
+  }
+  if (frames === 0) updateHud(t, bpm);
+  ui.update({ bpm, locked: tempo.locked, confidence: timeline.confidence, beats: nowBeats });
+  if (overlay.visible) {
+    overlay.draw({
+      audio: a,
+      flux: detector.attached ? detector.features.flux : audio.debugFlux,
+      threshold: detector.attached ? detector.features.thresh : audio.debugThresh,
+      timings: timer.timings,
+      bpm,
+      tempoLocked: tempo.locked,
+      confidence: timeline.confidence,
+      fps,
+      sampleRate: audio.ctx?.sampleRate ?? 48e3
+    });
+  }
+  if (harness) {
+    harness.advance();
+    if (harness.done) {
+      void harness.capture(device, canvas);
+      return;
+    }
+  }
+  requestAnimationFrame(frame);
+}
+function updateHud(t, bpm) {
+  const lock = tempo.locked ? `${tempo.bpm.toFixed(1)} BPM \xB7 ${timeline.confidence * 100 | 0}%` : `listening\u2026 (assuming ${bpm})`;
+  const det = detector.attached ? `worklet \xB7 ring ${ringAvailable()} \xB7 dropped ${detector.dropped}` : detectorError ? "rAF fallback (worklet failed)" : "rAF (worklet not attached)";
+  const bold = (value) => {
+    const node = document.createElement("b");
+    node.textContent = String(value);
+    return node;
+  };
+  const lines = [
+    [bold(`${fps.toFixed(0)} fps`), ` \xB7 ${gpu.width}\xD7${gpu.height}`, ...harness ? [" \xB7 ", bold("GOLDEN")] : []],
+    ["preset ", bold(preset.name), ` \xB7 ${stack.length} layers \xB7 auto `, bold(director.enabled ? "on" : "off"), ` (${director.dynamic ? `${director.minBars}\u2013${director.maxBars}bar responsive` : `${director.every}bar`})`],
+    ["tempo ", bold(lock), ` \xB7 horizon ${timeline.horizonSec.toFixed(2)}s`],
+    [`slot ${timeline.slotAt(t).toFixed(0)} \xB7 scheduled ${stats.scheduledEvents} \xB7 late ${(stats.lateBy * 1e3).toFixed(1)}ms`],
+    [`audio clock ${t.toFixed(2)}s \xB7 level ${peakLevel.toFixed(2)}`],
+    ["detector ", bold(det)],
+    [`onsets k${onsetCounts.kick} s${onsetCounts.snare} h${onsetCounts.hat} t${onsetCounts.tonal}`],
+    [`passes ${plan.passCount} \xB7 targets ${plan.targetCount}/${renderer.targetCount}`],
+    [`gpu ${timer.enabled ? `${timer.totalMs.toFixed(2)}ms` : "no timestamp-query"}`],
+    ["isolated: ", bold(self.crossOriginIsolated), " \xB7 SAB: ", bold(typeof SharedArrayBuffer !== "undefined")],
+    ...presetError ? [["preset: ", bold(presetError)]] : []
+  ];
+  const fragment = document.createDocumentFragment();
+  lines.forEach((parts, index) => {
+    if (index > 0) fragment.append(document.createElement("br"));
+    for (const part of parts) fragment.append(typeof part === "string" ? document.createTextNode(part) : part);
+  });
+  hud.replaceChildren(fragment);
+}
+requestAnimationFrame(frame);
+var pageDisposed = false;
+function disposePage() {
+  if (pageDisposed) return;
+  pageDisposed = true;
+  detector.detach();
+  audio.dispose();
+}
+window.addEventListener("pagehide", disposePage, { once: true });
+window.addEventListener("beforeunload", disposePage, { once: true });
+globalThis.__aaavs = {
+  audio,
+  tempo,
+  timeline: tierB,
+  scheduler,
+  detector,
+  stack,
+  audioGpu,
+  timer,
+  overlay,
+  renderer,
+  ui,
+  post,
+  gpu
+};
+function patchParams(type, patch) {
+  let touched = false;
+  for (const layer2 of stack.all) {
+    if (layer2.spec.type !== type) continue;
+    layer2.spec.params = { ...layer2.spec.params, ...patch };
+    touched = true;
+  }
+  if (touched) ui.refresh();
+}
+function readParam(type, key, fallback) {
+  for (const layer2 of stack.all) {
+    if (layer2.spec.type !== type) continue;
+    const v = layer2.spec.params[key];
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+  }
+  return fallback;
+}
+document.addEventListener("dragover", (e) => e.preventDefault());
+document.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  const file = e.dataTransfer?.files?.[0];
+  if (!file) return;
+  $("hint").hidden = true;
+  resetTransport(0);
+  try {
+    await audio.loadFile(file);
+  } catch (loadErr) {
+    const msg = loadErr instanceof Error ? loadErr.message : String(loadErr);
+    const hint = $("hint");
+    hint.hidden = false;
+    hint.textContent = `Could not play ${file.name}: ${msg}`;
+    console.error("[aaavs] file load failed", loadErr);
+    return;
+  }
+  await ensureDetector();
+  detector.timeOrigin = (audio.ctx?.currentTime ?? 0) - audio.currentTime;
+  detector.reset();
+});
+var GUIDE_SEEN = "aaavs.guide.v1";
+var guideWrap = $("guideWrap");
+function openGuide() {
+  guideWrap.hidden = false;
+  const dlg = $("guide");
+  dlg.scrollTop = 0;
+  dlg.focus({ preventScroll: true });
+}
+function closeGuide() {
+  guideWrap.hidden = true;
+  try {
+    localStorage.setItem(GUIDE_SEEN, "1");
+  } catch {
+  }
+}
+$("guideClose").addEventListener("click", closeGuide);
+$("guideGo").addEventListener("click", closeGuide);
+guideWrap.addEventListener("click", (e) => {
+  if (e.target === guideWrap) closeGuide();
+});
+if (!goldenConfig()) {
+  try {
+    if (!localStorage.getItem(GUIDE_SEEN)) openGuide();
+  } catch {
+    openGuide();
+  }
+}
+window.addEventListener("keydown", (e) => {
+  if (!guideWrap.hidden) {
+    if (e.key === "Escape" || e.key === "?" || e.key === "Enter") closeGuide();
+    return;
+  }
+  if (e.key >= "2" && e.key <= "9") patchParams("kaleidoscope", { segments: Number(e.key) });
+  if (e.key === "1") patchParams("kaleidoscope", { segments: 0 });
+  if (e.key === "k") {
+    const mix = readParam("kaleidoscope", "mix", 0.55);
+    patchParams("kaleidoscope", { mix: mix > 0.05 ? 0 : 0.55 });
+  }
+  if (e.key === "[") patchParams("feedback", { tauBeats: Math.max(0.1, readParam("feedback", "tauBeats", 1.2) - 0.15) });
+  if (e.key === "]") patchParams("feedback", { tauBeats: Math.min(8, readParam("feedback", "tauBeats", 1.2) + 0.15) });
+  if (e.key === "h") hud.hidden = !hud.hidden;
+  if (e.key === "?") {
+    openGuide();
+    return;
+  }
+  if (e.key === "p") {
+    director.enabled = !director.enabled;
+    ui.setAuto(director.enabled);
+  }
+  if (e.key === "," || e.key === ".") {
+    const c = director.step(e.key === "." ? 1 : -1, audio.currentTime);
+    applyPreset(c.preset, c.transition, audio.currentTime, timeline.bpm(audio.currentTime) || 120);
+  }
+  if (e.key === "d") overlay.toggle();
+  if (e.key === "t") {
+    resetTransport(0);
+    audio.startTestSignal(128);
+    void ensureDetector().then(() => {
+      detector.timeOrigin = (audio.ctx?.currentTime ?? 0) - audio.currentTime;
+      detector.reset();
+    });
+    $("hint").hidden = true;
+  }
+});

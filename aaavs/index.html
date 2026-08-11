@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>aaavs — layered beat-driven visualiser</title>
+<style>
+  :root { --fg:#e9e9f2; --dim:#8a8aa0; --line:rgba(255,255,255,.12); --accent:#ff3d81; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:#04040a; color:var(--fg); overflow:hidden;
+    font:12px/1.5 ui-monospace,"Cascadia Mono",Menlo,Consolas,monospace; }
+  #stage { display:block; width:100vw; height:100vh; }
+
+  #hud {
+    position:fixed; top:1rem; left:1rem; padding:.6rem .8rem;
+    border:1px solid var(--line); border-radius:8px;
+    background:rgba(10,10,18,.72); backdrop-filter:blur(10px);
+    color:var(--dim); pointer-events:none; white-space:nowrap;
+  }
+  #hud b { color:var(--fg); font-weight:600; }
+  #hud[hidden] { display:none; }
+
+  #hint {
+    position:fixed; left:50%; bottom:1.5rem; transform:translateX(-50%);
+    padding:.5rem .9rem; border:1px solid var(--line); border-radius:999px;
+    background:rgba(10,10,18,.72); color:var(--dim); white-space:nowrap;
+  }
+  #hint[hidden] { display:none; }
+  kbd { padding:.05em .35em; border:1px solid var(--line); border-radius:3px; color:var(--fg); }
+
+  #err {
+    position:fixed; inset:0; display:grid; place-items:center; padding:2rem;
+    background:#04040a; color:var(--fg); text-align:center; line-height:1.7;
+    max-width:40rem; margin:0 auto;
+  }
+  #err[hidden] { display:none; }
+
+  /* --- first-run guide. Shown once per browser; ? reopens it. --- */
+  #guideWrap { position:fixed; inset:0; z-index:30; display:grid; place-items:center;
+    padding:1rem; background:rgba(3,3,8,.78); backdrop-filter:blur(6px); }
+  #guideWrap[hidden] { display:none; }
+  #guide { width:min(40rem,100%); max-height:calc(100vh - 2rem); overflow-y:auto;
+    padding:1.25rem 1.4rem 1.4rem; border:1px solid var(--line); border-radius:12px;
+    background:rgba(10,10,18,.94); }
+  #guide header { display:flex; align-items:center; justify-content:space-between; margin-bottom:.5rem; }
+  #guide h2 { margin:0; font-size:14px; font-weight:600; letter-spacing:.18em; text-transform:uppercase; }
+  #guide .lead { margin:0 0 1.1rem; color:var(--dim); }
+  #guide h3 { margin:1.3rem 0 .5rem; padding-bottom:.3rem; border-bottom:1px solid var(--line);
+    font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--accent); }
+  #guide table { width:100%; border-collapse:collapse; color:var(--dim); }
+  #guide td { padding:.22rem 0; vertical-align:baseline; }
+  #guide td:first-child { width:8.5rem; white-space:nowrap; }
+  #guide b { color:var(--fg); }
+  #guide button.go { margin-top:1.3rem; width:100%; padding:.55rem; border:1px solid var(--accent);
+    border-radius:6px; background:var(--accent); color:#0b0b14; font:inherit; font-weight:600;
+    letter-spacing:.08em; cursor:pointer; }
+  #guide button.x { padding:0 .45rem; border:1px solid transparent; border-radius:6px;
+    background:none; color:var(--dim); font:inherit; cursor:pointer; }
+  #guide button.x:hover { color:var(--fg); border-color:var(--line); }
+</style>
+</head>
+<body>
+  <canvas id="stage"></canvas>
+
+  <div id="hud">booting…</div>
+
+  <div id="hint">
+    drop an audio file &middot; <kbd>T</kbd> test signal &middot;
+    <kbd>L</kbd> layers &middot;
+    <kbd>1</kbd>&ndash;<kbd>9</kbd> segments &middot;
+    <kbd>[</kbd><kbd>]</kbd> trail &middot; <kbd>K</kbd> kaleidoscope &middot;
+    <kbd>H</kbd> hud &middot; <kbd>D</kbd> debug &middot; <kbd>?</kbd> help
+  </div>
+
+  <div id="err" hidden></div>
+
+  <div id="guideWrap" hidden>
+    <div id="guide" role="dialog" aria-modal="true" aria-labelledby="guideTitle" tabindex="-1">
+      <header>
+        <h2 id="guideTitle">aaavs</h2>
+        <button class="x" id="guideClose" type="button" aria-label="Close">&times;</button>
+      </header>
+      <p class="lead">
+        A layered, beat-driven visualiser. Feed it audio, stack layers, and let
+        the director cut presets on the bar.
+      </p>
+
+      <h3>Get audio in</h3>
+      <table>
+        <tr><td><b>drop a file</b></td><td>drag any audio file onto the page. No permissions needed.</td></tr>
+        <tr><td><kbd>T</kbd></td><td>built-in 128&nbsp;BPM test signal &mdash; kick, hat and a sustained pad, so both transient and sustained sources have something to read</td></tr>
+      </table>
+
+      <h3>Presets</h3>
+      <table>
+        <tr><td><kbd>P</kbd></td><td>auto preset changes, responsive to energy and onsets on 2–12 bar boundaries</td></tr>
+        <tr><td><kbd>,</kbd> <kbd>.</kbd></td><td>previous / next preset</td></tr>
+        <tr><td><kbd>L</kbd></td><td>layer panel &mdash; preset bank, per-layer blend, opacity, clock, envelope</td></tr>
+      </table>
+
+      <h3>Effects</h3>
+      <table>
+        <tr><td><kbd>1</kbd>&ndash;<kbd>9</kbd></td><td>kaleidoscope segments (<kbd>1</kbd> bypasses)</td></tr>
+        <tr><td><kbd>K</kbd></td><td>toggle the kaleidoscope</td></tr>
+        <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>trail length, in beats</td></tr>
+      </table>
+
+      <h3>Diagnostics</h3>
+      <table>
+        <tr><td><kbd>H</kbd></td><td>hud &mdash; fps, tempo lock, scheduler lateness, GPU time</td></tr>
+        <tr><td><kbd>D</kbd></td><td>debug overlay &mdash; waveform, spectrum, spectrogram, stereo field, onset classes</td></tr>
+        <tr><td><kbd>?</kbd></td><td>this guide</td></tr>
+      </table>
+
+      <h3>Worth knowing</h3>
+      <table>
+        <tr><td>tempo</td><td>needs ~8 onsets to lock. Until it does, motion runs at an assumed 120&nbsp;BPM.</td></tr>
+        <tr><td>level 0.00</td><td>normal between transients &mdash; most of a percussive track is silence.</td></tr>
+        <tr><td>WebGPU</td><td>required. There is no WebGL2 fallback.</td></tr>
+      </table>
+
+      <button class="go" id="guideGo" type="button">Got it</button>
+    </div>
+  </div>
+
+  <script type="module" src="dist/main.js"></script>
+</body>
+</html>
