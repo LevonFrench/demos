@@ -40,13 +40,13 @@ function createSampler(gpu2) {
     addressModeV: "clamp-to-edge"
   });
 }
-function createFullscreenPipeline(gpu2, label, code, format, blend) {
+function createFullscreenPipeline(gpu2, label, code, format, blend2) {
   const module = gpu2.device.createShaderModule({ label, code });
   return gpu2.device.createRenderPipeline({
     label,
     layout: "auto",
     vertex: { module, entryPoint: "vs" },
-    fragment: { module, entryPoint: "fs", targets: [{ format, blend }] },
+    fragment: { module, entryPoint: "fs", targets: [{ format, blend: blend2 }] },
     primitive: { topology: "triangle-list" }
   });
 }
@@ -140,20 +140,29 @@ var AudioEngine = class {
   /** Short white-noise burst, reused for test-signal hats. */
   noiseBuf = null;
   startedAt = 0;
+  /** Stable transport position while the AudioContext is suspended. */
+  position = 0;
   playing = false;
   testBpm = 0;
   nextClick = 0;
   clickTimer = null;
+  testSources = /* @__PURE__ */ new Set();
   get isPlaying() {
     return this.playing;
+  }
+  get canTransport() {
+    return this.buffer !== null || this.testBpm > 0;
+  }
+  get isPaused() {
+    return this.canTransport && !this.playing;
   }
   get duration() {
     return this.buffer?.duration ?? 0;
   }
   /** Audio-clock seconds since playback began. The only clock (§4.6). */
   get currentTime() {
-    if (!this.ctx || !this.playing) return 0;
-    return this.ctx.currentTime - this.startedAt;
+    if (!this.ctx || !this.playing) return this.position;
+    return Math.max(0, this.ctx.currentTime - this.startedAt);
   }
   /** Real output latency, for scheduler compensation. Can change; read often. */
   get outputLatency() {
@@ -211,19 +220,63 @@ var AudioEngine = class {
     const ctx = this.ensure();
     await ctx.resume();
     this.buffer = await ctx.decodeAudioData(await file.arrayBuffer());
+    this.testBpm = 0;
     this.play();
   }
   play() {
     if (!this.ctx || !this.buffer || !this.input) return;
     this.stop();
+    this.startBufferAt(0);
+    this.resetDetector();
+  }
+  startBufferAt(position) {
+    if (!this.ctx || !this.buffer || !this.input) return;
+    this.disconnectSource();
     const src2 = this.ctx.createBufferSource();
     src2.buffer = this.buffer;
     src2.loop = true;
     src2.connect(this.input);
-    this.startedAt = this.ctx.currentTime;
-    src2.start(this.startedAt);
+    this.position = Math.max(0, position);
+    this.startedAt = this.ctx.currentTime - this.position;
+    const offset = this.buffer.duration > 0 ? this.position % this.buffer.duration : 0;
+    src2.start(this.ctx.currentTime, offset);
     this.source = src2;
     this.playing = true;
+  }
+  /** Suspend the audio clock without discarding the source or its exact phase. */
+  async pause() {
+    if (!this.ctx || !this.playing) return;
+    this.position = this.currentTime;
+    this.playing = false;
+    await this.ctx.suspend();
+  }
+  /** Resume the source frozen by `pause()`, or restart a retained file source. */
+  async resume() {
+    if (!this.ctx || this.playing || !this.canTransport) return;
+    if (!this.source && this.testBpm === 0) this.startBufferAt(this.position);
+    await this.ctx.resume();
+    this.startedAt = this.ctx.currentTime - this.position;
+    this.playing = true;
+  }
+  /** Seek the active file/click transport while preserving its running state. */
+  seek(seconds) {
+    if (!this.ctx || !this.canTransport) return;
+    const wasPlaying = this.playing;
+    const target = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+    this.position = target;
+    this.startedAt = this.ctx.currentTime - target;
+    if (this.testBpm > 0) {
+      this.clearTestSources();
+      if (this.clickTimer !== null) {
+        clearTimeout(this.clickTimer);
+        this.clickTimer = null;
+      }
+      this.nextClick = 0;
+      this.scheduleClicks();
+    } else {
+      this.startBufferAt(target);
+      this.playing = wasPlaying;
+    }
     this.resetDetector();
   }
   /**
@@ -236,6 +289,7 @@ var AudioEngine = class {
     void ctx.resume();
     this.stop();
     this.testBpm = bpm;
+    this.position = 0;
     this.startedAt = ctx.currentTime;
     this.playing = true;
     this.resetDetector();
@@ -244,7 +298,10 @@ var AudioEngine = class {
   scheduleClicks() {
     const ctx = this.ctx;
     const period = 60 / this.testBpm;
-    if (!this.nextClick) this.nextClick = ctx.currentTime + 0.1;
+    if (!this.nextClick) {
+      const elapsed = Math.max(0, ctx.currentTime - this.startedAt);
+      this.nextClick = this.startedAt + Math.ceil((elapsed + 0.01) / period) * period;
+    }
     while (this.nextClick < ctx.currentTime + 0.5) {
       const t = this.nextClick;
       const beat = Math.round((t - this.startedAt) / period);
@@ -265,6 +322,7 @@ var AudioEngine = class {
         env.gain.exponentialRampToValueAtTime(1e-4, t + 0.045);
         src2.connect(hp);
         hp.connect(env);
+        this.trackTestSource(src2);
         src2.start(t);
         src2.stop(t + 0.06);
       } else {
@@ -275,6 +333,7 @@ var AudioEngine = class {
         env.gain.exponentialRampToValueAtTime(0.9, t + 4e-3);
         env.gain.exponentialRampToValueAtTime(1e-4, t + 0.16);
         osc.connect(env);
+        this.trackTestSource(osc);
         osc.start(t);
         osc.stop(t + 0.2);
       }
@@ -305,15 +364,32 @@ var AudioEngine = class {
       clearTimeout(this.clickTimer);
       this.clickTimer = null;
     }
-    if (this.source) {
+    this.clearTestSources();
+    this.disconnectSource();
+    this.position = 0;
+    this.playing = false;
+  }
+  disconnectSource() {
+    if (!this.source) return;
+    try {
+      this.source.stop();
+    } catch {
+    }
+    this.source.disconnect();
+    this.source = null;
+  }
+  trackTestSource(source3) {
+    this.testSources.add(source3);
+    source3.addEventListener("ended", () => this.testSources.delete(source3), { once: true });
+  }
+  clearTestSources() {
+    for (const source3 of this.testSources) {
       try {
-        this.source.stop();
+        source3.stop();
       } catch {
       }
-      this.source.disconnect();
-      this.source = null;
     }
-    this.playing = false;
+    this.testSources.clear();
   }
   /**
    * Final page teardown. `stop()` handles the current source, while closing the
@@ -545,6 +621,14 @@ var TempoTracker = class {
     this.nextBeat = 0;
     this.beatIndex = 0;
     this.phase = 0;
+  }
+  /** Preserve a trusted tempo/phase while the transport jumps by musical beats. */
+  seekByBeats(beats, targetTime) {
+    if (!this.locked || !this.bpm || !Number.isFinite(beats) || !Number.isFinite(targetTime)) return;
+    this.beatIndex = Math.max(0, this.beatIndex + beats);
+    const period = 60 / this.bpm;
+    this.nextBeat = targetTime + (1 - this.phase) * period;
+    this.onsets.length = 0;
   }
   addOnset(t) {
     const last2 = this.onsets[this.onsets.length - 1];
@@ -942,6 +1026,14 @@ var TierBTimeline = class {
     this.secPerBeat = 0;
     this.bias = 0;
     this.maxSlot = Number.NEGATIVE_INFINITY;
+    this.onsets.length = 0;
+  }
+  /** Re-anchor after a musical seek without forcing the detector to relock. */
+  seekByBeats(beats, targetTime) {
+    if (this.secPerBeat <= 0 || !Number.isFinite(beats) || !Number.isFinite(targetTime)) return;
+    this.anchorTime = targetTime;
+    this.anchorSlot = Math.max(0, this.anchorSlot + beats * SLOTS_PER_BEAT2);
+    this.maxSlot = this.anchorSlot;
     this.onsets.length = 0;
   }
   bpm(_atSec) {
@@ -1969,7 +2061,7 @@ function planStack(resolved) {
   };
   for (const r of resolved) {
     const { spec } = r.layer;
-    const blend = BLEND_PLANS[spec.blend];
+    const blend2 = BLEND_PLANS[spec.blend];
     const scale = spec.resolutionScale;
     if (spec.family === "feedback") {
       flush();
@@ -1983,7 +2075,7 @@ function planStack(resolved) {
         feedbackSlot: spec.id,
         resolutionScale: scale
       });
-      if (blend.readsDestination) {
+      if (blend2.readsDestination) {
         passes.push({
           label: `composite:${spec.id}`,
           kind: "composite",
@@ -1998,7 +2090,7 @@ function planStack(resolved) {
       }
       continue;
     }
-    if (blend.readsDestination) {
+    if (blend2.readsDestination) {
       flush();
       scratch = 1;
       const kind = spec.family === "source" ? "draw" : "transform";
@@ -2431,9 +2523,9 @@ function encodeHash(preset2) {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 function decodeHash(hash) {
-  const clean = hash.replace(/^#/, "").trim();
-  if (clean.length === 0) throw new PresetError("No preset in the URL hash.");
-  const b64 = clean.replace(/-/g, "+").replace(/_/g, "/");
+  const clean2 = hash.replace(/^#/, "").trim();
+  if (clean2.length === 0) throw new PresetError("No preset in the URL hash.");
+  const b64 = clean2.replace(/-/g, "+").replace(/_/g, "/");
   const padded = b64 + "=".repeat((4 - b64.length % 4) % 4);
   let binary;
   try {
@@ -2452,9 +2544,9 @@ function decodeHash(hash) {
   return deserialise(json);
 }
 function presetFromLocation(hash) {
-  const clean = hash.replace(/^#/, "").trim();
-  if (clean.length === 0) return null;
-  return decodeHash(clean);
+  const clean2 = hash.replace(/^#/, "").trim();
+  if (clean2.length === 0) return null;
+  return decodeHash(clean2);
 }
 
 // src/director.ts
@@ -4977,14 +5069,14 @@ var Renderer = class {
   }
   // -- encoding primitives ------------------------------------------------
   /** Set up and issue one layer's draw inside an already-open render pass. */
-  encodeLayerDraw(pass6, target, m, frame2, blend, source3 = null, history = null) {
+  encodeLayerDraw(pass6, target, m, frame2, blend2, source3 = null, history = null) {
     const desc = this.descriptorFor(m);
     if (!desc) return;
     const ctx = this.contextFor(m, frame2, target.width, target.height);
     const res = this.resourcesFor(m);
     this.writeCommon(res.common, m, frame2, target.width, target.height, m.opacity);
     this.writeParams(desc, res, ctx, "render");
-    const pipeline = this.renderPipeline(desc, target.texture.format, blend);
+    const pipeline = this.renderPipeline(desc, target.texture.format, blend2);
     const bind = this.bindGroupFor(desc, m, res, source3, history);
     pass6.setPipeline(pipeline);
     pass6.setBindGroup(PASS_GROUP, bind);
@@ -5002,8 +5094,8 @@ var Renderer = class {
     }
   }
   /** A blit issued inside an already-open render pass (a member of a draw run). */
-  encodeBlit(pass6, source3, target, blend, opacity, frame2, m) {
-    const pipeline = this.utilityPipeline("blit", BLIT_WGSL, target.texture.format, blend, false);
+  encodeBlit(pass6, source3, target, blend2, opacity, frame2, m) {
+    const pipeline = this.utilityPipeline("blit", BLIT_WGSL, target.texture.format, blend2, false);
     const common = this.nextUtilityBuffer();
     this.writeCommon(common, m, frame2, target.width, target.height, opacity);
     const bind = this.device.createBindGroup({
@@ -5024,11 +5116,11 @@ var Renderer = class {
     pass6.draw(3);
   }
   /** A blit that owns its own render pass, so it gets its own timer row. */
-  blitPass(encoder, source3, target, blend, opacity, frame2, m, label) {
+  blitPass(encoder, source3, target, blend2, opacity, frame2, m, label) {
     const load = target === this.cur && !this.accumCleared ? "clear" : "load";
     if (target === this.cur) this.accumCleared = true;
     const pass6 = this.timer.beginPass(encoder, target.view, label, load);
-    this.encodeBlit(pass6, source3, target, blend, opacity, frame2, m);
+    this.encodeBlit(pass6, source3, target, blend2, opacity, frame2, m);
     this.timer.endPass(pass6);
   }
   /** Dispatch a source's compute prepass. */
@@ -5248,10 +5340,10 @@ var Renderer = class {
     s[C_DT_SEC] = frame2.dtSeconds;
     s[C_DT_BEATS] = frame2.dtBeats;
     s[C_SEED] = m.layer.seed % 16777216;
-    const rgb = oklchToLinear(frame2.palette[m.layer.spec.palette]);
-    s[C_COLOR] = rgb[0];
-    s[C_COLOR + 1] = rgb[1];
-    s[C_COLOR + 2] = rgb[2];
+    const rgb2 = oklchToLinear(frame2.palette[m.layer.spec.palette]);
+    s[C_COLOR] = rgb2[0];
+    s[C_COLOR + 1] = rgb2[1];
+    s[C_COLOR + 2] = rgb2[2];
     s[C_COLOR + 3] = frame2.palette[m.layer.spec.palette].intensity;
     s[C_FRAME] = frame2.frame;
     this.device.queue.writeBuffer(buffer, 0, s);
@@ -5376,11 +5468,11 @@ var Renderer = class {
    * audio bind group (`audiogpu.ts`) is one object shared by every pass in the
    * project. Explicit layouts are the only way that sharing works.
    */
-  renderPipeline(desc, format, blend) {
-    const key = `${desc.type}|${format}|${blend}`;
+  renderPipeline(desc, format, blend2) {
+    const key = `${desc.type}|${format}|${blend2}`;
     const existing = this.renderPipelines.get(key);
     if (existing) return existing;
-    const plan2 = BLEND_PLANS[blend];
+    const plan2 = BLEND_PLANS[blend2];
     const state = plan2.implementation === "shader" ? BLEND_PLANS.replace.state : plan2.state;
     const module = this.module(desc.type, desc.code);
     const layouts = [this.renderLayout(desc)];
@@ -5495,8 +5587,8 @@ var Renderer = class {
     return created;
   }
   /** Blit and composite pipelines. Same cache, distinct key space. */
-  utilityPipeline(name, code, format, blend, readsDst, withParams = false) {
-    const key = `~${name}|${format}|${blend}`;
+  utilityPipeline(name, code, format, blend2, readsDst, withParams = false) {
+    const key = `~${name}|${format}|${blend2}`;
     const existing = this.renderPipelines.get(key);
     if (existing) return existing;
     const vis = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
@@ -5512,7 +5604,7 @@ var Renderer = class {
       entries.push({ binding: PASS_BINDING.params, visibility: vis, buffer: { type: "uniform" } });
     }
     const layout = this.device.createBindGroupLayout({ label: key, entries });
-    const plan2 = BLEND_PLANS[blend];
+    const plan2 = BLEND_PLANS[blend2];
     const created = this.device.createRenderPipeline({
       label: key,
       layout: this.device.createPipelineLayout({ label: key, bindGroupLayouts: [layout] }),
@@ -9160,6 +9252,9 @@ var LayerUI = class {
   outBpm;
   outLock;
   outPos;
+  playButton;
+  previousBarButton;
+  nextBarButton;
   lastBpmText = "";
   lastLockText = "";
   lastPosText = "";
@@ -9202,7 +9297,30 @@ var LayerUI = class {
     this.outLock = lockStat.value;
     this.outPos = posStat.value;
     stats2.append(bpmStat.node, lockStat.node, posStat.node);
-    transport.append(transportLegend, stats2);
+    const transportControls = el("div", "ui-transport-controls");
+    this.previousBarButton = el("button", "ui-transport-button", "\u22121 bar");
+    this.previousBarButton.type = "button";
+    this.previousBarButton.setAttribute("aria-label", "Previous bar");
+    this.previousBarButton.title = "Previous bar (Left Arrow)";
+    this.previousBarButton.addEventListener("click", () => {
+      void opts.onSkipBar?.(-1);
+    });
+    this.playButton = el("button", "ui-transport-button is-primary", "pause");
+    this.playButton.type = "button";
+    this.playButton.setAttribute("aria-label", "Pause");
+    this.playButton.title = "Pause or resume (Space)";
+    this.playButton.addEventListener("click", () => {
+      void opts.onTogglePlayback?.();
+    });
+    this.nextBarButton = el("button", "ui-transport-button", "+1 bar");
+    this.nextBarButton.type = "button";
+    this.nextBarButton.setAttribute("aria-label", "Next bar");
+    this.nextBarButton.title = "Next bar (Right Arrow)";
+    this.nextBarButton.addEventListener("click", () => {
+      void opts.onSkipBar?.(1);
+    });
+    transportControls.append(this.previousBarButton, this.playButton, this.nextBarButton);
+    transport.append(transportLegend, stats2, transportControls);
     const presetSection = el("div", "ui-section ui-preset-section");
     if (opts.presets && opts.presets.length > 0) {
       const presetLegend = el("span", "ui-legend", "look");
@@ -9296,7 +9414,7 @@ var LayerUI = class {
     const fileInput = el("input");
     fileInput.id = fileId;
     fileInput.type = "file";
-    fileInput.accept = "application/json,.json";
+    fileInput.accept = "application/json,.json,.avs";
     fileInput.addEventListener("change", () => {
       void this.loadPresetFile(fileInput);
     });
@@ -9412,6 +9530,12 @@ var LayerUI = class {
       this.outPos.textContent = posText;
       this.lastPosText = posText;
     }
+    this.previousBarButton.disabled = !readout.canControl;
+    this.playButton.disabled = !readout.canControl;
+    this.nextBarButton.disabled = !readout.canControl;
+    const playLabel = readout.playing ? "pause" : "resume";
+    if (this.playButton.textContent !== playLabel) this.playButton.textContent = playLabel;
+    this.playButton.setAttribute("aria-label", readout.playing ? "Pause" : "Resume");
   }
   dispose() {
     window.removeEventListener("keydown", this.onKeyCapture, true);
@@ -9863,6 +9987,13 @@ var LayerUI = class {
     input.value = "";
     if (!file) return;
     try {
+      if (file.name.toLowerCase().endsWith(".avs")) {
+        if (!this.opts.onLoadAvsPreset) throw new Error("This host does not enable Winamp AVS imports");
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        await this.opts.onLoadAvsPreset(bytes, file.name);
+        this.status(`loaded ${file.name}`);
+        return;
+      }
       const preset2 = deserialise(await file.text());
       this.opts.onLoadPreset(preset2);
       this.status(`loaded ${preset2.name}`);
@@ -9912,12 +10043,6068 @@ function ensureStylesheet(href) {
   document.head.append(link);
 }
 
+// src/avs/types.ts
+var AVS_PRESET_HEADER_V1 = "Nullsoft AVS Preset 0.1";
+var AVS_PRESET_HEADER_V2 = "Nullsoft AVS Preset 0.2";
+var AVS_AUDIO_SAMPLES = 576;
+var AVS_FFT_SIZE = 512;
+var AVS_FFT_BINS = AVS_FFT_SIZE / 2;
+
+// src/avs/preset.ts
+var HEADER_BYTES2 = 24;
+var ROOT_CONFIG_BYTES = 1;
+var EFFECT_LIST_ID = -2;
+var DLL_RENDER_BASE = 16384;
+var TEXT = new TextDecoder("windows-1252");
+var EFFECT_LIST_CODE_ID = 16384;
+var EFFECT_LIST_CODE_NAME = "AVS 2.8+ Effect List Config";
+var AvsPresetError = class extends Error {
+  constructor(message, offset) {
+    super(`${message} (byte ${offset})`);
+    this.offset = offset;
+    this.name = "AvsPresetError";
+  }
+};
+function parseAvsPreset(input) {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  if (bytes.byteLength < HEADER_BYTES2 + ROOT_CONFIG_BYTES) {
+    throw new AvsPresetError("AVS preset is shorter than its header", bytes.byteLength);
+  }
+  const header = decode(bytes.subarray(0, HEADER_BYTES2));
+  let version;
+  if (header === AVS_PRESET_HEADER_V2) version = 2;
+  else if (header === AVS_PRESET_HEADER_V1) version = 1;
+  else throw new AvsPresetError(`Unsupported AVS preset signature ${JSON.stringify(header)}`, 0);
+  const components = readComponents(bytes, HEADER_BYTES2 + ROOT_CONFIG_BYTES, bytes.byteLength, "");
+  return {
+    version,
+    header,
+    clearEveryFrame: bytes[HEADER_BYTES2] === 1,
+    components,
+    byteLength: bytes.byteLength
+  };
+}
+function readComponents(bytes, start, end, parent, absoluteBase = 0) {
+  const components = [];
+  let cursor = start;
+  let ordinal = 0;
+  while (cursor < end) {
+    if (end - cursor < 8) {
+      for (let i = cursor; i < end; i++) {
+        if (bytes[i] !== 0) throw new AvsPresetError("Truncated renderer record", absoluteBase + cursor);
+      }
+      break;
+    }
+    ordinal++;
+    const path = parent ? `${parent}.${ordinal}` : `${ordinal}`;
+    const effectId = i32(bytes, cursor);
+    const isApe = effectId !== EFFECT_LIST_ID && effectId >>> 0 >= DLL_RENDER_BASE;
+    const headerBytes = isApe ? 40 : 8;
+    requireBytes(cursor, headerBytes, end, "renderer header", absoluteBase);
+    const apeId = isApe ? nulText(bytes.subarray(cursor + 4, cursor + 36)) : null;
+    const lengthOffset = cursor + 4 + (isApe ? 32 : 0);
+    const payloadLength = u32(bytes, lengthOffset);
+    const payloadStart = cursor + headerBytes;
+    const payloadEnd = payloadStart + payloadLength;
+    if (!Number.isSafeInteger(payloadEnd) || payloadEnd > end) {
+      throw new AvsPresetError(
+        `Renderer ${path} payload (${payloadLength} bytes) exceeds its container`,
+        absoluteBase + lengthOffset
+      );
+    }
+    const payload = bytes.slice(payloadStart, payloadEnd);
+    let list = null;
+    let listCode = null;
+    let children = [];
+    if (effectId === EFFECT_LIST_ID && payload.length > 0) {
+      list = readListSettings(payload, payloadStart);
+      let childOffset = list.byteLength;
+      const codeRecord = readEffectListCode(payload, childOffset, payloadStart);
+      if (codeRecord) {
+        listCode = codeRecord.code;
+        childOffset = codeRecord.nextOffset;
+      }
+      children = readComponents(payload, childOffset, payload.length, path, absoluteBase + payloadStart);
+    }
+    components.push({
+      effectId,
+      apeId,
+      payload,
+      fileOffset: absoluteBase + cursor,
+      path,
+      children,
+      list,
+      listCode
+    });
+    cursor = payloadEnd;
+  }
+  return components;
+}
+function readListSettings(payload, absoluteOffset) {
+  const extended = (payload[0] & 128) !== 0;
+  if (!extended) {
+    const mode5 = payload[0];
+    return {
+      mode: mode5,
+      // r_list.h stores a DISABLE bit. This inversion is easy to miss because
+      // most serialized modes are zero, meaning an enabled, uncleared list.
+      enabled: (mode5 & 2) === 0,
+      clearEveryFrame: (mode5 & 1) !== 0,
+      inputBlendMode: mode5 >>> 8 & 31,
+      // The output selector is stored with bit zero toggled for historical
+      // compatibility with the original list renderer.
+      outputBlendMode: mode5 >>> 16 & 31 ^ 1,
+      inputBlendValue: 128,
+      outputBlendValue: 128,
+      inputBuffer: 0,
+      outputBuffer: 0,
+      inputInvert: false,
+      outputInvert: false,
+      beatRender: false,
+      beatRenderFrames: 1,
+      byteLength: 1
+    };
+  }
+  requireBytes(0, 5, payload.length, "extended Effect List header", absoluteOffset);
+  const mode4 = u32(payload, 1);
+  const byteLength = payload[4] + 1;
+  if (byteLength < 5 || byteLength > payload.length) {
+    throw new AvsPresetError(`Invalid Effect List header length ${byteLength}`, absoluteOffset + 4);
+  }
+  const ext = (index, fallback) => 5 + index * 4 + 4 <= byteLength ? i32(payload, 5 + index * 4) : fallback;
+  return {
+    mode: mode4,
+    enabled: (mode4 & 2) === 0,
+    clearEveryFrame: (mode4 & 1) !== 0,
+    inputBlendMode: mode4 >>> 8 & 31,
+    outputBlendMode: mode4 >>> 16 & 31 ^ 1,
+    inputBlendValue: ext(0, 128),
+    outputBlendValue: ext(1, 128),
+    inputBuffer: ext(2, 0),
+    outputBuffer: ext(3, 0),
+    inputInvert: ext(4, 0) !== 0,
+    outputInvert: ext(5, 0) !== 0,
+    beatRender: ext(6, 0) !== 0,
+    beatRenderFrames: ext(7, 1),
+    byteLength
+  };
+}
+function readEffectListCode(payload, offset, absoluteOffset) {
+  if (payload.length - offset < 40) return null;
+  if (i32(payload, offset) !== EFFECT_LIST_CODE_ID) return null;
+  const name = nulText(payload.subarray(offset + 4, offset + 36));
+  if (name !== EFFECT_LIST_CODE_NAME) return null;
+  const length = u32(payload, offset + 36);
+  const start = offset + 40;
+  const end = start + length;
+  if (end > payload.length) {
+    throw new AvsPresetError("Effect List code record exceeds its container", absoluteOffset + offset + 36);
+  }
+  const raw = payload.slice(start, end);
+  const decoded = decodeListCode(raw);
+  return { code: { ...decoded, raw }, nextOffset: end };
+}
+function decodeListCode(raw) {
+  if (raw.length < 4) return { enabled: false, init: "", frame: "" };
+  let cursor = 0;
+  const enabled = i32(raw, cursor) !== 0;
+  cursor += 4;
+  const readString4 = () => {
+    if (cursor + 4 > raw.length) return "";
+    const length = u32(raw, cursor);
+    cursor += 4;
+    const end = Math.min(raw.length, cursor + length);
+    const value = nulText(raw.subarray(cursor, end));
+    cursor = end;
+    return value;
+  };
+  return { enabled, init: readString4(), frame: readString4() };
+}
+function requireBytes(offset, length, end, what, base2 = 0) {
+  if (offset < 0 || length < 0 || offset + length > end) {
+    throw new AvsPresetError(`Truncated ${what}`, base2 + offset);
+  }
+}
+function u32(bytes, offset) {
+  requireBytes(offset, 4, bytes.length, "uint32");
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(offset, true);
+}
+function i32(bytes, offset) {
+  requireBytes(offset, 4, bytes.length, "int32");
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(offset, true);
+}
+function decode(bytes) {
+  return TEXT.decode(bytes);
+}
+function nulText(bytes) {
+  const zero = bytes.indexOf(0);
+  return decode(zero < 0 ? bytes : bytes.subarray(0, zero));
+}
+
+// src/avs/audio.ts
+var AvsBeatDetector = class {
+  slowPeak = 0;
+  fastPeak = 0;
+  lastTriggerPeak = 0;
+  reset() {
+    this.slowPeak = 0;
+    this.fastPeak = 0;
+    this.lastTriggerPeak = 0;
+  }
+  update(waveform) {
+    let left = 0;
+    let right = 0;
+    for (let i = 0; i < AVS_AUDIO_SAMPLES; i++) {
+      left += Math.abs(signedByte(waveform[0][i]));
+      right += Math.abs(signedByte(waveform[1][i]));
+    }
+    const level = Math.max(left, right);
+    this.slowPeak = (125 * this.slowPeak + 3 * this.fastPeak) / 128;
+    const beat = level >= 34 / 32 * this.slowPeak && level > AVS_AUDIO_SAMPLES * 16;
+    if (beat) {
+      this.slowPeak = (level + this.lastTriggerPeak) * 0.5;
+      this.lastTriggerPeak = level;
+    } else {
+      this.fastPeak = Math.max(level, this.fastPeak * 14 / 16);
+    }
+    return { beat, level };
+  }
+};
+var AvsAudioAnalyser = class {
+  beat = new AvsBeatDetector();
+  reset() {
+    this.beat.reset();
+  }
+  analyse(pcm) {
+    if (pcm.left.length < AVS_AUDIO_SAMPLES) {
+      throw new RangeError(`AVS audio analysis needs ${AVS_AUDIO_SAMPLES} PCM frames`);
+    }
+    const right = pcm.right ?? pcm.left;
+    if (right.length < AVS_AUDIO_SAMPLES) {
+      throw new RangeError(`AVS right channel needs ${AVS_AUDIO_SAMPLES} PCM frames`);
+    }
+    const waveform = [pcmBytes(pcm.left), pcmBytes(right)];
+    const spectrum = [
+      spectrumBytes(waveform[0]),
+      spectrumBytes(waveform[1])
+    ];
+    const hit = this.beat.update(waveform);
+    return { waveform, spectrum, beat: hit.beat, beatLevel: hit.level };
+  }
+};
+function avsLogSpectrumByte(value) {
+  const x = clamp11(value, 0, 255);
+  return clamp11(Math.floor(255 * Math.log(1 + 60 * x / 255) / Math.log(60)), 0, 255);
+}
+var AvsAudioAccumulator = class {
+  waveform = [new Uint8Array(AVS_AUDIO_SAMPLES), new Uint8Array(AVS_AUDIO_SAMPLES)];
+  spectrum = [new Uint8Array(AVS_AUDIO_SAMPLES), new Uint8Array(AVS_AUDIO_SAMPLES)];
+  beat = new AvsBeatDetector();
+  beatLatched = false;
+  beatLevel = 0;
+  push(waveform, spectrum) {
+    validateHostFrame(waveform, "waveform");
+    validateHostFrame(spectrum, "spectrum");
+    for (let channel = 0; channel < 2; channel++) {
+      this.waveform[channel].set(waveform[channel]);
+      const held = this.spectrum[channel];
+      const incoming = spectrum[channel];
+      for (let i = 0; i < AVS_AUDIO_SAMPLES; i++) {
+        const mapped = avsLogSpectrumByte(incoming[i]);
+        if (mapped > held[i]) held[i] = mapped;
+      }
+    }
+    const hit = this.beat.update(waveform);
+    this.beatLatched ||= hit.beat;
+    this.beatLevel = hit.level;
+  }
+  consume() {
+    const waveform = [this.waveform[0].slice(), this.waveform[1].slice()];
+    const spectrum = [this.spectrum[0].slice(), this.spectrum[1].slice()];
+    const frame2 = { waveform, spectrum, beat: this.beatLatched, beatLevel: this.beatLevel };
+    this.spectrum[0].fill(0);
+    this.spectrum[1].fill(0);
+    this.beatLatched = false;
+    return frame2;
+  }
+  reset() {
+    this.waveform[0].fill(0);
+    this.waveform[1].fill(0);
+    this.spectrum[0].fill(0);
+    this.spectrum[1].fill(0);
+    this.beat.reset();
+    this.beatLatched = false;
+    this.beatLevel = 0;
+  }
+};
+function avsAudioSample(frame2, kind, band, width, channelValue) {
+  const channel = Math.floor(channelValue + 0.5);
+  if (channel < 0 || channel > 2) return 0;
+  let centre = Math.trunc(band * AVS_AUDIO_SAMPLES);
+  let span = Math.max(1, Math.trunc(width * AVS_AUDIO_SAMPLES));
+  centre -= Math.trunc(span / 2);
+  if (centre < 0) {
+    span += centre;
+    centre = 0;
+  }
+  if (centre > AVS_AUDIO_SAMPLES - 1) centre = AVS_AUDIO_SAMPLES - 1;
+  if (centre + span > AVS_AUDIO_SAMPLES) span = AVS_AUDIO_SAMPLES - centre;
+  if (span <= 0) return 0;
+  const end = centre + span;
+  let sum = 0;
+  let count = 0;
+  for (let i = centre; i < end; i++) {
+    const read = (ch) => kind === "osc" ? ((frame2.waveform[ch][i] ^ 128) - 128) / 127.5 : frame2.spectrum[ch][i] / 255;
+    sum += channel === 0 ? (read(0) + read(1)) * 0.5 : read(channel - 1);
+    count++;
+  }
+  return count > 0 ? sum / count : 0;
+}
+function pcmBytes(samples) {
+  const out = new Uint8Array(AVS_AUDIO_SAMPLES);
+  for (let i = 0; i < out.length; i++) {
+    const value = clamp11(samples[i], -1, 1);
+    const pcm16 = value <= -1 ? -32768 : Math.round(value * 32767);
+    out[i] = pcm16 >> 8 & 255;
+  }
+  return out;
+}
+function spectrumBytes(waveform) {
+  const re = new Float64Array(AVS_FFT_SIZE);
+  const im = new Float64Array(AVS_FFT_SIZE);
+  let x1 = 0;
+  let y1 = 0;
+  for (let i = 0; i < AVS_FFT_SIZE; i++) {
+    const x = signedByte(waveform[i]);
+    const y = x - x1 + 0.99 * y1;
+    x1 = x;
+    y1 = y;
+    const hann = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (AVS_FFT_SIZE - 1));
+    re[i] = y * hann;
+  }
+  fft(re, im);
+  const out = new Uint8Array(AVS_AUDIO_SAMPLES);
+  let last2 = 0;
+  for (let bin = 0; bin < AVS_FFT_BINS; bin++) {
+    const magnitude = clamp11(Math.hypot(re[bin], im[bin]) / 16, 0, 255);
+    const smooth = (magnitude + last2) * 0.5;
+    out[bin * 2] = avsLogSpectrumByte(smooth);
+    out[bin * 2 + 1] = avsLogSpectrumByte(magnitude);
+    last2 = magnitude;
+  }
+  for (let i = AVS_FFT_SIZE; i < AVS_AUDIO_SAMPLES; i++) {
+    last2 *= 0.5;
+    out[i] = avsLogSpectrumByte(last2);
+  }
+  return out;
+}
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      const tr = re[i];
+      re[i] = re[j];
+      re[j] = tr;
+      const ti = im[i];
+      im[i] = im[j];
+      im[j] = ti;
+    }
+  }
+  for (let size = 2; size <= n; size <<= 1) {
+    const angle = -2 * Math.PI / size;
+    const stepR = Math.cos(angle);
+    const stepI = Math.sin(angle);
+    for (let base2 = 0; base2 < n; base2 += size) {
+      let wr = 1;
+      let wi = 0;
+      for (let j = 0; j < size / 2; j++) {
+        const even = base2 + j;
+        const odd = even + size / 2;
+        const tr = wr * re[odd] - wi * im[odd];
+        const ti = wr * im[odd] + wi * re[odd];
+        re[odd] = re[even] - tr;
+        im[odd] = im[even] - ti;
+        re[even] = re[even] + tr;
+        im[even] = im[even] + ti;
+        const nextWr = wr * stepR - wi * stepI;
+        wi = wr * stepI + wi * stepR;
+        wr = nextWr;
+      }
+    }
+  }
+}
+function signedByte(value) {
+  return value < 128 ? value : value - 256;
+}
+function validateHostFrame(frame2, label) {
+  if (frame2[0].length < AVS_AUDIO_SAMPLES || frame2[1].length < AVS_AUDIO_SAMPLES) {
+    throw new RangeError(`AVS ${label} callback needs two ${AVS_AUDIO_SAMPLES}-byte channels`);
+  }
+}
+function clamp11(value, lo, hi) {
+  return value < lo ? lo : value > hi ? hi : value;
+}
+
+// src/avs/eel/types.ts
+var AvsEelSyntaxError = class extends SyntaxError {
+  constructor(message, offset, source3) {
+    const before = source3.slice(0, offset);
+    const line = before.split("\n").length;
+    const lastNewline = before.lastIndexOf("\n");
+    const column = offset - lastNewline;
+    super(`${message} at ${line}:${column}`);
+    this.offset = offset;
+    this.name = "AvsEelSyntaxError";
+  }
+};
+var AvsEelCompileError = class extends Error {
+  constructor(message, span) {
+    super(`${message} (characters ${span.start}-${span.end})`);
+    this.span = span;
+    this.name = "AvsEelCompileError";
+  }
+};
+
+// src/avs/eel/parser.ts
+var ASSIGNMENTS = /* @__PURE__ */ new Set(["=", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "**="]);
+var PRECEDENCE = {
+  "||": 1,
+  "&&": 2,
+  "|": 3,
+  "^": 4,
+  "&": 5,
+  "==": 6,
+  "!=": 6,
+  "===": 6,
+  "!==": 6,
+  "<": 7,
+  "<=": 7,
+  ">": 7,
+  ">=": 7,
+  "<<": 8,
+  ">>": 8,
+  "+": 9,
+  "-": 9,
+  "*": 10,
+  "/": 10,
+  "%": 10,
+  "**": 11
+};
+function parseAvsEel(source3) {
+  const parser = new Parser(source3);
+  return { kind: "program", source: source3, body: parser.program() };
+}
+var Parser = class {
+  constructor(source3) {
+    this.source = source3;
+    this.lexer = new Lexer(source3);
+    this.current = this.lexer.next();
+  }
+  lexer;
+  current;
+  program() {
+    const values = [];
+    for (; ; ) {
+      if (this.current.kind === "eof") break;
+      if (this.take(";") || this.take(",")) continue;
+      values.push(this.expression(0, true));
+      if (this.take(";") || this.take(",")) continue;
+      if (this.current.lineBreakBefore) continue;
+      if (this.startsExpression()) continue;
+      if (!this.atEnd()) this.fail(`Expected statement separator, got ${JSON.stringify(this.current.text)}`);
+    }
+    if (values.length === 0) return { kind: "number", value: 0, span: { start: 0, end: 0 } };
+    if (values.length === 1) return values[0];
+    return {
+      kind: "sequence",
+      values,
+      span: { start: values[0].span.start, end: values[values.length - 1].span.end }
+    };
+  }
+  expression(minPrecedence, stopAtComma) {
+    let left = this.prefix();
+    for (; ; ) {
+      if (stopAtComma && this.current.text === ",") break;
+      if (this.current.text === "?") {
+        if (minPrecedence > 0) break;
+        this.advance();
+        const yes = this.expression(0, true);
+        this.expect(":");
+        const no = this.expression(0, stopAtComma);
+        left = { kind: "conditional", condition: left, yes, no, span: { start: left.span.start, end: no.span.end } };
+        continue;
+      }
+      if (ASSIGNMENTS.has(this.current.text)) {
+        if (minPrecedence > 0) break;
+        const operator2 = this.current.text;
+        this.advance();
+        const value = this.expression(0, stopAtComma);
+        left = { kind: "assign", operator: operator2, target: left, value, span: { start: left.span.start, end: value.span.end } };
+        continue;
+      }
+      const precedence = PRECEDENCE[this.current.text];
+      if (precedence === void 0 || precedence < minPrecedence) break;
+      const operator = this.current.text;
+      this.advance();
+      const right = this.expression(operator === "**" ? precedence : precedence + 1, stopAtComma);
+      left = { kind: "binary", operator, left, right, span: { start: left.span.start, end: right.span.end } };
+    }
+    return left;
+  }
+  prefix() {
+    const token = this.current;
+    if (token.kind === "number") {
+      this.advance();
+      const value = Number(token.text);
+      if (!Number.isFinite(value)) this.fail(`Invalid number ${JSON.stringify(token.text)}`, token.start);
+      return { kind: "number", value, span: { start: token.start, end: token.end } };
+    }
+    if (token.kind === "identifier") {
+      this.advance();
+      const name = token.text.toLowerCase();
+      if (!this.take("(")) return { kind: "variable", name, span: { start: token.start, end: token.end } };
+      const args = [];
+      if (!this.take(")")) {
+        do {
+          args.push(this.expression(0, true));
+        } while (this.take(","));
+        this.expect(")");
+      }
+      return { kind: "call", name, args, span: { start: token.start, end: this.previousEnd } };
+    }
+    if (token.text === "(") {
+      this.advance();
+      const values = [];
+      while (!this.take(")")) {
+        if (this.current.kind === "eof") this.fail("Unterminated parenthesized expression", token.start);
+        if (this.take(";") || this.take(",")) continue;
+        values.push(this.expression(0, true));
+        if (this.current.text !== ")" && !this.take(";") && !this.take(",") && !this.current.lineBreakBefore && !this.startsExpression()) {
+          this.fail(`Expected separator or ')', got ${JSON.stringify(this.current.text)}`);
+        }
+      }
+      if (values.length === 0) return { kind: "number", value: 0, span: { start: token.start, end: this.previousEnd } };
+      if (values.length === 1) return values[0];
+      return { kind: "sequence", values, span: { start: token.start, end: this.previousEnd } };
+    }
+    if (token.text === "+" || token.text === "-" || token.text === "!" || token.text === "~") {
+      this.advance();
+      const value = this.expression(12, true);
+      return { kind: "unary", operator: token.text, value, span: { start: token.start, end: value.span.end } };
+    }
+    this.fail(`Expected expression, got ${JSON.stringify(token.text)}`);
+  }
+  previousEnd = 0;
+  startsExpression() {
+    return this.current.kind === "number" || this.current.kind === "identifier" || this.current.text === "(" || this.current.text === "+" || this.current.text === "-" || this.current.text === "!" || this.current.text === "~";
+  }
+  atEnd() {
+    return this.current.kind === "eof";
+  }
+  advance() {
+    this.previousEnd = this.current.end;
+    this.current = this.lexer.next();
+  }
+  take(text) {
+    if (this.current.text !== text) return false;
+    this.advance();
+    return true;
+  }
+  expect(text) {
+    if (!this.take(text)) this.fail(`Expected ${JSON.stringify(text)}, got ${JSON.stringify(this.current.text)}`);
+  }
+  fail(message, offset = this.current.start) {
+    throw new AvsEelSyntaxError(message, offset, this.source);
+  }
+};
+var Lexer = class {
+  constructor(source3) {
+    this.source = source3;
+  }
+  offset = 0;
+  next() {
+    const lineBreakBefore = this.skipTrivia();
+    const start = this.offset;
+    if (start >= this.source.length) return { kind: "eof", text: "", start, end: start, lineBreakBefore };
+    const rest = this.source.slice(start);
+    const number = /^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/.exec(rest);
+    if (number) return this.token("number", number[0], lineBreakBefore);
+    const identifier = /^[$A-Za-z_][$A-Za-z0-9_]*/.exec(rest);
+    if (identifier) return this.token("identifier", identifier[0], lineBreakBefore);
+    for (const operator of ["!==", "===", "**=", "<<=", ">>=", "!=", "==", "<=", ">=", "&&", "||", "<<", ">>", "**", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^="]) {
+      if (rest.startsWith(operator)) return this.token("operator", operator, lineBreakBefore);
+    }
+    const char = this.source[start];
+    if ("+-*/%^|&!=<>~".includes(char)) return this.token("operator", char, lineBreakBefore);
+    if ("(),;?:".includes(char)) return this.token("punctuation", char, lineBreakBefore);
+    throw new AvsEelSyntaxError(`Unexpected character ${JSON.stringify(char)}`, start, this.source);
+  }
+  token(kind, text, lineBreakBefore) {
+    const start = this.offset;
+    this.offset += text.length;
+    return { kind, text, start, end: this.offset, lineBreakBefore };
+  }
+  skipTrivia() {
+    let lineBreak = false;
+    for (; ; ) {
+      while (this.offset < this.source.length && this.source[this.offset] !== "\xA0" && /\s/.test(this.source[this.offset])) {
+        lineBreak ||= this.source[this.offset] === "\n" || this.source[this.offset] === "\r";
+        this.offset++;
+      }
+      if (this.source[this.offset] === "\xA0" || this.source[this.offset] === "\xA3" || this.source[this.offset] === "\xA4" || this.source[this.offset] === "\xA9") {
+        const semicolon = this.source.indexOf(";", this.offset + 1);
+        const relativeNewline = this.source.slice(this.offset + 1).search(/\r?\n/);
+        const newline = relativeNewline < 0 ? -1 : this.offset + 1 + relativeNewline;
+        const end = semicolon >= 0 && (newline < 0 || semicolon < newline) ? semicolon + 1 : newline < 0 ? this.source.length : newline;
+        this.offset = end;
+        continue;
+      }
+      if (this.source.startsWith("//", this.offset)) {
+        const newline = this.source.indexOf("\n", this.offset + 2);
+        this.offset = newline < 0 ? this.source.length : newline + 1;
+        lineBreak = true;
+        continue;
+      }
+      if (this.source[this.offset] === "/" && this.source[this.offset + 1] !== "*" && this.atLineStart(this.offset) && /[\sA-Za-z_]/.test(this.source[this.offset + 1] ?? "")) {
+        const newline = this.source.indexOf("\n", this.offset + 1);
+        this.offset = newline < 0 ? this.source.length : newline + 1;
+        lineBreak = true;
+        continue;
+      }
+      if (this.source.startsWith("/*", this.offset)) {
+        const end = this.source.indexOf("*/", this.offset + 2);
+        if (end < 0) throw new AvsEelSyntaxError("Unterminated block comment", this.offset, this.source);
+        lineBreak ||= /[\r\n]/.test(this.source.slice(this.offset, end + 2));
+        this.offset = end + 2;
+        continue;
+      }
+      break;
+    }
+    return lineBreak;
+  }
+  atLineStart(offset) {
+    const newline = this.source.lastIndexOf("\n", offset - 1);
+    return this.source.slice(newline + 1, offset).trim().length === 0;
+  }
+};
+
+// src/avs/eel/compiler.ts
+var CLOSE = 1e-5;
+function compileAvsEel(source3) {
+  return compileAvsEelAst(parseAvsEel(source3));
+}
+function compileAvsEelAst(ast) {
+  const execute7 = compileNode(ast.body);
+  return { source: ast.source, ast, execute: execute7 };
+}
+function compileNode(node) {
+  switch (node.kind) {
+    case "number":
+      return () => node.value;
+    case "variable": {
+      if (node.name === "$pi") return () => Math.PI;
+      if (node.name === "$e") return () => Math.E;
+      if (node.name === "$phi") return () => (1 + Math.sqrt(5)) * 0.5;
+      const reference = compileReference(node);
+      return (vm) => reference(vm).get();
+    }
+    case "sequence": {
+      const values = node.values.map(compileNode);
+      return (vm) => {
+        let result = 0;
+        for (const value of values) result = finite2(value(vm));
+        return result;
+      };
+    }
+    case "unary": {
+      const value = compileNode(node.value);
+      switch (node.operator) {
+        case "+":
+          return (vm) => finite2(value(vm));
+        case "-":
+          return (vm) => finite2(-value(vm));
+        case "!":
+          return (vm) => truth(value(vm)) ? 0 : 1;
+        case "~":
+          return (vm) => ~integer(value(vm));
+        default:
+          throw new AvsEelCompileError(`Unknown unary operator ${node.operator}`, node.span);
+      }
+    }
+    case "binary":
+      return compileBinary(node.operator, compileNode(node.left), compileNode(node.right), node.span);
+    case "conditional": {
+      const condition = compileNode(node.condition);
+      const yes = compileNode(node.yes);
+      const no = compileNode(node.no);
+      return (vm) => truth(condition(vm)) ? yes(vm) : no(vm);
+    }
+    case "assign": {
+      const target = compileReference(node.target);
+      const value = compileNode(node.value);
+      return (vm) => {
+        const reference = target(vm);
+        const right = value(vm);
+        const left = reference.get();
+        let result;
+        switch (node.operator) {
+          case "=":
+            result = right;
+            break;
+          case "+=":
+            result = left + right;
+            break;
+          case "-=":
+            result = left - right;
+            break;
+          case "*=":
+            result = left * right;
+            break;
+          case "/=":
+            result = divide(left, right);
+            break;
+          case "%=":
+            result = modulo(left, right);
+            break;
+          case "|=":
+            result = integer(left) | integer(right);
+            break;
+          case "&=":
+            result = integer(left) & integer(right);
+            break;
+          case "^=":
+            result = integer(left) ^ integer(right);
+            break;
+          case "**=":
+            result = Math.pow(left, right);
+            break;
+        }
+        result = finite2(result);
+        reference.set(result);
+        return result;
+      };
+    }
+    case "call":
+      return compileCall(node.name, node.args, node.span);
+  }
+}
+function compileBinary(operator, left, right, span) {
+  switch (operator) {
+    case "&&":
+      return (vm) => truth(left(vm)) ? truth(right(vm)) ? 1 : 0 : 0;
+    case "||":
+      return (vm) => truth(left(vm)) ? 1 : truth(right(vm)) ? 1 : 0;
+    case "+":
+      return (vm) => finite2(left(vm) + right(vm));
+    case "-":
+      return (vm) => finite2(left(vm) - right(vm));
+    case "*":
+      return (vm) => finite2(left(vm) * right(vm));
+    case "/":
+      return (vm) => divide(left(vm), right(vm));
+    case "%":
+      return (vm) => modulo(left(vm), right(vm));
+    case "**":
+      return (vm) => finite2(Math.pow(left(vm), right(vm)));
+    case "|":
+      return (vm) => integer(left(vm)) | integer(right(vm));
+    case "&":
+      return (vm) => integer(left(vm)) & integer(right(vm));
+    case "^":
+      return (vm) => integer(left(vm)) ^ integer(right(vm));
+    case "<<":
+      return (vm) => integer(left(vm)) << (integer(right(vm)) & 31);
+    case ">>":
+      return (vm) => integer(left(vm)) >> (integer(right(vm)) & 31);
+    case "<":
+      return (vm) => left(vm) < right(vm) ? 1 : 0;
+    case "<=":
+      return (vm) => left(vm) <= right(vm) ? 1 : 0;
+    case ">":
+      return (vm) => left(vm) > right(vm) ? 1 : 0;
+    case ">=":
+      return (vm) => left(vm) >= right(vm) ? 1 : 0;
+    case "==":
+      return (vm) => close(left(vm), right(vm)) ? 1 : 0;
+    case "!=":
+      return (vm) => close(left(vm), right(vm)) ? 0 : 1;
+    case "===":
+      return (vm) => left(vm) === right(vm) ? 1 : 0;
+    case "!==":
+      return (vm) => left(vm) !== right(vm) ? 1 : 0;
+    default:
+      throw new AvsEelCompileError(`Unknown binary operator ${operator}`, span);
+  }
+}
+function compileCall(name, nodes, span) {
+  if (name === "if") {
+    arity(name, nodes, 3, span);
+    const condition = compileNode(nodes[0]);
+    const yes = compileNode(nodes[1]);
+    const no = compileNode(nodes[2]);
+    return (vm) => truth(condition(vm)) ? yes(vm) : no(vm);
+  }
+  if (name === "loop") {
+    arity(name, nodes, 2, span);
+    const count = compileNode(nodes[0]);
+    const body = compileNode(nodes[1]);
+    return (vm) => {
+      const iterations = Math.min(Math.max(0, integer(count(vm))), vm.maxLoopIterations);
+      let result = 0;
+      for (let i = 0; i < iterations; i++) result = body(vm);
+      return finite2(result);
+    };
+  }
+  if (name === "assign") {
+    arity(name, nodes, 2, span);
+    const target = compileReference(nodes[0]);
+    const value = compileNode(nodes[1]);
+    return (vm) => {
+      const reference = target(vm);
+      const result = finite2(value(vm));
+      reference.set(result);
+      return result;
+    };
+  }
+  if (name === "megabuf" || name === "gmegabuf") {
+    arity(name, nodes, 1, span);
+    const index = compileNode(nodes[0]);
+    return (vm) => vm.memory(name === "gmegabuf", index(vm)).get();
+  }
+  const args = nodes.map(compileNode);
+  const values = (vm) => args.map((arg) => arg(vm));
+  const one = (fn) => {
+    arity(name, nodes, 1, span);
+    return (vm) => finite2(fn(args[0](vm)));
+  };
+  const two = (fn) => {
+    arity(name, nodes, 2, span);
+    return (vm) => finite2(fn(args[0](vm), args[1](vm)));
+  };
+  switch (name) {
+    case "sin":
+      return one(Math.sin);
+    case "cos":
+      return one(Math.cos);
+    case "tan":
+      return one(Math.tan);
+    case "asin":
+      return one(Math.asin);
+    case "acos":
+      return one(Math.acos);
+    case "atan":
+      return one(Math.atan);
+    case "atan2":
+      return two(Math.atan2);
+    case "sqrt":
+      return one(Math.sqrt);
+    case "sqr":
+      return one((v) => v * v);
+    case "invsqrt":
+      return one((v) => 1 / Math.sqrt(v));
+    case "pow":
+      return two(Math.pow);
+    case "exp":
+      return one(Math.exp);
+    case "log":
+      return one(Math.log);
+    case "log10":
+      return one(Math.log10);
+    case "abs":
+      return one(Math.abs);
+    case "floor":
+      return one(Math.floor);
+    case "ceil":
+      return one(Math.ceil);
+    case "int":
+      return one(Math.trunc);
+    case "sign":
+      return one((v) => v < 0 ? -1 : v > 0 ? 1 : 0);
+    case "min":
+      return two(Math.min);
+    case "max":
+      return two(Math.max);
+    case "equal":
+      return two((a, b) => close(a, b) ? 1 : 0);
+    case "above":
+      return two((a, b) => a > b ? 1 : 0);
+    case "below":
+      return two((a, b) => a < b ? 1 : 0);
+    case "band":
+      return two((a, b) => truth(a) && truth(b) ? 1 : 0);
+    case "bor":
+      return two((a, b) => truth(a) || truth(b) ? 1 : 0);
+    case "bnot":
+      return one((v) => truth(v) ? 0 : 1);
+    case "rand": {
+      arity(name, nodes, 1, span);
+      return (vm) => vm.random(args[0](vm));
+    }
+    case "getosc":
+    case "getspec": {
+      arity(name, nodes, 3, span);
+      return (vm) => vm.host(name, values(vm));
+    }
+    case "gettime":
+    case "getkbmouse": {
+      arity(name, nodes, 1, span);
+      return (vm) => vm.host(name, values(vm));
+    }
+    default:
+      throw new AvsEelCompileError(`Unknown EEL function ${name}`, span);
+  }
+}
+function compileReference(node) {
+  if (node.kind === "variable") {
+    if (node.name === "$pi" || node.name === "$e" || node.name === "$phi") {
+      throw new AvsEelCompileError(`Cannot assign to constant ${node.name}`, node.span);
+    }
+    return (vm) => vm.variable(node.name);
+  }
+  if (node.kind === "call" && (node.name === "megabuf" || node.name === "gmegabuf")) {
+    arity(node.name, node.args, 1, node.span);
+    const index = compileNode(node.args[0]);
+    return (vm) => vm.memory(node.name === "gmegabuf", index(vm));
+  }
+  if (node.kind === "conditional") {
+    const condition = compileNode(node.condition);
+    const yes = compileReference(node.yes);
+    const no = compileReference(node.no);
+    return (vm) => truth(condition(vm)) ? yes(vm) : no(vm);
+  }
+  if (node.kind === "call" && node.name === "if") {
+    arity(node.name, node.args, 3, node.span);
+    const condition = compileNode(node.args[0]);
+    const yes = compileReference(node.args[1]);
+    const no = compileReference(node.args[2]);
+    return (vm) => truth(condition(vm)) ? yes(vm) : no(vm);
+  }
+  throw new AvsEelCompileError("Assignment target must be a variable, memory cell, or conditional reference", node.span);
+}
+function arity(name, args, expected, span) {
+  if (args.length !== expected) throw new AvsEelCompileError(`${name} expects ${expected} arguments, got ${args.length}`, span);
+}
+function truth(value) {
+  return Math.abs(value) >= CLOSE;
+}
+function close(a, b) {
+  return Math.abs(a - b) < CLOSE;
+}
+function integer(value) {
+  return Number.isFinite(value) ? Math.trunc(value) : 0;
+}
+function finite2(value) {
+  return Number.isFinite(value) ? value : 0;
+}
+function divide(a, b) {
+  return Math.abs(b) < Number.EPSILON ? 0 : finite2(a / b);
+}
+function modulo(a, b) {
+  return Math.abs(b) < Number.EPSILON ? 0 : finite2(a % b);
+}
+
+// src/avs/eel/vm.ts
+var REGISTER_COUNT = 100;
+var MEMORY_BLOCK_SIZE = 16384;
+var MEMORY_BLOCK_COUNT = 64;
+var MEMORY_CELL_COUNT = MEMORY_BLOCK_SIZE * MEMORY_BLOCK_COUNT;
+var DEFAULT_MAX_LOOPS = 4096;
+var MEMORY_CLOSE_FACTOR = 1e-5;
+var AvsEelMemory = class {
+  blocks = /* @__PURE__ */ new Map();
+  read(value) {
+    const index = memoryIndex(value);
+    if (index < 0) return 0;
+    const block = this.blocks.get(Math.floor(index / MEMORY_BLOCK_SIZE));
+    return block?.[index % MEMORY_BLOCK_SIZE] ?? 0;
+  }
+  write(value, next) {
+    const index = memoryIndex(value);
+    if (index < 0) return;
+    const blockIndex = Math.floor(index / MEMORY_BLOCK_SIZE);
+    let block = this.blocks.get(blockIndex);
+    if (!block) {
+      if (next === 0) return;
+      block = new Float64Array(MEMORY_BLOCK_SIZE);
+      this.blocks.set(blockIndex, block);
+    }
+    block[index % MEMORY_BLOCK_SIZE] = Number.isFinite(next) ? next : 0;
+  }
+  clear() {
+    this.blocks.clear();
+  }
+};
+var AvsEelGlobalState = class {
+  registers = new Float64Array(REGISTER_COUNT);
+  memory = new AvsEelMemory();
+  reset() {
+    this.registers.fill(0);
+    this.memory.clear();
+  }
+};
+var AvsEelVm = class {
+  global;
+  localMemory = new AvsEelMemory();
+  variables = /* @__PURE__ */ new Map();
+  maxLoopIterations;
+  hostFunctions;
+  randomState;
+  constructor(options = {}) {
+    this.global = options.global ?? new AvsEelGlobalState();
+    this.hostFunctions = options.host ?? {};
+    this.randomState = options.seed === void 0 ? 1831565813 : options.seed >>> 0;
+    this.maxLoopIterations = Math.max(0, Math.trunc(options.maxLoopIterations ?? DEFAULT_MAX_LOOPS));
+  }
+  execute(program) {
+    return program.execute(this);
+  }
+  setHost(host) {
+    this.hostFunctions = host;
+  }
+  reseed(seed) {
+    this.randomState = seed >>> 0;
+  }
+  get(name) {
+    return this.variable(name).get();
+  }
+  set(name, value) {
+    this.variable(name).set(value);
+  }
+  variable(rawName) {
+    const name = rawName.toLowerCase().slice(0, 8);
+    const match = /^reg(\d\d)$/.exec(name);
+    if (match) {
+      const index = Number(match[1]);
+      return {
+        get: () => this.global.registers[index] ?? 0,
+        set: (value) => {
+          this.global.registers[index] = clean(value);
+        }
+      };
+    }
+    return {
+      get: () => this.variables.get(name) ?? 0,
+      set: (value) => {
+        this.variables.set(name, clean(value));
+      }
+    };
+  }
+  memory(global, rawIndex) {
+    const memory2 = global ? this.global.memory : this.localMemory;
+    const index = memoryIndex(rawIndex);
+    return { get: () => memory2.read(index), set: (value) => memory2.write(index, clean(value)) };
+  }
+  host(name, args) {
+    const fn = this.hostFunctions[name];
+    if (!fn) return 0;
+    if (name === "getosc" || name === "getspec") {
+      return clean(fn(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0));
+    }
+    return clean(fn(args[0] ?? 0));
+  }
+  random(limit) {
+    let state = this.randomState + 2654435769 >>> 0;
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    this.randomState = state >>> 0;
+    const bound = Math.max(0, Math.trunc(limit));
+    return bound > 1 ? this.randomState % bound : 0;
+  }
+  resetLocal() {
+    this.variables.clear();
+    this.localMemory.clear();
+  }
+};
+function memoryIndex(value) {
+  if (!Number.isFinite(value) || value < 0) return -1;
+  const index = Math.trunc(value + MEMORY_CLOSE_FACTOR);
+  return index < 0 || index >= MEMORY_CELL_COUNT ? -1 : index;
+}
+function clean(value) {
+  return Number.isFinite(value) ? value : 0;
+}
+
+// src/avs/framebuffer.ts
+var AVS_LIST_BLEND_MODES = {
+  0: "ignore",
+  1: "replace",
+  2: "average",
+  3: "maximum",
+  4: "additive",
+  5: "destination-minus-source",
+  6: "source-minus-destination",
+  7: "every-other-line",
+  8: "every-other-pixel",
+  9: "xor",
+  10: "adjustable",
+  11: "multiply",
+  12: "buffer-depth",
+  13: "minimum"
+};
+var AvsFramebuffer = class _AvsFramebuffer {
+  constructor(width, height, pixels) {
+    this.width = width;
+    this.height = height;
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+      throw new RangeError(`Invalid AVS framebuffer size ${width}x${height}`);
+    }
+    const length = width * height;
+    if (pixels && pixels.length !== length) {
+      throw new RangeError(`AVS framebuffer has ${pixels.length} pixels, expected ${length}`);
+    }
+    this.pixels = pixels ?? new Uint32Array(length);
+  }
+  pixels;
+  clear(color = 0) {
+    this.pixels.fill(color & 16777215);
+  }
+  clone() {
+    return new _AvsFramebuffer(this.width, this.height, this.pixels.slice());
+  }
+  copyFrom(source3) {
+    this.assertShape(source3);
+    this.pixels.set(source3.pixels);
+  }
+  /** Blend source (the list/local image) over this destination/parent image. */
+  blendFrom(source3, mode4, amount = 128, depth, invertDepth = false) {
+    this.assertShape(source3);
+    if (mode4 === "ignore") return;
+    if (mode4 === "replace") {
+      this.copyFrom(source3);
+      return;
+    }
+    if (mode4 === "buffer-depth") {
+      if (!depth) return;
+      this.assertShape(depth);
+    }
+    const alpha = clampByte(amount);
+    for (let i = 0; i < this.pixels.length; i++) {
+      if (mode4 === "every-other-line" && Math.floor(i / this.width) % 2 !== 0) continue;
+      if (mode4 === "every-other-pixel") {
+        const y = Math.floor(i / this.width);
+        const x = i - y * this.width;
+        if ((x & 1) !== (y & 1)) continue;
+      }
+      const mix = mode4 === "buffer-depth" ? depthOf(depth.pixels[i], invertDepth) : alpha;
+      this.pixels[i] = blendPixel(source3.pixels[i], this.pixels[i], mode4, mix);
+    }
+  }
+  assertShape(other) {
+    if (other.width !== this.width || other.height !== this.height) {
+      throw new RangeError(`AVS framebuffer mismatch ${other.width}x${other.height} vs ${this.width}x${this.height}`);
+    }
+  }
+};
+var AvsBufferBank = class {
+  buffers = new Array(8).fill(null);
+  get(index, width, height, create = true) {
+    if (!Number.isInteger(index) || index < 0 || index >= 8) return null;
+    const current = this.buffers[index];
+    if (current?.width === width && current.height === height) return current;
+    if (!create) return null;
+    const next = new AvsFramebuffer(width, height);
+    this.buffers[index] = next;
+    return next;
+  }
+  clear() {
+    for (const buffer of this.buffers) buffer?.clear();
+  }
+  release() {
+    this.buffers.fill(null);
+  }
+};
+function decodeAvsListBlend(code) {
+  return AVS_LIST_BLEND_MODES[code] ?? "ignore";
+}
+function blendPixel(source3, destination, mode4, amount = 128) {
+  source3 &= 16777215;
+  destination &= 16777215;
+  switch (mode4) {
+    case "ignore":
+      return destination;
+    case "replace":
+      return source3;
+    case "average":
+      return (source3 >>> 1 & 8355711) + (destination >>> 1 & 8355711);
+    case "maximum":
+      return channels(source3, destination, Math.max);
+    case "minimum":
+      return channels(source3, destination, Math.min);
+    case "additive":
+      return channels(source3, destination, (a, b) => Math.min(255, a + b));
+    case "destination-minus-source":
+      return channels(source3, destination, (a, b) => Math.max(0, b - a));
+    case "source-minus-destination":
+      return channels(source3, destination, (a, b) => Math.max(0, a - b));
+    case "xor":
+      return (source3 ^ destination) & 16777215;
+    case "adjustable":
+    case "buffer-depth": {
+      const a = clampByte(amount);
+      return channels(source3, destination, (s, d) => table(s, a) + table(d, 255 - a));
+    }
+    case "multiply":
+      return channels(source3, destination, table);
+    // Selection for these modes is performed by blendFrom because it needs x/y.
+    case "every-other-line":
+    case "every-other-pixel":
+      return source3;
+  }
+}
+function channels(a, b, fn) {
+  const c0 = fn(a & 255, b & 255) & 255;
+  const c1 = fn(a >>> 8 & 255, b >>> 8 & 255) & 255;
+  const c2 = fn(a >>> 16 & 255, b >>> 16 & 255) & 255;
+  return c0 | c1 << 8 | c2 << 16;
+}
+function table(x, y) {
+  return Math.trunc(x / 255 * y);
+}
+function clampByte(value) {
+  return value < 0 ? 0 : value > 255 ? 255 : Math.trunc(value);
+}
+function depthOf(pixel, invert) {
+  const depth = Math.max(pixel & 255, pixel >>> 8 & 255, pixel >>> 16 & 255);
+  return invert ? 255 - depth : depth;
+}
+
+// src/avs/executor.ts
+var AvsEffectRegistry = class {
+  /** Shared NS-EEL registers and gmegabuf for every effect in this graph. */
+  eelGlobal;
+  builtins = /* @__PURE__ */ new Map();
+  apes = /* @__PURE__ */ new Map();
+  constructor(eelGlobal = new AvsEelGlobalState()) {
+    this.eelGlobal = eelGlobal;
+  }
+  registerBuiltin(effectId, handler) {
+    this.builtins.set(effectId, handler);
+    return this;
+  }
+  registerApe(apeId, handler) {
+    this.apes.set(apeId.toLowerCase(), handler);
+    return this;
+  }
+  handler(component) {
+    return component.apeId ? this.apes.get(component.apeId.toLowerCase()) : this.builtins.get(component.effectId);
+  }
+};
+var AvsExecutor = class {
+  constructor(preset2, registry) {
+    this.preset = preset2;
+    this.registry = registry;
+    this.eelGlobal = registry.eelGlobal;
+  }
+  buffers = new AvsBufferBank();
+  stats = { rendered: 0, unsupported: 0, lists: 0 };
+  /** Preset-global EEL registers/gmegabuf shared with registered codeable effects. */
+  eelGlobal;
+  retained = /* @__PURE__ */ new Map();
+  alternates = /* @__PURE__ */ new Map();
+  beatFrames = /* @__PURE__ */ new Map();
+  listEel = /* @__PURE__ */ new Map();
+  render(framebuffer, audio2, preinit = false) {
+    this.stats.rendered = 0;
+    this.stats.unsupported = 0;
+    this.stats.lists = 0;
+    if (this.preset.clearEveryFrame && !preinit) framebuffer.clear();
+    const alternate = this.surface(this.alternates, "$root", framebuffer);
+    const line = { blendMode: 0, adjustableAlpha: 0, lineWidth: 1 };
+    const result = this.runChildren(this.preset.components, framebuffer, alternate, audio2, line, preinit, audio2.beat);
+    if (result.current !== framebuffer) framebuffer.copyFrom(result.current);
+    return { ...this.stats };
+  }
+  reset() {
+    this.retained.clear();
+    this.alternates.clear();
+    this.beatFrames.clear();
+    this.listEel.clear();
+    this.buffers.release();
+  }
+  runChildren(children, primary, alternate, audio2, line, preinit, initialBeat) {
+    let current = primary;
+    let spare = alternate;
+    let beat = initialBeat;
+    for (const component of children) {
+      if (component.list) {
+        this.runList(component, current, audio2, line, preinit, beat);
+        continue;
+      }
+      const handler = this.registry.handler(component);
+      if (!handler) {
+        this.stats.unsupported++;
+        continue;
+      }
+      const result = handler({
+        component,
+        input: current,
+        output: spare,
+        audio: audio2,
+        buffers: this.buffers,
+        line,
+        preinit,
+        beat
+      });
+      this.stats.rendered++;
+      if (result?.swap) {
+        const old = current;
+        current = spare;
+        spare = old;
+      }
+      if (result?.beat !== void 0 && !preinit) beat = result.beat;
+    }
+    return { current, alternate: spare, beat };
+  }
+  runList(component, parent, audio2, parentLine, preinit, beat) {
+    const settings = component.list;
+    this.stats.lists++;
+    let remaining = this.beatFrames.get(component.path) ?? 0;
+    if ((beat || preinit) && settings.beatRender) {
+      remaining = settings.beatRenderFrames;
+      this.beatFrames.set(component.path, remaining);
+    }
+    const frameState = this.evaluateListCode(
+      component,
+      audio2,
+      parent.width,
+      parent.height,
+      preinit,
+      beat,
+      settings.enabled || remaining > 0,
+      settings.clearEveryFrame,
+      settings.inputBlendValue,
+      settings.outputBlendValue,
+      remaining
+    );
+    if (!frameState.enabled) {
+      this.retained.delete(component.path);
+      return;
+    }
+    if (settings.inputBlendMode === 1 && settings.outputBlendMode === 1) {
+      const alternate2 = this.surface(this.alternates, `${component.path}:fast`, parent);
+      const line2 = { blendMode: 0, adjustableAlpha: 0, lineWidth: 1 };
+      const result2 = this.runChildren(component.children, parent, alternate2, audio2, line2, preinit, frameState.beat);
+      if (result2.current !== parent) parent.copyFrom(result2.current);
+      this.consumeBeatFrame(component.path, frameState.remainingBeatFrames);
+      return;
+    }
+    const local = this.surface(this.retained, component.path, parent);
+    const alternate = this.surface(this.alternates, component.path, parent);
+    if (frameState.clear) local.clear();
+    if (!preinit) {
+      const depth = settings.inputBlendMode === 12 ? this.buffers.get(settings.inputBuffer, parent.width, parent.height, false) : null;
+      local.blendFrom(
+        parent,
+        decodeAvsListBlend(settings.inputBlendMode),
+        frameState.alphaIn,
+        depth ?? void 0,
+        settings.inputInvert
+      );
+    }
+    const line = { ...parentLine, blendMode: 0 };
+    const result = this.runChildren(component.children, local, alternate, audio2, line, preinit, frameState.beat);
+    if (result.current !== local) local.copyFrom(result.current);
+    if (!preinit) {
+      const depth = settings.outputBlendMode === 12 ? this.buffers.get(settings.outputBuffer, parent.width, parent.height, false) : null;
+      parent.blendFrom(
+        local,
+        decodeAvsListBlend(settings.outputBlendMode),
+        frameState.alphaOut,
+        depth ?? void 0,
+        settings.outputInvert
+      );
+    }
+    this.consumeBeatFrame(component.path, frameState.remainingBeatFrames);
+  }
+  evaluateListCode(component, audio2, width, height, preinit, beat, enabled, clear, alphaIn, alphaOut, remainingBeatFrames) {
+    const code = component.listCode;
+    if (!code?.enabled) {
+      return { enabled, clear, alphaIn, alphaOut, beat, remainingBeatFrames };
+    }
+    let state = this.listEel.get(component.path);
+    if (!state) {
+      state = {
+        vm: new AvsEelVm({ global: this.eelGlobal, seed: hashPath(component.path) }),
+        init: compileOrNull(code.init),
+        frame: compileOrNull(code.frame),
+        initialized: false
+      };
+      this.listEel.set(component.path, state);
+    }
+    const { vm } = state;
+    vm.setHost({
+      getosc: (band, span, channel) => avsAudioSample(audio2, "osc", band, span, channel),
+      getspec: (band, span, channel) => avsAudioSample(audio2, "spec", band, span, channel)
+    });
+    vm.set("beat", beat && !preinit ? 1 : 0);
+    vm.set("enabled", enabled ? 1 : 0);
+    vm.set("w", width);
+    vm.set("h", height);
+    vm.set("clear", clear ? 1 : 0);
+    vm.set("alphain", alphaIn / 255);
+    vm.set("alphaout", alphaOut / 255);
+    if (!state.initialized) {
+      execute(state.init, vm);
+      state.initialized = true;
+    }
+    execute(state.frame, vm);
+    return {
+      enabled: eelSwitch(vm.get("enabled")),
+      clear: eelSwitch(vm.get("clear")),
+      alphaIn: alphaByte(vm.get("alphain")),
+      alphaOut: alphaByte(vm.get("alphaout")),
+      beat: preinit ? beat : eelSwitch(vm.get("beat")),
+      remainingBeatFrames
+    };
+  }
+  consumeBeatFrame(path, remaining) {
+    if (remaining > 0) this.beatFrames.set(path, remaining - 1);
+  }
+  surface(store, key, like) {
+    const current = store.get(key);
+    if (current?.width === like.width && current.height === like.height) return current;
+    const created = new AvsFramebuffer(like.width, like.height);
+    store.set(key, created);
+    return created;
+  }
+};
+function compileOrNull(source3) {
+  if (!source3.trim()) return null;
+  try {
+    return compileAvsEel(source3);
+  } catch {
+    return null;
+  }
+}
+function execute(program, vm) {
+  return program ? vm.execute(program) : 0;
+}
+function eelSwitch(value) {
+  return value > 0.1 || value < -0.1;
+}
+function alphaByte(value) {
+  const byte = Math.trunc(value * 255);
+  return byte < 0 ? 0 : byte > 255 ? 255 : byte;
+}
+function hashPath(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+
+// src/avs/effects/core.ts
+function registerAvsCoreEffects(registry = new AvsEffectRegistry()) {
+  const stackDirection = /* @__PURE__ */ new Map();
+  const clearFrames = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(18, (ctx) => {
+    if (ctx.preinit) return;
+    const direction = int2(ctx, 0, 0);
+    const index = clamp12(int2(ctx, 4, 0), 0, 7);
+    const blend2 = int2(ctx, 8, 0);
+    const amount = int2(ctx, 12, 128);
+    const buffer = ctx.buffers.get(index, ctx.input.width, ctx.input.height, direction !== 1);
+    if (!buffer) return;
+    let actual = direction;
+    if (direction >= 2) {
+      const phase = stackDirection.get(ctx.component.path) ?? 0;
+      actual = direction & 1 ^ phase;
+      stackDirection.set(ctx.component.path, phase ^ 1);
+    }
+    const source3 = actual === 0 ? ctx.input : buffer;
+    const destination = actual === 0 ? buffer : ctx.input;
+    blendStack(destination, source3, blend2, amount);
+  });
+  registry.registerBuiltin(21, () => void 0);
+  registry.registerBuiltin(25, (ctx) => {
+    if (ctx.preinit || int2(ctx, 0, 1) === 0) return;
+    const seen = clearFrames.get(ctx.component.path) ?? 0;
+    if (int2(ctx, 16, 0) !== 0 && seen > 0) return;
+    clearFrames.set(ctx.component.path, seen + 1);
+    const color = int2(ctx, 4, 0) & 16777215;
+    const blend2 = int2(ctx, 8, 0);
+    const average = int2(ctx, 12, 0) !== 0;
+    if (blend2 === 2) {
+      for (let i = 0; i < ctx.input.pixels.length; i++) {
+        ctx.input.pixels[i] = blendLine(color, ctx.input.pixels[i], ctx.line.blendMode, ctx.line.adjustableAlpha);
+      }
+    } else if (blend2 !== 0) {
+      for (let i = 0; i < ctx.input.pixels.length; i++) {
+        ctx.input.pixels[i] = add(color, ctx.input.pixels[i]);
+      }
+    } else if (average) {
+      for (let i = 0; i < ctx.input.pixels.length; i++) {
+        ctx.input.pixels[i] = averagePixel(color, ctx.input.pixels[i]);
+      }
+    } else ctx.input.clear(color);
+  });
+  registry.registerBuiltin(37, (ctx) => {
+    if (ctx.preinit || int2(ctx, 0, 1) === 0) return;
+    for (let i = 0; i < ctx.input.pixels.length; i++) {
+      ctx.input.pixels[i] = ctx.input.pixels[i] ^ 16777215;
+    }
+  });
+  registry.registerBuiltin(40, (ctx) => {
+    if (ctx.preinit) return;
+    const mode4 = uint(ctx, 0, 2147549184);
+    if ((mode4 & 2147483648) === 0) return;
+    ctx.line.blendMode = mode4 & 255;
+    ctx.line.adjustableAlpha = mode4 >>> 8 & 255;
+    ctx.line.lineWidth = mode4 >>> 16 & 255;
+  });
+  registry.registerBuiltin(44, (ctx) => {
+    if (ctx.preinit) return;
+    const direction = int2(ctx, 0, 0);
+    if (direction === 0) {
+      for (let i = 0; i < ctx.input.pixels.length; i++) {
+        const p = ctx.input.pixels[i];
+        ctx.input.pixels[i] = rgb(p, (v) => Math.min(255, v + v));
+      }
+    } else if (direction === 1) {
+      for (let i = 0; i < ctx.input.pixels.length; i++) {
+        ctx.input.pixels[i] = ctx.input.pixels[i] >>> 1 & 8355711;
+      }
+    }
+  });
+  return registry;
+}
+function blendStack(destination, source3, code, amount) {
+  const modes = {
+    0: "replace",
+    1: "average",
+    2: "additive",
+    3: "every-other-pixel",
+    4: "destination-minus-source",
+    5: "every-other-line",
+    6: "xor",
+    7: "maximum",
+    8: "minimum",
+    9: "source-minus-destination",
+    10: "multiply",
+    11: "adjustable"
+  };
+  destination.blendFrom(source3, modes[code] ?? "replace", amount);
+}
+function blendLine(source3, destination, mode4, amount) {
+  switch (mode4) {
+    case 1:
+      return add(source3, destination);
+    case 2:
+      return channel2(source3, destination, Math.max);
+    case 3:
+      return averagePixel(source3, destination);
+    case 4:
+      return channel2(source3, destination, (s, d) => Math.max(0, d - s));
+    case 5:
+      return channel2(source3, destination, (s, d) => Math.max(0, s - d));
+    case 6:
+      return channel2(source3, destination, table2);
+    case 7:
+      return channel2(source3, destination, (s, d) => table2(s, amount) + table2(d, 255 - amount));
+    case 8:
+      return (source3 ^ destination) & 16777215;
+    case 9:
+      return channel2(source3, destination, Math.min);
+    default:
+      return source3 & 16777215;
+  }
+}
+function int2(ctx, offset, fallback) {
+  if (offset + 4 > ctx.component.payload.length) return fallback;
+  return new DataView(
+    ctx.component.payload.buffer,
+    ctx.component.payload.byteOffset,
+    ctx.component.payload.byteLength
+  ).getInt32(offset, true);
+}
+function uint(ctx, offset, fallback) {
+  if (offset + 4 > ctx.component.payload.length) return fallback >>> 0;
+  return new DataView(
+    ctx.component.payload.buffer,
+    ctx.component.payload.byteOffset,
+    ctx.component.payload.byteLength
+  ).getUint32(offset, true);
+}
+function add(a, b) {
+  return channel2(a, b, (x, y) => Math.min(255, x + y));
+}
+function averagePixel(a, b) {
+  return (a >>> 1 & 8355711) + (b >>> 1 & 8355711);
+}
+function table2(a, b) {
+  return Math.trunc(a / 255 * b);
+}
+function rgb(pixel, fn) {
+  return fn(pixel & 255) | fn(pixel >>> 8 & 255) << 8 | fn(pixel >>> 16 & 255) << 16;
+}
+function channel2(a, b, fn) {
+  return fn(a & 255, b & 255) & 255 | (fn(a >>> 8 & 255, b >>> 8 & 255) & 255) << 8 | (fn(a >>> 16 & 255, b >>> 16 & 255) & 255) << 16;
+}
+function clamp12(value, lo, hi) {
+  return value < lo ? lo : value > hi ? hi : value;
+}
+
+// src/avs/effects/add-borders.ts
+var AVS_ADD_BORDERS_APE_ID = "Virtual Effect: Addborders";
+function decodeAvsAddBorders(payload) {
+  return {
+    enabled: i322(payload, 0, 1) !== 0,
+    color: i322(payload, 4, 0) & 16777215,
+    size: Math.max(0, i322(payload, 8, 1))
+  };
+}
+function registerAvsAddBorders(registry = new AvsEffectRegistry()) {
+  registry.registerApe(AVS_ADD_BORDERS_APE_ID, (context) => render(context, decodeAvsAddBorders(context.component.payload)));
+  return registry;
+}
+function render(context, config) {
+  if (context.preinit || !config.enabled || config.size === 0) return;
+  const { width, height } = context.input;
+  const sizeX = Math.min(width, config.size);
+  const sizeY = Math.min(height, config.size);
+  for (let y = 0; y < height; y++) {
+    const edgeY = y < sizeY || y >= height - sizeY;
+    for (let x = 0; x < width; x++) {
+      if (edgeY || x < sizeX || x >= width - sizeX) {
+        context.input.pixels[x + y * width] = config.color;
+      }
+    }
+  }
+}
+function i322(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+}
+
+// src/avs/effects/classic.ts
+function registerAvsClassicEffects(registry = new AvsEffectRegistry(), options = {}) {
+  const randomInt = options.randomInt ?? ((maximum) => Math.floor(Math.random() * maximum));
+  const blitters = /* @__PURE__ */ new Map();
+  const scatterTables = /* @__PURE__ */ new Map();
+  const mirrors = /* @__PURE__ */ new Map();
+  const mirrorShared = {
+    lastMode: 0,
+    divisor: [0, 0, 0, 0],
+    increment: [0, 0, 0, 0]
+  };
+  registry.registerBuiltin(3, (ctx) => {
+    if (ctx.preinit) return;
+    const fade3 = int3(ctx, 0, 16);
+    if (fade3 === 0) return;
+    const target = int3(ctx, 4, 0);
+    const tr = target & 255;
+    const tg = target >>> 8 & 255;
+    const tb = target >>> 16 & 255;
+    for (let i = 0; i < ctx.input.pixels.length; i++) {
+      const pixel = ctx.input.pixels[i];
+      ctx.input.pixels[i] = approach(pixel & 255, tr, fade3) | approach(pixel >>> 8 & 255, tg, fade3) << 8 | approach(pixel >>> 16 & 255, tb, fade3) << 16;
+    }
+  });
+  registry.registerBuiltin(4, (ctx) => {
+    if (ctx.preinit) return;
+    const scale = int3(ctx, 0, 30);
+    const beatScale = int3(ctx, 4, 30);
+    const blend2 = int3(ctx, 8, 0) !== 0;
+    const changeOnBeat = int3(ctx, 12, 0) !== 0;
+    const subpixel = int3(ctx, 16, 0) !== 0;
+    let state = blitters.get(ctx.component.path);
+    if (!state || state.scale !== scale) {
+      state = { scale, position: scale };
+      blitters.set(ctx.component.path, state);
+    }
+    if (ctx.beat && changeOnBeat) state.position = beatScale;
+    let value;
+    if (scale < beatScale) {
+      value = Math.max(state.position, scale);
+      state.position -= 3;
+    } else {
+      value = Math.min(state.position, scale);
+      state.position += 3;
+    }
+    value = Math.max(0, value);
+    if (value < 32) {
+      blitIn(ctx, value, blend2, subpixel);
+      return { swap: true };
+    }
+    if (value > 32) blitOut(ctx, value, blend2);
+  });
+  registry.registerBuiltin(6, (ctx) => {
+    const mode4 = int3(ctx, 0, 1);
+    if (ctx.preinit || mode4 === 0) return;
+    blur(ctx, mode4, int3(ctx, 4, 0) !== 0);
+    return { swap: true };
+  });
+  registry.registerBuiltin(16, (ctx) => {
+    if (int3(ctx, 0, 1) === 0 || ctx.preinit) return;
+    const { width, height } = ctx.input;
+    if (height <= 8) {
+      ctx.output.copyFrom(ctx.input);
+      return { swap: true };
+    }
+    let table7 = scatterTables.get(width);
+    if (!table7) {
+      table7 = new Int32Array(512);
+      for (let i = 0; i < table7.length; i++) {
+        let dx = i % 8 - 4;
+        let dy = Math.floor(i / 8) % 8 - 4;
+        if (dx < 0) dx++;
+        if (dy < 0) dy++;
+        table7[i] = width * dy + dx;
+      }
+      scatterTables.set(width, table7);
+    }
+    const edge = width * 4;
+    ctx.output.pixels.set(ctx.input.pixels.subarray(0, edge), 0);
+    for (let i = edge; i < width * (height - 4); i++) {
+      const offset = table7[normalizeRandom(randomInt(512), 512)];
+      ctx.output.pixels[i] = ctx.input.pixels[i + offset];
+    }
+    ctx.output.pixels.set(ctx.input.pixels.subarray(width * (height - 4)), width * (height - 4));
+    return { swap: true };
+  });
+  registry.registerBuiltin(22, (ctx) => {
+    if (ctx.preinit || int3(ctx, 0, 1) === 0) return;
+    const additive = int3(ctx, 4, 0) !== 0;
+    const average = int3(ctx, 8, 1) !== 0;
+    const red = multiplier(int3(ctx, 12, 0));
+    const green = multiplier(int3(ctx, 16, 0));
+    const blue = multiplier(int3(ctx, 20, 0));
+    const reference = int3(ctx, 28, 0);
+    const exclude = int3(ctx, 32, 0) !== 0;
+    const distance = int3(ctx, 36, 16);
+    for (let i = 0; i < ctx.input.pixels.length; i++) {
+      const pixel = ctx.input.pixels[i];
+      if (exclude && inRange(pixel, reference, distance)) continue;
+      const adjusted = adjustBrightness(pixel, red, green, blue);
+      ctx.input.pixels[i] = additive ? add2(pixel, adjusted) : average ? averagePixel2(pixel, adjusted) : adjusted;
+    }
+  });
+  registry.registerBuiltin(26, (ctx) => {
+    if (ctx.preinit || int3(ctx, 0, 1) === 0) return;
+    const configuredMode = int3(ctx, 4, 1) & 15;
+    const onBeat = int3(ctx, 8, 0) !== 0;
+    const smooth = int3(ctx, 12, 0) !== 0;
+    const slower = Math.max(1, int3(ctx, 16, 4));
+    let state = mirrors.get(ctx.component.path);
+    if (!state) {
+      state = { beatMode: 0, frameCount: 0 };
+      mirrors.set(ctx.component.path, state);
+    }
+    if (onBeat && ctx.beat) state.beatMode = normalizeRandom(randomInt(16), 16) & configuredMode;
+    const mode4 = onBeat ? state.beatMode : configuredMode;
+    updateMirrorTarget(mirrorShared, mode4);
+    renderMirror(ctx, mode4, smooth, mirrorShared.divisor);
+    state.frameCount++;
+    if (smooth && state.frameCount % slower === 0) stepMirror(mirrorShared);
+  });
+  return registry;
+}
+function blur(ctx, mode4, roundUp) {
+  const { width, height } = ctx.input;
+  const source3 = ctx.input.pixels;
+  const destination = ctx.output.pixels;
+  if (width < 2 || height < 2) {
+    destination.set(source3);
+    return;
+  }
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const center = source3[y * width + x];
+      const left = x > 0 ? source3[y * width + x - 1] : 0;
+      const right = x + 1 < width ? source3[y * width + x + 1] : 0;
+      const up = y > 0 ? source3[(y - 1) * width + x] : 0;
+      const down = y + 1 < height ? source3[(y + 1) * width + x] : 0;
+      destination[y * width + x] = blurPixel(
+        mode4,
+        center,
+        left,
+        right,
+        up,
+        down,
+        x === 0,
+        x === width - 1,
+        y === 0,
+        y === height - 1,
+        roundUp
+      );
+    }
+  }
+}
+function blurPixel(mode4, center, left, right, up, down, atLeft, atRight, atTop, atBottom, roundUp) {
+  if (mode4 === 3) {
+    const horizontal = atLeft ? [[right, 1]] : atRight ? [[left, 1]] : [[left, 2], [right, 2]];
+    const vertical = atTop ? [[down, 1]] : atBottom ? [[up, 1]] : [[up, 2], [down, 2]];
+    const rounding = atLeft || atRight ? atTop || atBottom ? 1 : 2 : atTop || atBottom ? 2 : 3;
+    return shiftedSum([...horizontal, ...vertical], roundUp ? rounding : 0);
+  }
+  if (mode4 === 2) {
+    const corner2 = (atLeft || atRight) && (atTop || atBottom);
+    const edge2 = atLeft || atRight || atTop || atBottom;
+    const terms2 = [[center, 1]];
+    if (corner2) {
+      terms2.push([center, 2], [atLeft ? right : left, 3], [atTop ? down : up, 3]);
+    } else if (edge2) {
+      terms2.push([center, 3]);
+      if (!atLeft && !atRight) terms2.push([left, 3], [right, 3], [atTop ? down : up, 3]);
+      else terms2.push([atLeft ? right : left, 3], [up, 3], [down, 3]);
+    } else terms2.push([center, 2], [left, 4], [right, 4], [up, 4], [down, 4]);
+    return shiftedSum(terms2, roundUp ? corner2 ? 3 : edge2 ? 4 : 5 : 0);
+  }
+  const corner = (atLeft || atRight) && (atTop || atBottom);
+  const edge = atLeft || atRight || atTop || atBottom;
+  let terms;
+  if (corner) terms = [[center, 1], [atLeft ? right : left, 2], [atTop ? down : up, 2]];
+  else if (edge && (atTop || atBottom)) terms = [[center, 2], [left, 2], [right, 2], [atTop ? down : up, 2]];
+  else if (edge) terms = [[center, 2], [atLeft ? right : left, 2], [up, 2], [down, 2]];
+  else terms = [[center, 1], [left, 3], [right, 3], [up, 3], [down, 3]];
+  return shiftedSum(terms, roundUp ? corner ? 2 : edge ? 3 : 4 : 0);
+}
+function shiftedSum(terms, rounding) {
+  let r = rounding, g = rounding, b = rounding;
+  for (const [pixel, shift] of terms) {
+    r += (pixel & 255) >>> shift;
+    g += (pixel >>> 8 & 255) >>> shift;
+    b += (pixel >>> 16 & 255) >>> shift;
+  }
+  return r & 255 | (g & 255) << 8 | (b & 255) << 16;
+}
+function blitIn(ctx, value, blend2, subpixel) {
+  const { width, height } = ctx.input;
+  const source3 = ctx.input.pixels;
+  const destination = ctx.output.pixels;
+  const step = Math.trunc((value + 32) * 65536 / 64);
+  const startX = Math.trunc((width * 65536 - step * width) / 2);
+  let sourceY = Math.trunc((height * 65536 - step * height) / 2);
+  for (let y = 0; y < height; y++) {
+    let sourceX = startX;
+    for (let x = 0; x < width; x++) {
+      const sx = sourceX >> 16;
+      const sy = sourceY >> 16;
+      const sampled = subpixel ? bilinear(source3, width, height, sx, sy, sourceX >> 8 & 255, sourceY >> 8 & 255) : source3[sy * width + sx];
+      destination[y * width + x] = blend2 ? averagePixel2(source3[y * width + x], sampled) : sampled;
+      sourceX += step;
+      if (!subpixel && blend2 && (x & 3) === 3) sourceX += step;
+    }
+    sourceY += step;
+  }
+}
+function blitOut(ctx, value, blend2) {
+  const { width, height } = ctx.input;
+  const source3 = ctx.input.pixels;
+  const scratch = ctx.output.pixels;
+  const step = value + 128 - 32 << 9;
+  const regionWidth = Math.trunc(width * 65536 / step) & ~3;
+  const regionHeight = Math.trunc(height * 65536 / step);
+  if (regionWidth >= width || regionHeight >= height || regionWidth <= 0 || regionHeight <= 0) return;
+  const startX = Math.trunc((width - regionWidth) / 2);
+  const startY = Math.trunc((height - regionHeight) / 2);
+  let sourceY = 32768;
+  for (let y = 0; y < regionHeight; y++) {
+    let sourceX = 32768;
+    const sy = sourceY >> 16;
+    for (let x = 0; x < regionWidth; x++) {
+      const sampled = source3[sy * width + (sourceX >> 16)];
+      const index = (startY + y) * width + startX + x;
+      scratch[index] = blend2 ? averagePixel2(source3[index], sampled) : sampled;
+      sourceX += step;
+      if (blend2 && (x & 3) === 3) sourceX += step;
+    }
+    sourceY += step;
+  }
+  for (let y = 0; y < regionHeight; y++) {
+    const offset = (startY + y) * width + startX;
+    source3.set(scratch.subarray(offset, offset + regionWidth), offset);
+  }
+}
+function bilinear(pixels, width, height, x, y, xPart, yPart) {
+  const x1 = Math.min(width - 1, x + 1);
+  const y1 = Math.min(height - 1, y + 1);
+  const a = pixels[y * width + x];
+  const b = pixels[y * width + x1];
+  const c = pixels[y1 * width + x];
+  const d = pixels[y1 * width + x1];
+  return channels4(a, b, c, d, (av, bv, cv, dv) => {
+    const top = av * (255 - xPart) + bv * xPart >>> 8;
+    const bottom = cv * (255 - xPart) + dv * xPart >>> 8;
+    return top * (255 - yPart) + bottom * yPart >>> 8;
+  });
+}
+function renderMirror(ctx, mode4, smooth, divisor) {
+  const pixels = ctx.input.pixels;
+  const { width, height } = ctx.input;
+  const halfWidth = Math.trunc(width / 2);
+  const halfHeight = Math.trunc(height / 2);
+  if ((mode4 & 4) !== 0 || smooth && divisor[2] !== 0) {
+    const amount = divisor[2];
+    for (let y = 0; y < height; y++) for (let x = 0; x < halfWidth; x++) {
+      const source3 = y * width + x;
+      const target = y * width + width - 1 - x;
+      pixels[target] = smooth && amount ? adaptive(pixels[target], pixels[source3], amount) : pixels[source3];
+    }
+  }
+  if ((mode4 & 8) !== 0 || smooth && divisor[3] !== 0) {
+    const amount = divisor[3];
+    for (let y = 0; y < height; y++) for (let x = 0; x < halfWidth; x++) {
+      const target = y * width + x;
+      const source3 = y * width + width - 1 - x;
+      pixels[target] = smooth && amount ? adaptive(pixels[target], pixels[source3], amount) : pixels[source3];
+    }
+  }
+  if ((mode4 & 1) !== 0 || smooth && divisor[0] !== 0) {
+    const amount = divisor[0];
+    for (let y = 0; y < halfHeight; y++) for (let x = 0; x < width; x++) {
+      const source3 = y * width + x;
+      const target = (height - 1 - y) * width + x;
+      pixels[target] = smooth && amount ? adaptive(pixels[target], pixels[source3], amount) : pixels[source3];
+    }
+  }
+  if ((mode4 & 2) !== 0 || smooth && divisor[1] !== 0) {
+    const amount = divisor[1];
+    for (let y = 0; y < halfHeight; y++) for (let x = 0; x < width; x++) {
+      const target = y * width + x;
+      const source3 = (height - 1 - y) * width + x;
+      pixels[target] = smooth && amount ? adaptive(pixels[target], pixels[source3], amount) : pixels[source3];
+    }
+  }
+}
+function updateMirrorTarget(state, mode4) {
+  const difference = mode4 ^ state.lastMode;
+  for (let i = 0; i < 4; i++) {
+    const bit = 1 << i;
+    if ((difference & bit) === 0) continue;
+    const wasOn = (state.lastMode & bit) !== 0;
+    state.increment[i] = wasOn ? -1 : 1;
+    if (state.divisor[i] === 0) state.divisor[i] = wasOn ? 16 : 1;
+  }
+  state.lastMode = mode4;
+}
+function stepMirror(state) {
+  for (let i = 0; i < 4; i++) {
+    if (state.divisor[i] !== 0) state.divisor[i] = (state.divisor[i] + state.increment[i] + 16) % 16;
+  }
+}
+function adaptive(current, target, divisor) {
+  return channels2(current, target, (a, b) => (a >>> 4) * (16 - divisor) + (b >>> 4) * divisor & 255);
+}
+function multiplier(setting) {
+  return Math.trunc((1 + (setting < 0 ? 1 : 16) * (setting / 4096)) * 65536);
+}
+function adjustBrightness(pixel, red, green, blue) {
+  const high = clampByte2(Math.trunc((pixel >>> 16 & 255) * red / 65536));
+  const middle = clampByte2(Math.trunc((pixel >>> 8 & 255) * green / 65536));
+  const low = clampByte2(Math.trunc((pixel & 255) * blue / 65536));
+  return low | middle << 8 | high << 16;
+}
+function inRange(pixel, reference, distance) {
+  return Math.abs((pixel & 255) - (reference & 255)) <= distance && Math.abs((pixel >>> 8 & 255) - (reference >>> 8 & 255)) <= distance && Math.abs((pixel >>> 16 & 255) - (reference >>> 16 & 255)) <= distance;
+}
+function approach(value, target, fade3) {
+  if (value <= target - fade3) return value + fade3 & 255;
+  if (value >= target + fade3) return value - fade3 & 255;
+  return target;
+}
+function averagePixel2(a, b) {
+  return (a >>> 1 & 8355711) + (b >>> 1 & 8355711);
+}
+function add2(a, b) {
+  return channels2(a, b, (x, y) => Math.min(255, x + y));
+}
+function channels2(a, b, fn) {
+  return fn(a & 255, b & 255) & 255 | (fn(a >>> 8 & 255, b >>> 8 & 255) & 255) << 8 | (fn(a >>> 16 & 255, b >>> 16 & 255) & 255) << 16;
+}
+function channels4(a, b, c, d, fn) {
+  return fn(a & 255, b & 255, c & 255, d & 255) & 255 | (fn(a >>> 8 & 255, b >>> 8 & 255, c >>> 8 & 255, d >>> 8 & 255) & 255) << 8 | (fn(a >>> 16 & 255, b >>> 16 & 255, c >>> 16 & 255, d >>> 16 & 255) & 255) << 16;
+}
+function int3(ctx, offset, fallback) {
+  if (offset + 4 > ctx.component.payload.length) return fallback;
+  return new DataView(
+    ctx.component.payload.buffer,
+    ctx.component.payload.byteOffset,
+    ctx.component.payload.byteLength
+  ).getInt32(offset, true);
+}
+function normalizeRandom(value, maximum) {
+  if (!Number.isFinite(value)) return 0;
+  const integer2 = Math.trunc(value);
+  return (integer2 % maximum + maximum) % maximum;
+}
+function clampByte2(value) {
+  return value < 0 ? 0 : value > 255 ? 255 : value;
+}
+
+// src/avs/effects/color-map.ts
+var AVS_COLOR_MAP_APE_ID = "Color Map";
+var FIXED_CONFIG_BYTES = 496;
+var MAP_HEADER_BYTES = 60;
+var MAP_COUNT = 8;
+var POINT_BYTES = 12;
+function decodeAvsColorMap(payload) {
+  if (payload.length < FIXED_CONFIG_BYTES) return defaultConfig();
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  const maps = [];
+  let pointOffset = FIXED_CONFIG_BYTES;
+  for (let index = 0; index < MAP_COUNT; index++) {
+    const header = 16 + index * MAP_HEADER_BYTES;
+    const count = view.getInt32(header + 4, true);
+    const byteCount = count > 0 && count <= 65536 ? count * POINT_BYTES : -1;
+    let points;
+    if (byteCount < 0 || pointOffset + byteCount > payload.length) {
+      points = defaultPoints();
+    } else {
+      points = [];
+      for (let point = 0; point < count; point++, pointOffset += POINT_BYTES) {
+        points.push({
+          position: view.getUint32(pointOffset, true),
+          color: view.getUint32(pointOffset + 4, true) & 16777215,
+          id: view.getUint32(pointOffset + 8, true)
+        });
+      }
+    }
+    maps.push({
+      index,
+      enabled: count > 0 ? view.getInt32(header, true) !== 0 : index === 0,
+      id: view.getUint32(header + 8, true),
+      filename: nulText2(payload.subarray(header + 12, header + MAP_HEADER_BYTES)),
+      points
+    });
+  }
+  return {
+    key: view.getInt32(0, true),
+    blendMode: view.getInt32(4, true),
+    mapCycleMode: view.getInt32(8, true),
+    adjustBlend: payload[12],
+    dontSkipFastBeats: payload[14] !== 0,
+    cycleSpeed: normalizeCycleSpeed(payload[15]),
+    maps
+  };
+}
+function buildAvsColorMapTable(points) {
+  const table7 = new Uint32Array(256);
+  const sorted = points.length > 0 ? [...points].sort((a, b) => a.position - b.position || a.color - b.color) : defaultPoints();
+  const first = sorted[0];
+  const firstPosition = clamp13(first.position, 0, 255);
+  table7.fill(first.color & 16777215, 0, firstPosition);
+  for (let i = 0; i + 1 < sorted.length; i++) {
+    const left = sorted[i];
+    const right = sorted[i + 1];
+    const leftPosition = clamp13(left.position, 0, 255);
+    const rightPosition = clamp13(right.position, 0, 255);
+    const distance = rightPosition - leftPosition;
+    if (distance <= 0) continue;
+    const increment = Math.trunc(65536 / distance);
+    let fraction = 0;
+    for (let position = leftPosition; position <= rightPosition; position++) {
+      const weight = Math.min(256, fraction >>> 8);
+      table7[position] = mix256(left.color, right.color, weight);
+      fraction += increment;
+    }
+  }
+  const last2 = sorted[sorted.length - 1];
+  table7.fill(last2.color & 16777215, clamp13(last2.position, 0, 255), 256);
+  return table7;
+}
+function registerAvsColorMap(registry = new AvsEffectRegistry()) {
+  const states = /* @__PURE__ */ new Map();
+  registry.registerApe(AVS_COLOR_MAP_APE_ID, (context) => {
+    if (context.preinit) return;
+    const config = decodeAvsColorMap(context.component.payload);
+    let state = states.get(context.component.path);
+    if (!state) {
+      const initial = firstEnabled(config.maps);
+      state = {
+        tables: config.maps.map((map) => buildAvsColorMapTable(map.points)),
+        previous: initial,
+        target: initial,
+        // load_config copies the variable tail into the object before fixing
+        // pointers, so the first point's editor id also becomes this field.
+        progress: readI32(context.component.payload, FIXED_CONFIG_BYTES + 8, 0),
+        random: hashPath2(context.component.path)
+      };
+      states.set(context.component.path, state);
+    }
+    const table7 = selectTable(config, state, context.beat);
+    transform(context, config, table7);
+  });
+  return registry;
+}
+function selectTable(config, state, beat) {
+  if (config.mapCycleMode === 0) {
+    state.progress = 0;
+    return state.tables[state.previous];
+  }
+  state.target = modulo2(state.target, MAP_COUNT);
+  state.progress = Math.min(256, state.progress + config.cycleSpeed);
+  if (beat && (!config.dontSkipFastBeats || state.progress === 256)) {
+    const enabled = config.maps.filter((map) => map.enabled).map((map) => map.index);
+    if (enabled.length > 0) {
+      state.previous = state.target;
+      if (config.mapCycleMode === 1) {
+        do {
+          state.random = xorshift32(state.random);
+          state.target = state.random & 7;
+        } while (!config.maps[state.target].enabled);
+      } else {
+        let candidate = state.target;
+        do
+          candidate = candidate + 1 & 7;
+        while (!config.maps[candidate].enabled);
+        state.target = candidate;
+      }
+    }
+    state.progress = 0;
+  }
+  if (state.progress === 0 || state.previous === state.target) return state.tables[state.previous];
+  if (state.progress === 256) {
+    state.previous = state.target;
+    return state.tables[state.target];
+  }
+  const table7 = new Uint32Array(256);
+  const previous = state.tables[state.previous];
+  const target = state.tables[state.target];
+  for (let i = 0; i < 256; i++) table7[i] = mix256(previous[i], target[i], state.progress);
+  return table7;
+}
+function transform(context, config, table7) {
+  for (let i = 0; i < context.input.pixels.length; i++) {
+    const destination = context.input.pixels[i] & 16777215;
+    const key = colorKey(destination, config.key);
+    if (key === null) continue;
+    const source3 = table7[key];
+    context.input.pixels[i] = blend(source3, destination, config.blendMode, config.adjustBlend);
+  }
+}
+function colorKey(pixel, key) {
+  const blue = pixel & 255;
+  const green = pixel >>> 8 & 255;
+  const red = pixel >>> 16 & 255;
+  switch (key) {
+    case 0:
+      return red;
+    case 1:
+      return green;
+    case 2:
+      return blue;
+    case 3:
+      return Math.min(255, red + green + blue >>> 1);
+    case 4:
+      return Math.max(red, green, blue);
+    case 5:
+      return Math.trunc((red + green + blue) / 3);
+    default:
+      return null;
+  }
+}
+function blend(source3, destination, mode4, amount) {
+  switch (mode4) {
+    case 0:
+      return source3;
+    case 1:
+      return channels22(source3, destination, (s, d) => Math.min(255, s + d));
+    case 2:
+      return channels22(source3, destination, Math.max);
+    case 3:
+      return channels22(source3, destination, Math.min);
+    case 4:
+      return channels22(source3, destination, (s, d) => s + d >>> 1);
+    case 5:
+      return channels22(source3, destination, (s, d) => Math.max(0, d - s));
+    case 6:
+      return channels22(source3, destination, (s, d) => Math.max(0, s - d));
+    case 7:
+      return channels22(source3, destination, (s, d) => s * d >>> 8);
+    case 8:
+      return (source3 ^ destination) & 16777215;
+    case 9:
+      return channels22(source3, destination, (s, d) => Math.min(255, (s * amount >>> 8) + (d * (256 - amount) >>> 8)));
+    default:
+      return destination;
+  }
+}
+function mix256(left, right, rightWeight) {
+  return channels22(right, left, (r, l) => r * rightWeight + l * (256 - rightWeight) >>> 8);
+}
+function channels22(a, b, fn) {
+  return fn(a & 255, b & 255) & 255 | (fn(a >>> 8 & 255, b >>> 8 & 255) & 255) << 8 | (fn(a >>> 16 & 255, b >>> 16 & 255) & 255) << 16;
+}
+function defaultConfig() {
+  return {
+    key: 0,
+    blendMode: 0,
+    mapCycleMode: 0,
+    adjustBlend: 0,
+    dontSkipFastBeats: false,
+    cycleSpeed: 8,
+    maps: Array.from({ length: MAP_COUNT }, (_, index) => ({
+      index,
+      enabled: index === 0,
+      id: 0,
+      filename: "",
+      points: defaultPoints()
+    }))
+  };
+}
+function defaultPoints() {
+  return [{ position: 0, color: 0, id: 0 }, { position: 255, color: 16777215, id: 1 }];
+}
+function normalizeCycleSpeed(raw) {
+  const signed4 = raw < 128 ? raw : raw - 256;
+  if (signed4 === 0) return 8;
+  return clamp13(signed4, 1, 64);
+}
+function readI32(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+}
+function firstEnabled(maps) {
+  return maps.find((map) => map.enabled)?.index ?? 0;
+}
+function nulText2(bytes) {
+  const end = bytes.indexOf(0);
+  return new TextDecoder("windows-1252").decode(end < 0 ? bytes : bytes.subarray(0, end));
+}
+function clamp13(value, minimum, maximum) {
+  return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+function modulo2(value, divisor) {
+  const result = value % divisor;
+  return result < 0 ? result + divisor : result;
+}
+function hashPath2(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+function xorshift32(value) {
+  let state = value || 1831565813;
+  state ^= state << 13;
+  state ^= state >>> 17;
+  state ^= state << 5;
+  return state >>> 0;
+}
+
+// src/avs/effects/convolution.ts
+var AVS_CONVOLUTION_APE_ID = "Holden03: Convolution Filter";
+var AVS_CONVOLUTION_KERNEL_SIZE = 7;
+var KERNEL_CELLS = AVS_CONVOLUTION_KERNEL_SIZE ** 2;
+var CORE_BYTES = (4 + KERNEL_CELLS + 2) * 4;
+function decodeAvsConvolutionConfig(payload) {
+  const defaults = new Int32Array(4 + KERNEL_CELLS + 2);
+  defaults[0] = 1;
+  defaults[4 + 24] = 1;
+  defaults[4 + KERNEL_CELLS + 1] = 1;
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  const words = Math.min(defaults.length, Math.floor(payload.length / 4));
+  for (let index = 0; index < words; index++) defaults[index] = view.getInt32(index * 4, true);
+  const scale = defaults[4 + KERNEL_CELLS + 1];
+  return {
+    // The native loader tests these four values against exactly one.
+    enabled: defaults[0] === 1,
+    wrap: defaults[1] === 1,
+    absolute: defaults[2] === 1,
+    twoPass: defaults[3] === 1,
+    kernel: Array.from(defaults.subarray(4, 4 + KERNEL_CELLS)),
+    bias: defaults[4 + KERNEL_CELLS],
+    scale: scale === 0 ? 1 : scale,
+    legacyFilename: payload.length > CORE_BYTES ? new TextDecoder("windows-1252").decode(payload.subarray(CORE_BYTES)) : ""
+  };
+}
+function registerAvsConvolutionFilter(registry = new AvsEffectRegistry()) {
+  registry.registerApe(AVS_CONVOLUTION_APE_ID, (context) => {
+    const config = decodeAvsConvolutionConfig(context.component.payload);
+    if (!config.enabled || context.input.width === 0 || context.input.height === 0) return;
+    return renderConvolution(context, config);
+  });
+  return registry;
+}
+function renderConvolution(context, config) {
+  const firstNonzero = [...config.kernel, config.bias].findIndex((value) => value !== 0);
+  const swap = firstNonzero >= 0 && firstNonzero < 24;
+  const source3 = context.input.pixels;
+  const target = swap ? context.output.pixels : source3;
+  const width = context.input.width;
+  const height = context.input.height;
+  const divisor = Math.abs(config.scale) || 1;
+  const sign = config.scale < 0 ? -1 : 1;
+  const kernel = config.kernel.map((value) => Math.imul(value, sign));
+  const bias = Math.imul(config.bias, sign);
+  const sums = coefficientSums(config.kernel, config.bias);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const words = convolvePass(source3, width, height, x, y, kernel, bias, sums, false, config);
+      if (config.twoPass) {
+        const second = convolvePass(source3, width, height, x, y, kernel, bias, sums, true, config);
+        for (let channel = 0; channel < 4; channel++) {
+          words[channel] = Math.min(65535, words[channel] + second[channel]);
+        }
+      }
+      let pixel = 0;
+      for (let channel = 0; channel < 4; channel++) {
+        pixel |= packByte(scaleWord(words[channel], divisor)) << channel * 8;
+      }
+      target[y * width + x] = pixel >>> 0;
+    }
+  }
+  return swap ? { swap: true } : void 0;
+}
+function coefficientSums(kernel, bias) {
+  let positive = 0;
+  let negative = 0;
+  for (const coefficient of [...kernel, bias]) {
+    if (coefficient > 0) positive = positive + coefficient >>> 0;
+    else if (coefficient < 0) negative = negative + (-coefficient >>> 0) >>> 0;
+  }
+  return { saturatePositive: positive >= 256, saturateNegative: negative >= 256 };
+}
+function convolvePass(source3, width, height, x, y, kernel, bias, sums, rotate, config) {
+  const channels7 = [0, 0, 0, 0];
+  const hasNegative = bias < 0 || kernel.some((coefficient) => coefficient < 0);
+  for (let shift = 0; shift <= 24; shift += 8) {
+    let positive = 0;
+    let negative = 0;
+    for (let index = 0; index < KERNEL_CELLS; index++) {
+      const coefficient = kernel[index];
+      if (coefficient === 0) continue;
+      const kx = index % 7 - 3;
+      const ky = Math.floor(index / 7) - 3;
+      const dx = rotate ? -ky : kx;
+      const dy = rotate ? kx : ky;
+      const sx = clamp14(x + dx, 0, width - 1);
+      const sy = clamp14(y + dy, 0, height - 1);
+      const sample2 = source3[sy * width + sx] >>> shift & 255;
+      const product = Math.imul(sample2, Math.abs(coefficient) & 65535) & 65535;
+      if (coefficient > 0) positive = addWord(positive, product, sums.saturatePositive);
+      else negative = addWord(negative, product, sums.saturateNegative);
+    }
+    const biasProduct = Math.imul(Math.abs(bias) & 65535, 256) & 65535;
+    if (bias > 0) positive = Math.min(65535, positive + biasProduct);
+    else if (bias < 0) negative = Math.min(65535, negative + biasProduct);
+    let value;
+    if (!hasNegative) {
+      value = positive;
+    } else if (config.absolute) {
+      const difference = clamp14(signed16(positive) - signed16(negative), -32768, 32767) & 65535;
+      value = difference & 32767;
+    } else if (config.wrap) {
+      value = positive - negative & 65535;
+    } else {
+      value = Math.max(0, positive - negative);
+    }
+    channels7[shift >>> 3] = value;
+  }
+  return channels7;
+}
+function scaleWord(value, divisor) {
+  if (divisor <= 1) return value & 65535;
+  if (divisor <= 32768 && (divisor & divisor - 1) === 0) {
+    return value >>> Math.log2(divisor);
+  }
+  const reciprocal = Math.floor(65536 / divisor) & 65535;
+  return Math.floor(value * reciprocal / 65536) & 65535;
+}
+function addWord(left, right, saturate) {
+  return saturate ? Math.min(65535, left + right) : left + right & 65535;
+}
+function signed16(value) {
+  return value & 32768 ? (value & 65535) - 65536 : value & 65535;
+}
+function packByte(value) {
+  const signed4 = signed16(value);
+  return signed4 < 0 ? 0 : signed4 > 255 ? 255 : signed4;
+}
+function clamp14(value, minimum, maximum) {
+  return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+
+// src/avs/effects/basic-transforms.ts
+function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
+  const clears = /* @__PURE__ */ new Map();
+  const interleaves = /* @__PURE__ */ new Map();
+  const mosaics = /* @__PURE__ */ new Map();
+  const colorFades = /* @__PURE__ */ new Map();
+  const waterFrames = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(5, (context) => {
+    if (context.preinit) return;
+    const color = int4(context, 0, 16777215) & 16777215;
+    const average = int4(context, 4, 0) !== 0;
+    const every = int4(context, 8, 1);
+    let state = clears.get(context.component.path);
+    if (!state) {
+      state = { beats: 0, quiet: 0 };
+      clears.set(context.component.path, state);
+    }
+    if (context.beat) {
+      if (every !== 0 && ++state.beats >= every) {
+        state.beats = 0;
+        state.quiet = 0;
+        if (average) for (let i = 0; i < context.input.pixels.length; i++) {
+          context.input.pixels[i] = blendPixel(color, context.input.pixels[i], "average");
+        }
+        else context.input.clear(color);
+      }
+    } else if (++state.quiet >= every) state.quiet = 0;
+  });
+  registry.registerBuiltin(11, (context) => {
+    if (context.preinit) return;
+    const enabled = int4(context, 0, 1);
+    if (enabled === 0) return;
+    const normal = [int4(context, 4, 8), int4(context, 8, -8), int4(context, 12, -8)];
+    const beat = [int4(context, 16, normal[0]), int4(context, 20, normal[1]), int4(context, 24, normal[2])];
+    let state = colorFades.get(context.component.path);
+    if (!state) {
+      state = { position: [...normal], random: hashPath3(context.component.path) };
+      colorFades.set(context.component.path, state);
+    }
+    state.position[0] += Math.sign(normal[0] - state.position[0]);
+    state.position[1] += Math.sign(normal[2] - state.position[1]);
+    state.position[2] += Math.sign(normal[1] - state.position[2]);
+    if ((enabled & 4) === 0) state.position = [...normal];
+    else if (context.beat && (enabled & 2) !== 0) {
+      state.position[0] = nextRandom(state, 32) - 6;
+      state.position[1] = nextRandom(state, 64) - 32;
+      if (state.position[1] < 0 && state.position[1] > -16) state.position[1] = -32;
+      if (state.position[1] >= 0 && state.position[1] < 16) state.position[1] = 32;
+      state.position[2] = nextRandom(state, 32) - 6;
+    } else if (context.beat) state.position = [...beat];
+    const [first, second, third] = state.position;
+    const table7 = [[third, second, first], [second, first, third], [first, third, second], [third, third, third]];
+    for (let i = 0; i < context.input.pixels.length; i++) {
+      const pixel = context.input.pixels[i];
+      const low = pixel & 255, middle = pixel >>> 8 & 255, high = pixel >>> 16 & 255;
+      const x = middle - high;
+      const y = high - low;
+      const category = x > 0 && x > -y ? 0 : y < 0 && x < -y ? 1 : x < 0 && y > 0 ? 2 : 3;
+      const offsets = table7[category];
+      context.input.pixels[i] = clampByte3(low + offsets[0]) | clampByte3(middle + offsets[1]) << 8 | clampByte3(high + offsets[2]) << 16;
+    }
+  });
+  registry.registerBuiltin(12, (context) => {
+    if (context.preinit) return;
+    const mode4 = int4(context, 0, 1);
+    if (mode4 === 0) return;
+    const source3 = int4(context, 4, 2105376) & 16777215;
+    const replacement = int4(context, 8, source3) & 16777215;
+    const distanceSquared = Math.pow(int4(context, 12, 10) * 2, 2);
+    const sr = source3 & 255, sg = source3 >>> 8 & 255, sb = source3 >>> 16 & 255;
+    for (let i = 0; i < context.input.pixels.length; i++) {
+      const pixel = context.input.pixels[i];
+      const r = pixel & 255, g = pixel >>> 8 & 255, b = pixel >>> 16 & 255;
+      const match = mode4 === 1 ? r <= sr && g <= sg && b <= sb : mode4 === 2 ? r >= sr && g >= sg && b >= sb : Math.pow(r - sr, 2) + Math.pow(g - sg, 2) + Math.pow(b - sb, 2) <= distanceSquared;
+      if (match) context.input.pixels[i] = replacement;
+    }
+  });
+  registry.registerBuiltin(20, (context) => {
+    if (context.preinit || int4(context, 0, 1) === 0) return;
+    const { width, height } = context.input;
+    let previous = waterFrames.get(context.component.path);
+    if (!previous || previous.length !== context.input.pixels.length) {
+      previous = new Uint32Array(context.input.pixels.length);
+      waterFrames.set(context.component.path, previous);
+    }
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+      const neighbors = [];
+      if (x > 0) neighbors.push(context.input.pixels[x - 1 + y * width]);
+      if (x + 1 < width) neighbors.push(context.input.pixels[x + 1 + y * width]);
+      if (y > 0) neighbors.push(context.input.pixels[x + (y - 1) * width]);
+      if (y + 1 < height) neighbors.push(context.input.pixels[x + (y + 1) * width]);
+      const index = x + y * width;
+      let result = 0;
+      for (let shift = 0; shift <= 16; shift += 8) {
+        let total = 0;
+        for (const pixel of neighbors) total += pixel >>> shift & 255;
+        if (neighbors.length > 2) total = Math.trunc(total / 2);
+        const value = clampByte3(total - (previous[index] >>> shift & 255));
+        result |= value << shift;
+      }
+      context.output.pixels[index] = result;
+    }
+    previous.set(context.input.pixels);
+    return { swap: true };
+  });
+  registry.registerBuiltin(23, (context) => {
+    if (context.preinit || int4(context, 0, 1) === 0) return;
+    const normalX = int4(context, 4, 1);
+    const normalY = int4(context, 8, 1);
+    const color = int4(context, 12, 0) & 16777215;
+    const additive = int4(context, 16, 0) !== 0;
+    const average = int4(context, 20, 0) !== 0;
+    const onBeat = int4(context, 24, 0) !== 0;
+    const beatX = int4(context, 28, normalX);
+    const beatY = int4(context, 32, normalY);
+    const duration = int4(context, 36, 4);
+    let state = interleaves.get(context.component.path);
+    if (!state) {
+      state = { x: normalX, y: normalY };
+      interleaves.set(context.component.path, state);
+    }
+    const smoothing = (duration + 448) / 512;
+    state.x = state.x * smoothing + normalX * (1 - smoothing);
+    state.y = state.y * smoothing + normalY * (1 - smoothing);
+    if (context.beat && onBeat) {
+      state.x = beatX;
+      state.y = beatY;
+    }
+    const blockX = Math.trunc(state.x);
+    const blockY = Math.trunc(state.y);
+    if (blockX < 0 || blockY < 0) return;
+    let vertical = blockY === 0;
+    let yPhase = blockY > 0 ? context.input.height % blockY / 2 : 0;
+    const xOffset = blockX > 0 ? Math.trunc(context.input.width % blockX / 2) : 0;
+    for (let y = 0; y < context.input.height; y++) {
+      if (blockY > 0 && ++yPhase >= blockY) {
+        vertical = !vertical;
+        yPhase = 0;
+      }
+      let horizontal = false;
+      for (let x = 0; x < context.input.width; x++) {
+        const selected = !vertical || blockX > 0 && !horizontal;
+        if (selected) {
+          const index = x + y * context.input.width;
+          const mode4 = additive ? "additive" : average ? "average" : "replace";
+          context.input.pixels[index] = blendPixel(color, context.input.pixels[index], mode4);
+        }
+        if (blockX > 0 && (x + xOffset + 1) % blockX === 0) horizontal = !horizontal;
+      }
+    }
+  });
+  registry.registerBuiltin(30, (context) => {
+    if (context.preinit || int4(context, 0, 1) === 0) return;
+    const quality = int4(context, 4, 50);
+    const beatQuality = int4(context, 8, quality);
+    const additive = int4(context, 12, 0) !== 0;
+    const average = int4(context, 16, 0) !== 0;
+    const onBeat = int4(context, 20, 0) !== 0;
+    const duration = Math.max(1, int4(context, 24, 15));
+    let state = mosaics.get(context.component.path);
+    if (!state) {
+      state = { quality, remaining: 0 };
+      mosaics.set(context.component.path, state);
+    }
+    if (onBeat && context.beat) {
+      state.quality = beatQuality;
+      state.remaining = duration;
+    } else if (state.remaining === 0) state.quality = quality;
+    if (state.quality < 100 && state.quality > 0) {
+      mosaic(context, state.quality, additive, average);
+      if (state.remaining > 0) {
+        state.remaining--;
+        if (state.remaining > 0) {
+          const step = Math.trunc(Math.abs(quality - beatQuality) / duration);
+          state.quality += step * (beatQuality > quality ? -1 : 1);
+        }
+      }
+      return { swap: true };
+    }
+    if (state.remaining > 0) state.remaining--;
+  });
+  return registry;
+}
+function mosaic(context, quality, additive, average) {
+  const { width, height } = context.input;
+  const incrementX = Math.trunc(width * 65536 / quality);
+  const incrementY = Math.trunc(height * 65536 / quality);
+  let sourceY = incrementY >> 17;
+  let yPosition = 0;
+  for (let y = 0; y < height; y++) {
+    let sourceX = incrementX >> 17;
+    let xPosition = 0;
+    let sampled = context.input.pixels[Math.min(height - 1, sourceY) * width + Math.min(width - 1, sourceX)];
+    for (let x = 0; x < width; x++) {
+      const index = y * width + x;
+      context.output.pixels[index] = additive ? blendPixel(sampled, context.input.pixels[index], "additive") : average ? blendPixel(sampled, context.input.pixels[index], "average") : sampled;
+      xPosition += 65536;
+      if (xPosition >= incrementX) {
+        sourceX += xPosition >> 16;
+        xPosition -= incrementX;
+        if (sourceX < width) sampled = context.input.pixels[Math.min(height - 1, sourceY) * width + sourceX];
+      }
+    }
+    yPosition += 65536;
+    if (yPosition >= incrementY) {
+      sourceY += yPosition >> 16;
+      yPosition -= incrementY;
+    }
+  }
+}
+function int4(context, offset, fallback) {
+  if (offset + 4 > context.component.payload.length) return fallback;
+  return new DataView(
+    context.component.payload.buffer,
+    context.component.payload.byteOffset,
+    context.component.payload.byteLength
+  ).getInt32(offset, true);
+}
+function clampByte3(value) {
+  return value < 0 ? 0 : value > 255 ? 255 : Math.trunc(value);
+}
+function nextRandom(state, bound) {
+  let value = state.random || 1831565813;
+  value ^= value << 13;
+  value ^= value >>> 17;
+  value ^= value << 5;
+  state.random = value >>> 0;
+  return state.random % bound;
+}
+function hashPath3(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+
+// src/avs/effects/bitmap-assets.ts
+function createAvsBitmapResolver(assets) {
+  const resolved = /* @__PURE__ */ new Map();
+  const entries = assets instanceof Map ? assets.entries() : Object.entries(assets);
+  for (const [name, value] of entries) {
+    const bitmap = value instanceof Uint8Array ? decodeAvsBmp(value) : validateBitmap(value);
+    const normalized = normalizeName(name);
+    resolved.set(normalized, bitmap);
+    resolved.set(basename(normalized), bitmap);
+  }
+  return (legacyName) => {
+    const normalized = normalizeName(legacyName);
+    return resolved.get(normalized) ?? resolved.get(basename(normalized)) ?? null;
+  };
+}
+function decodeAvsBmp(bytes) {
+  if (bytes.length < 54 || bytes[0] !== 66 || bytes[1] !== 77) {
+    throw new Error("Invalid BMP file header");
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const pixelOffset = u322(view, 10);
+  const dibSize = u322(view, 14);
+  if (dibSize < 40 || 14 + dibSize > bytes.length) throw new Error(`Unsupported BMP DIB header ${dibSize}`);
+  const width = i323(view, 18);
+  const rawHeight = i323(view, 22);
+  const planes = u16(view, 26);
+  const bits = u16(view, 28);
+  const compression = u322(view, 30);
+  if (width <= 0 || rawHeight === 0 || planes !== 1) throw new Error("Invalid BMP dimensions or plane count");
+  const height = Math.abs(rawHeight);
+  const topDown = rawHeight < 0;
+  if (pixelOffset > bytes.length) throw new Error("BMP pixel offset is outside the file");
+  const palette = readPalette2(bytes, view, dibSize, bits);
+  const pixels = new Uint32Array(width * height);
+  if (compression === 1 && bits === 8) {
+    decodeRle8(bytes.subarray(pixelOffset), pixels, width, height, topDown, palette);
+  } else if (compression === 0 || compression === 3 && (bits === 16 || bits === 32)) {
+    decodeRows(bytes, view, pixelOffset, pixels, width, height, topDown, bits, compression, dibSize, palette);
+  } else {
+    throw new Error(`Unsupported BMP encoding: ${bits} bits, compression ${compression}`);
+  }
+  return { width, height, pixels };
+}
+function decodeRows(bytes, view, pixelOffset, pixels, width, height, topDown, bits, compression, dibSize, palette) {
+  if (![1, 4, 8, 16, 24, 32].includes(bits)) throw new Error(`Unsupported BMP depth ${bits}`);
+  const stride = Math.floor((width * bits + 31) / 32) * 4;
+  const masks = colorMasks(view, bits, compression, dibSize);
+  for (let storedY = 0; storedY < height; storedY++) {
+    const y = topDown ? storedY : height - storedY - 1;
+    const row = pixelOffset + storedY * stride;
+    if (row + stride > bytes.length) throw new Error("Truncated BMP pixel rows");
+    for (let x = 0; x < width; x++) {
+      let pixel;
+      if (bits === 1) pixel = palette[bytes[row + (x >>> 3)] >>> 7 - (x & 7) & 1] ?? 0;
+      else if (bits === 4) {
+        const packed = bytes[row + (x >>> 1)];
+        pixel = palette[(x & 1) === 0 ? packed >>> 4 : packed & 15] ?? 0;
+      } else if (bits === 8) pixel = palette[bytes[row + x]] ?? 0;
+      else if (bits === 16) pixel = maskedPixel(u16(view, row + x * 2), masks);
+      else if (bits === 24) {
+        const offset = row + x * 3;
+        pixel = bytes[offset] | bytes[offset + 1] << 8 | bytes[offset + 2] << 16;
+      } else pixel = maskedPixel(u322(view, row + x * 4), masks);
+      pixels[y * width + x] = pixel & 16777215;
+    }
+  }
+}
+function decodeRle8(data, pixels, width, height, topDown, palette) {
+  let offset = 0;
+  let x = 0;
+  let storedY = 0;
+  const write = (index) => {
+    if (x < width && storedY < height) {
+      const y = topDown ? storedY : height - storedY - 1;
+      pixels[y * width + x] = palette[index] ?? 0;
+    }
+    x++;
+  };
+  while (offset + 1 < data.length && storedY < height) {
+    const count = data[offset++];
+    const value = data[offset++];
+    if (count !== 0) {
+      for (let i = 0; i < count; i++) write(value);
+      continue;
+    }
+    if (value === 0) {
+      x = 0;
+      storedY++;
+      continue;
+    }
+    if (value === 1) break;
+    if (value === 2) {
+      if (offset + 1 >= data.length) throw new Error("Truncated BMP RLE delta");
+      x += data[offset++];
+      storedY += data[offset++];
+      continue;
+    }
+    if (offset + value > data.length) throw new Error("Truncated BMP RLE literal");
+    for (let i = 0; i < value; i++) write(data[offset + i]);
+    offset += value;
+    if (value & 1) offset++;
+  }
+}
+function readPalette2(bytes, view, dibSize, bits) {
+  if (bits > 8) return [];
+  const declared = u322(view, 46);
+  const count = declared || 1 << bits;
+  const start = 14 + dibSize;
+  if (start + count * 4 > bytes.length) throw new Error("Truncated BMP palette");
+  const palette = [];
+  for (let index = 0; index < count; index++) {
+    const offset = start + index * 4;
+    palette.push(bytes[offset] | bytes[offset + 1] << 8 | bytes[offset + 2] << 16);
+  }
+  return palette;
+}
+function colorMasks(view, bits, compression, dibSize) {
+  if (bits === 16 && compression === 0) return { red: 31744, green: 992, blue: 31 };
+  if (bits === 32 && compression === 0) return { red: 16711680, green: 65280, blue: 255 };
+  const offset = dibSize >= 52 ? 14 + 40 : 14 + dibSize;
+  return { red: u322(view, offset), green: u322(view, offset + 4), blue: u322(view, offset + 8) };
+}
+function maskedPixel(value, masks) {
+  return scaleMask(value, masks.blue) | scaleMask(value, masks.green) << 8 | scaleMask(value, masks.red) << 16;
+}
+function scaleMask(value, mask) {
+  if (mask === 0) return 0;
+  let shift = 0;
+  while ((mask >>> shift & 1) === 0) shift++;
+  const maximum = mask >>> shift;
+  return Math.round(((value & mask) >>> shift) * 255 / maximum);
+}
+function validateBitmap(bitmap) {
+  if (!Number.isInteger(bitmap.width) || !Number.isInteger(bitmap.height) || bitmap.width <= 0 || bitmap.height <= 0 || bitmap.pixels.length !== bitmap.width * bitmap.height) {
+    throw new Error("Invalid AVS bitmap asset");
+  }
+  return bitmap;
+}
+function normalizeName(name) {
+  return name.trim().replaceAll("\\", "/").toLowerCase();
+}
+function basename(name) {
+  return name.slice(name.lastIndexOf("/") + 1);
+}
+function u16(view, offset) {
+  if (offset + 2 > view.byteLength) throw new Error("Truncated BMP field");
+  return view.getUint16(offset, true);
+}
+function u322(view, offset) {
+  if (offset + 4 > view.byteLength) throw new Error("Truncated BMP field");
+  return view.getUint32(offset, true);
+}
+function i323(view, offset) {
+  if (offset + 4 > view.byteLength) throw new Error("Truncated BMP field");
+  return view.getInt32(offset, true);
+}
+
+// src/avs/effects/beat-particle.ts
+function decodeAvsMovingParticle(payload) {
+  return {
+    enabled: i324(payload, 0, 1),
+    color: i324(payload, 4, 16777215) & 16777215,
+    maximumDistance: i324(payload, 8, 16),
+    size: i324(payload, 12, 8),
+    beatSize: i324(payload, 16, 8),
+    blend: i324(payload, 20, 1)
+  };
+}
+function decodeAvsCustomBpm(payload) {
+  return {
+    enabled: i324(payload, 0, 1) !== 0,
+    arbitrary: i324(payload, 4, 1) !== 0,
+    skip: i324(payload, 8, 0) !== 0,
+    invert: i324(payload, 12, 0) !== 0,
+    arbitraryMilliseconds: i324(payload, 16, 500),
+    skipCount: i324(payload, 20, 1),
+    skipFirst: i324(payload, 24, 0)
+  };
+}
+function decodeAvsStarfield(payload) {
+  return {
+    enabled: i324(payload, 0, 1) !== 0,
+    color: i324(payload, 4, 16777215) & 16777215,
+    additive: i324(payload, 8, 0) !== 0,
+    average: i324(payload, 12, 0) !== 0,
+    speed: f32(payload, 16, 6),
+    maximumStars: i324(payload, 20, 350),
+    onBeat: i324(payload, 24, 0) !== 0,
+    beatSpeed: f32(payload, 28, 4),
+    beatDurationFrames: i324(payload, 32, 15)
+  };
+}
+function registerAvsBeatParticleEffects(registry, options = {}) {
+  registerMovingParticle(registry, options);
+  registerStarfield(registry, options);
+  registerCustomBpm(registry, options);
+  return registry;
+}
+function registerStarfield(registry, options) {
+  const states = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(27, (context) => {
+    const config = decodeAvsStarfield(context.component.payload);
+    if (!config.enabled) return;
+    let state = states.get(context.component.path);
+    if (!state) {
+      state = {
+        width: 0,
+        height: 0,
+        stars: [],
+        currentSpeed: Math.fround(config.speed),
+        beatIncrement: 0,
+        beatFrames: 0,
+        randomState: hashPath4(context.component.path)
+      };
+      states.set(context.component.path, state);
+    }
+    if (config.onBeat && (context.beat || context.preinit)) {
+      state.currentSpeed = Math.fround(config.beatSpeed);
+      state.beatIncrement = Math.fround((config.speed - state.currentSpeed) / config.beatDurationFrames);
+      state.beatFrames = config.beatDurationFrames;
+    }
+    if (state.width !== context.input.width || state.height !== context.input.height) {
+      state.width = context.input.width;
+      state.height = context.input.height;
+      initializeStars(state, config.maximumStars, options.random);
+    }
+    if (context.preinit) return;
+    const centerX = Math.trunc(state.width / 2);
+    const centerY = Math.trunc(state.height / 2);
+    for (const star of state.stars) {
+      const depth = Math.trunc(star.z);
+      if (depth <= 0) {
+        recreateStar(star, state, options.random);
+        continue;
+      }
+      const x = Math.trunc((star.x << 7) / depth) + centerX;
+      const y = Math.trunc((star.y << 7) / depth) + centerY;
+      if (x <= 0 || x >= state.width || y <= 0 || y >= state.height) {
+        recreateStar(star, state, options.random);
+        continue;
+      }
+      const intensity = Math.trunc((255 - depth) * star.speed);
+      const gray = intensity | intensity << 8 | intensity << 16;
+      const color = config.color === 16777215 ? gray : adaptiveStarColor(gray, config.color, intensity >> 4);
+      const index = x + y * state.width;
+      const destination = context.input.pixels[index];
+      context.input.pixels[index] = config.additive ? blendPixel(color, destination, "additive") : config.average ? blendPixel(color, destination, "average") : color;
+      star.z = Math.fround(star.z - Math.fround(star.speed * state.currentSpeed));
+    }
+    if (state.beatFrames === 0) state.currentSpeed = Math.fround(config.speed);
+    else {
+      state.currentSpeed = Math.fround(Math.max(0, state.currentSpeed + state.beatIncrement));
+      state.beatFrames--;
+    }
+  });
+}
+function initializeStars(state, configuredCount, random) {
+  const scaled = Math.round(configuredCount * state.width * state.height / (512 * 384));
+  const count = Math.max(0, Math.min(4095, scaled));
+  state.stars = new Array(count);
+  const centerX = Math.trunc(state.width / 2);
+  const centerY = Math.trunc(state.height / 2);
+  for (let i = 0; i < count; i++) {
+    state.stars[i] = {
+      x: randomBound(state, random, state.width) - centerX,
+      y: randomBound(state, random, state.height) - centerY,
+      z: Math.fround(randomBound(state, random, 255)),
+      speed: Math.fround((randomBound(state, random, 9) + 1) / 10)
+    };
+  }
+}
+function recreateStar(star, state, random) {
+  star.x = randomBound(state, random, state.width) - Math.trunc(state.width / 2);
+  star.y = randomBound(state, random, state.height) - Math.trunc(state.height / 2);
+  star.z = 255;
+}
+function adaptiveStarColor(gray, color, divisor) {
+  return (gray >>> 4 & 986895) * (16 - divisor) + (color >>> 4 & 986895) * divisor & 16777215;
+}
+function registerMovingParticle(registry, options) {
+  const states = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(8, (context) => {
+    const config = decodeAvsMovingParticle(context.component.payload);
+    if ((config.enabled & 1) === 0 || context.preinit) return;
+    let state = states.get(context.component.path);
+    if (!state) {
+      state = {
+        center: [0, 0],
+        velocity: [-0.01551, 0],
+        position: [-0.6, 0.3],
+        size: config.size,
+        randomState: hashPath4(context.component.path)
+      };
+      states.set(context.component.path, state);
+    }
+    if (context.beat) {
+      state.center[0] = (randomModulo33(state, options.random) - 16) / 48;
+      state.center[1] = (randomModulo33(state, options.random) - 16) / 48;
+    }
+    state.velocity[0] -= 4e-3 * (state.position[0] - state.center[0]);
+    state.velocity[1] -= 4e-3 * (state.position[1] - state.center[1]);
+    state.position[0] += state.velocity[0];
+    state.position[1] += state.velocity[1];
+    state.velocity[0] *= 0.991;
+    state.velocity[1] *= 0.991;
+    const scale = Math.min(Math.trunc(context.input.height / 2), Math.trunc(context.input.width * 3 / 8));
+    const x = Math.trunc(state.position[0] * scale * (config.maximumDistance / 32)) + Math.trunc(context.input.width / 2);
+    const y = Math.trunc(state.position[1] * scale * (config.maximumDistance / 32)) + Math.trunc(context.input.height / 2);
+    if (context.beat && (config.enabled & 2) !== 0) state.size = config.beatSize;
+    const drawSize = state.size;
+    state.size = Math.trunc((state.size + config.size) / 2);
+    drawParticle(context, x, y, drawSize, config.color, config.blend);
+  });
+}
+function drawParticle(context, centerX, centerY, rawSize, color, blend2) {
+  if (rawSize <= 1) {
+    plotParticlePixel(context, centerX, centerY, color, blend2);
+    return;
+  }
+  const size = Math.min(rawSize, 128);
+  const radiusSquared = size * size * 0.25;
+  const top = centerY - Math.trunc(size / 2);
+  for (let row = 0; row < size; row++) {
+    const y = top + row;
+    if (y < 0 || y >= context.input.height) continue;
+    const relativeY = row - size * 0.5;
+    const halfWidth = Math.max(1, Math.trunc(Math.sqrt(Math.max(0, radiusSquared - relativeY * relativeY)) + 0.99));
+    const start = Math.max(0, centerX - halfWidth);
+    const end = Math.min(context.input.width, centerX + halfWidth);
+    for (let x = start; x < end; x++) plotParticlePixel(context, x, y, color, blend2);
+  }
+}
+function plotParticlePixel(context, x, y, color, blend2) {
+  if (x < 0 || y < 0 || x >= context.input.width || y >= context.input.height) return;
+  const index = x + y * context.input.width;
+  const destination = context.input.pixels[index];
+  context.input.pixels[index] = blend2 === 0 ? color : blend2 === 2 ? blendPixel(color, destination, "average") : blend2 === 3 ? blendLine(color, destination, context.line.blendMode, context.line.adjustableAlpha) : blendPixel(color, destination, "additive");
+}
+function registerCustomBpm(registry, options) {
+  const states = /* @__PURE__ */ new Map();
+  const now = () => Math.trunc(options.now?.() ?? defaultNow()) >>> 0;
+  registry.registerBuiltin(33, (context) => {
+    const config = decodeAvsCustomBpm(context.component.payload);
+    if (!config.enabled || context.preinit) return;
+    let state = states.get(context.component.path);
+    if (!state) {
+      state = { lastTick: now(), skipped: 0, inputBeats: 0 };
+      states.set(context.component.path, state);
+    }
+    if (context.beat) state.inputBeats++;
+    if (config.skipFirst !== 0 && state.inputBeats <= config.skipFirst) {
+      return context.beat ? { beat: false } : void 0;
+    }
+    if (config.arbitrary) {
+      const current = now();
+      const deadline = state.lastTick + config.arbitraryMilliseconds >>> 0;
+      if (current > deadline) {
+        state.lastTick = current;
+        return { beat: true };
+      }
+      return { beat: false };
+    }
+    if (config.skip) {
+      if (context.beat && ++state.skipped >= config.skipCount + 1) {
+        state.skipped = 0;
+        return { beat: true };
+      }
+      return { beat: false };
+    }
+    if (config.invert) return { beat: !context.beat };
+    return;
+  });
+}
+function randomModulo33(state, hook) {
+  const value = hook ? Math.trunc(hook()) >>> 0 : nextRandom2(state);
+  return value % 33;
+}
+function randomBound(state, hook, bound) {
+  if (bound <= 0) return 0;
+  const value = hook ? Math.trunc(hook()) >>> 0 : nextStarRandom(state);
+  return value % bound;
+}
+function nextRandom2(state) {
+  let value = state.randomState || 1831565813;
+  value ^= value << 13;
+  value ^= value >>> 17;
+  value ^= value << 5;
+  state.randomState = value >>> 0;
+  return state.randomState;
+}
+function nextStarRandom(state) {
+  let value = state.randomState || 1831565813;
+  value ^= value << 13;
+  value ^= value >>> 17;
+  value ^= value << 5;
+  state.randomState = value >>> 0;
+  return state.randomState;
+}
+function defaultNow() {
+  return typeof performance === "undefined" ? Date.now() : performance.now();
+}
+function i324(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+}
+function f32(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getFloat32(offset, true) : fallback;
+}
+function hashPath4(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+
+// src/avs/effects/bump.ts
+var TEXT2 = new TextDecoder("windows-1252");
+function decodeAvsBump(payload) {
+  let offset = 0;
+  const read = (fallback) => {
+    const value = i325(payload, offset, fallback);
+    offset += 4;
+    return value;
+  };
+  const enabled = read(1) !== 0;
+  const onBeat = read(0) !== 0;
+  const beatDurationFrames = read(15);
+  const depth = read(30);
+  const beatDepth = read(100);
+  const additive = read(0) !== 0;
+  const average = read(0) !== 0;
+  const scripts = [];
+  for (let i = 0; i < 3; i++) {
+    const decoded = readString(payload, offset);
+    scripts.push(decoded.value);
+    offset = decoded.next;
+  }
+  const showLight = read(0) !== 0;
+  const invertDepth = read(0) !== 0;
+  const oldStyle = offset + 4 <= payload.length ? read(0) !== 0 : true;
+  const buffer = read(0);
+  return {
+    enabled,
+    onBeat,
+    beatDurationFrames,
+    depth,
+    beatDepth,
+    additive,
+    average,
+    frame: scripts[0],
+    beat: scripts[1],
+    init: scripts[2],
+    showLight,
+    invertDepth,
+    oldStyle,
+    buffer
+  };
+}
+function registerAvsBump(registry) {
+  const states = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(29, (context) => {
+    const config = decodeAvsBump(context.component.payload);
+    if (!config.enabled) return;
+    let state = states.get(context.component.path);
+    if (!state) {
+      const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath5(context.component.path) });
+      vm.set("bi", 1);
+      state = {
+        vm,
+        frame: compileOrNull2(config.frame),
+        beat: compileOrNull2(config.beat),
+        init: compileOrNull2(config.init),
+        initialized: false,
+        currentDepth: config.depth,
+        beatFrames: 0
+      };
+      states.set(context.component.path, state);
+    }
+    if (context.preinit) return;
+    const depthSurface = config.buffer === 0 ? context.input : context.buffers.get(config.buffer - 1, context.input.width, context.input.height, false);
+    if (!depthSurface) return;
+    configureVm(state.vm, context);
+    if (!state.initialized) {
+      execute2(state.init, state.vm);
+      state.initialized = true;
+    }
+    execute2(state.frame, state.vm);
+    if (context.beat) execute2(state.beat, state.vm);
+    state.vm.set("isbeat", context.beat ? -1 : 1);
+    state.vm.set("islbeat", state.beatFrames ? -1 : 1);
+    if (config.onBeat && context.beat) {
+      state.currentDepth = config.beatDepth;
+      state.beatFrames = config.beatDurationFrames;
+    } else if (!state.beatFrames) state.currentDepth = config.depth;
+    context.output.clear();
+    const lightX = clamp15(Math.trunc(state.vm.get("x") * context.input.width / (config.oldStyle ? 100 : 1)), 0, context.input.width);
+    const lightY = clamp15(Math.trunc(state.vm.get("y") * context.input.height / (config.oldStyle ? 100 : 1)), 0, context.input.height);
+    if (config.showLight && lightX < context.input.width && lightY < context.input.height) {
+      context.output.pixels[lightX + lightY * context.input.width] = 16777215;
+    }
+    const intensity = clamp15(state.vm.get("bi"), 0, 1);
+    state.vm.set("bi", intensity);
+    state.currentDepth = Math.trunc(state.currentDepth * intensity);
+    shadeBump(context, depthSurface.pixels, config, state.currentDepth, lightX, lightY);
+    if (state.beatFrames) {
+      state.beatFrames--;
+      if (state.beatFrames) {
+        const step = Math.trunc(Math.abs(config.depth - config.beatDepth) / config.beatDurationFrames);
+        state.currentDepth += step * (config.beatDepth > config.depth ? -1 : 1);
+      }
+    }
+    return { swap: true };
+  });
+  return registry;
+}
+function shadeBump(context, depthPixels, config, currentDepth, lightX, lightY) {
+  const { width, height } = context.input;
+  const source3 = context.input.pixels;
+  const output = context.output.pixels;
+  const currentDepthBuffer = depthPixels === source3;
+  const scaledDepth = Math.trunc((currentDepth << 8) / 100);
+  for (let y = 1; y < height - 1; y++) {
+    const relativeY = y - lightY;
+    for (let x = 1; x < width - 1; x++) {
+      const index = x + y * width;
+      const left = depthPixels[index - 1];
+      const right = depthPixels[index + 1];
+      const above = depthPixels[index - width];
+      const below = depthPixels[index + width];
+      if (currentDepthBuffer && !(left || right || above || below)) continue;
+      let horizontal = depthOf2(right, config.invertDepth) - depthOf2(left, config.invertDepth) - (x - lightX);
+      let vertical = depthOf2(below, config.invertDepth) - depthOf2(above, config.invertDepth) - relativeY;
+      horizontal = 127 - Math.abs(horizontal);
+      vertical = 127 - Math.abs(vertical);
+      const original = source3[index];
+      const lit = horizontal <= 0 || vertical <= 0 ? clamp254(original) : addLight(original, horizontal * vertical * scaledDepth >> 14);
+      output[index] = config.additive ? blendPixel(lit, original, "additive") : config.average ? blendPixel(lit, original, "average") : lit;
+    }
+  }
+}
+function depthOf2(pixel, invert) {
+  const depth = Math.max(pixel & 255, pixel >>> 8 & 255, pixel >>> 16 & 255);
+  return invert ? 255 - depth : depth;
+}
+function addLight(pixel, amount) {
+  return Math.min((pixel & 255) + amount, 254) | Math.min((pixel >>> 8 & 255) + amount, 254) << 8 | Math.min((pixel >>> 16 & 255) + amount, 254) << 16;
+}
+function clamp254(pixel) {
+  return Math.min(pixel & 255, 254) | Math.min(pixel >>> 8 & 255, 254) << 8 | Math.min(pixel >>> 16 & 255, 254) << 16;
+}
+function configureVm(vm, context) {
+  vm.setHost({
+    getosc: (band, width, channel) => avsAudioSample(context.audio, "osc", band, width, channel),
+    getspec: (band, width, channel) => avsAudioSample(context.audio, "spec", band, width, channel)
+  });
+}
+function readString(payload, offset) {
+  if (offset + 4 > payload.length) return { value: "", next: payload.length };
+  const length = i325(payload, offset, 0);
+  const start = offset + 4;
+  if (length <= 0 || start + length > payload.length) return { value: "", next: start };
+  return { value: nulText3(payload.subarray(start, start + length)), next: start + length };
+}
+function compileOrNull2(source3) {
+  if (!source3.trim()) return null;
+  try {
+    return compileAvsEel(source3);
+  } catch {
+    return null;
+  }
+}
+function execute2(program, vm) {
+  return program ? vm.execute(program) : 0;
+}
+function i325(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+}
+function nulText3(bytes) {
+  const end = bytes.indexOf(0);
+  return TEXT2.decode(end < 0 ? bytes : bytes.subarray(0, end));
+}
+function clamp15(value, minimum, maximum) {
+  return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+function hashPath5(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+
+// src/avs/effects/dynamic-movement.ts
+var TEXT3 = new TextDecoder("windows-1252");
+function decodeAvsDynamicMovement(payload) {
+  let offset = 0;
+  let scripts = ["", "", "", ""];
+  if (payload[0] === 1) {
+    offset = 1;
+    for (let i = 0; i < 4; i++) {
+      const value = readString2(payload, offset);
+      scripts[i] = value.value;
+      offset = value.next;
+    }
+  } else if (payload.length >= 1024) {
+    scripts = [0, 256, 512, 768].map((start) => nulText4(payload.subarray(start, start + 256)));
+    offset = 1024;
+  }
+  const read = (fallback) => {
+    const value = i326(payload, offset, fallback);
+    offset += 4;
+    return value;
+  };
+  return {
+    point: scripts[0],
+    frame: scripts[1],
+    beat: scripts[2],
+    init: scripts[3],
+    bilinear: read(1) !== 0,
+    rectangular: read(0) !== 0,
+    gridWidth: read(16),
+    gridHeight: read(16),
+    blend: read(0) !== 0,
+    wrap: read(0) !== 0,
+    buffer: read(0),
+    noMove: read(0) !== 0
+  };
+}
+function registerAvsDynamicMovement(registry) {
+  const states = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(43, (context) => {
+    let state = states.get(context.component.path);
+    const config = decodeAvsDynamicMovement(context.component.payload);
+    if (!state) {
+      const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath6(context.component.path) });
+      state = {
+        vm,
+        programs: [
+          compileOrNull3(config.point),
+          compileOrNull3(config.frame),
+          compileOrNull3(config.beat),
+          compileOrNull3(config.init)
+        ],
+        initialized: false
+      };
+      states.set(context.component.path, state);
+    }
+    if (context.preinit) return;
+    return renderDynamicMovement(context, config, state);
+  });
+  return registry;
+}
+function renderDynamicMovement(context, config, state) {
+  const source3 = config.buffer === 0 ? context.input : context.buffers.get(config.buffer - 1, context.input.width, context.input.height, false);
+  if (!source3) return;
+  const vm = state.vm;
+  vm.setHost({
+    getosc: (band, width2, channel) => avsAudioSample(context.audio, "osc", band, width2, channel),
+    getspec: (band, width2, channel) => avsAudioSample(context.audio, "spec", band, width2, channel)
+  });
+  vm.set("w", context.input.width);
+  vm.set("h", context.input.height);
+  vm.set("b", context.beat ? 1 : 0);
+  vm.set("alpha", 0.5);
+  if (!state.initialized) {
+    execute3(state.programs[3], vm);
+    state.initialized = true;
+  }
+  execute3(state.programs[1], vm);
+  if (context.beat) execute3(state.programs[2], vm);
+  const columns = clamp16(Math.trunc(config.gridWidth) + 1, 2, 256);
+  const rows = clamp16(Math.trunc(config.gridHeight) + 1, 2, 256);
+  const grid2 = new Array(columns * rows);
+  const width = context.input.width;
+  const height = context.input.height;
+  const radius = Math.sqrt(width * width + height * height) * 0.5;
+  for (let gy = 0; gy < rows; gy++) {
+    const screenY = gy * height / (rows - 1);
+    const normalizedY = (screenY - height * 0.5) * (2 / height);
+    for (let gx = 0; gx < columns; gx++) {
+      const screenX = gx * width / (columns - 1);
+      const normalizedX = (screenX - width * 0.5) * (2 / width);
+      vm.set("x", normalizedX);
+      vm.set("y", normalizedY);
+      vm.set("d", Math.hypot(screenX - width * 0.5, screenY - height * 0.5) / radius);
+      vm.set("r", Math.atan2(screenY - height * 0.5, screenX - width * 0.5) + Math.PI * 0.5);
+      execute3(state.programs[0], vm);
+      let x;
+      let y;
+      if (config.rectangular) {
+        x = (vm.get("x") + 1) * width * 0.5;
+        y = (vm.get("y") + 1) * height * 0.5;
+      } else {
+        const distance = vm.get("d") * radius;
+        const angle = vm.get("r") - Math.PI * 0.5;
+        x = width * 0.5 + Math.cos(angle) * distance;
+        y = height * 0.5 + Math.sin(angle) * distance;
+      }
+      grid2[gx + gy * columns] = { x, y, alpha: clamp16(vm.get("alpha"), 0, 1) };
+    }
+  }
+  for (let y = 0; y < height; y++) {
+    const py = y * (rows - 1) / height;
+    const cellY = Math.min(rows - 2, Math.trunc(py));
+    const fy = py - cellY;
+    for (let x = 0; x < width; x++) {
+      const px = x * (columns - 1) / width;
+      const cellX = Math.min(columns - 2, Math.trunc(px));
+      const fx = px - cellX;
+      const topLeft = grid2[cellX + cellY * columns];
+      const topRight = grid2[cellX + 1 + cellY * columns];
+      const bottomLeft = grid2[cellX + (cellY + 1) * columns];
+      const bottomRight = grid2[cellX + 1 + (cellY + 1) * columns];
+      const mappedX = bilerp(topLeft.x, topRight.x, bottomLeft.x, bottomRight.x, fx, fy);
+      const mappedY = bilerp(topLeft.y, topRight.y, bottomLeft.y, bottomRight.y, fx, fy);
+      const alpha = Math.trunc(clamp16(bilerp(
+        topLeft.alpha,
+        topRight.alpha,
+        bottomLeft.alpha,
+        bottomRight.alpha,
+        fx,
+        fy
+      ), 0, 1) * 255);
+      const index = x + y * width;
+      if (config.noMove) {
+        const maskSource = config.buffer === 0 ? 0 : source3.pixels[index];
+        context.input.pixels[index] = blendPixel(maskSource, context.input.pixels[index], "adjustable", alpha);
+        continue;
+      }
+      const sampled = sample(source3.pixels, width, height, mappedX, mappedY, config.wrap, config.bilinear);
+      context.output.pixels[index] = config.blend ? blendPixel(sampled, context.input.pixels[index], "adjustable", alpha) : sampled;
+    }
+  }
+  return config.noMove ? void 0 : { swap: true };
+}
+function sample(pixels, width, height, rawX, rawY, wrap2, bilinear3) {
+  const maxX = bilinear3 ? Math.max(0, width - 2) : width - 1;
+  const maxY = bilinear3 ? Math.max(0, height - 2) : height - 1;
+  let x = rawX;
+  let y = rawY;
+  if (wrap2) {
+    const spanX = Math.max(1, maxX);
+    const spanY = Math.max(1, maxY);
+    x = (x % spanX + spanX) % spanX;
+    y = (y % spanY + spanY) % spanY;
+  } else {
+    x = clamp16(x, 0, maxX);
+    y = clamp16(y, 0, maxY);
+  }
+  const ix = Math.trunc(x);
+  const iy = Math.trunc(y);
+  if (!bilinear3 || width < 2 || height < 2) return pixels[ix + iy * width];
+  const fx = Math.trunc((x - ix) * 256) & 255;
+  const fy = Math.trunc((y - iy) * 256) & 255;
+  const weights = [table3(255 - fx, 255 - fy), table3(fx, 255 - fy), table3(255 - fx, fy), table3(fx, fy)];
+  const points = [pixels[ix + iy * width], pixels[ix + 1 + iy * width], pixels[ix + (iy + 1) * width], pixels[ix + 1 + (iy + 1) * width]];
+  let result = 0;
+  for (let shift = 0; shift <= 16; shift += 8) {
+    let value = 0;
+    for (let i = 0; i < 4; i++) value += table3(points[i] >>> shift & 255, weights[i]);
+    result |= (value & 255) << shift;
+  }
+  return result;
+}
+function readString2(payload, offset) {
+  if (offset + 4 > payload.length) return { value: "", next: payload.length };
+  const length = u323(payload, offset, 0);
+  const start = offset + 4;
+  const end = Math.min(payload.length, start + length);
+  return { value: nulText4(payload.subarray(start, end)), next: end };
+}
+function compileOrNull3(source3) {
+  if (!source3.trim()) return null;
+  try {
+    return compileAvsEel(source3);
+  } catch {
+    return null;
+  }
+}
+function execute3(program, vm) {
+  return program ? vm.execute(program) : 0;
+}
+function i326(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+}
+function u323(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(offset, true) : fallback;
+}
+function nulText4(bytes) {
+  const end = bytes.indexOf(0);
+  return TEXT3.decode(end < 0 ? bytes : bytes.subarray(0, end));
+}
+function bilerp(a, b, c, d, x, y) {
+  return (a + (b - a) * x) * (1 - y) + (c + (d - c) * x) * y;
+}
+function table3(x, y) {
+  return Math.trunc(x / 255 * y);
+}
+function clamp16(value, minimum, maximum) {
+  return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+function hashPath6(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+
+// src/avs/effects/final-low-count-builtins.ts
+function registerAvsFinalLowCountBuiltins(registry = new AvsEffectRegistry()) {
+  const rotoStates = /* @__PURE__ */ new Map();
+  const interferenceStates = /* @__PURE__ */ new Map();
+  const fountainStates = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(9, (context) => {
+    if (context.preinit) return;
+    const zoom = int5(context, 0, 31), direction = int5(context, 4, 31), blend2 = int5(context, 8, 0) !== 0;
+    const beatReverse = int5(context, 12, 0) !== 0, beatSpeed = int5(context, 16, 0);
+    const beatZoom = int5(context, 20, 31), beatScale = int5(context, 24, 0) !== 0, subpixel = int5(context, 28, 0) !== 0;
+    let state = rotoStates.get(context.component.path);
+    if (!state) {
+      state = { reverse: 1, reversePosition: 1, scalePosition: zoom };
+      rotoStates.set(context.component.path, state);
+    }
+    if (context.beat && beatReverse) state.reverse = -state.reverse;
+    if (!beatReverse) state.reverse = 1;
+    state.reversePosition += (state.reverse - state.reversePosition) / (1 + beatSpeed * 4);
+    if (state.reverse > 0 && state.reversePosition > state.reverse) state.reversePosition = state.reverse;
+    if (state.reverse < 0 && state.reversePosition < state.reverse) state.reversePosition = state.reverse;
+    if (context.beat && beatScale) state.scalePosition = beatZoom;
+    let scale;
+    if (zoom < beatZoom) {
+      scale = Math.max(state.scalePosition, zoom);
+      if (state.scalePosition > zoom) state.scalePosition -= 3;
+    } else {
+      scale = Math.min(state.scalePosition, zoom);
+      if (state.scalePosition < zoom) state.scalePosition += 3;
+    }
+    rotoBlit(context, 1 + (scale - 31) / 31, (direction - 32) * state.reversePosition, blend2, subpixel);
+    return { swap: true };
+  });
+  registry.registerBuiltin(19, (context) => {
+    if (context.preinit) return;
+    let state = fountainStates.get(context.component.path);
+    if (!state) {
+      state = createFountain(int5(context, 28, 0) / 32);
+      fountainStates.set(context.component.path, state);
+    }
+    renderFountain(context, state, int5(context, 0, 16), readFiveColors(context), int5(context, 24, -20));
+  });
+  registry.registerBuiltin(41, (context) => {
+    if (context.preinit || int5(context, 0, 1) === 0) return;
+    const count = Math.max(0, Math.min(8, int5(context, 4, 2)));
+    if (count === 0) return;
+    let state = interferenceStates.get(context.component.path);
+    if (!state) {
+      state = { rotation: int5(context, 8, 0), status: Math.PI };
+      interferenceStates.set(context.component.path, state);
+    }
+    const onBeat = int5(context, 48, 1) !== 0;
+    if (onBeat && context.beat && state.status >= Math.PI) state.status = 0;
+    const wave = Math.sin(state.status);
+    const rotationIncrement = int5(context, 20, 0) + Math.trunc((int5(context, 40, 25) - int5(context, 20, 0)) * wave);
+    const alpha = int5(context, 16, 128) + Math.trunc((int5(context, 36, 192) - int5(context, 16, 128)) * wave);
+    const distance = int5(context, 12, 10) + Math.trunc((int5(context, 32, 32) - int5(context, 12, 10)) * wave);
+    const points = Array.from({ length: count }, (_, index) => {
+      const angle = state.rotation / 255 * Math.PI * 2 + Math.PI * 2 * index / count;
+      return [Math.trunc(Math.cos(angle) * distance), Math.trunc(Math.sin(angle) * distance)];
+    });
+    interference(context, points, alpha, int5(context, 44, 1) !== 0);
+    state.rotation += rotationIncrement;
+    state.rotation = state.rotation > 255 ? state.rotation - 255 : state.rotation < -255 ? state.rotation + 255 : state.rotation;
+    state.status = Math.min(Math.PI, state.status + float(context, 52, 0.2));
+    if (state.status < -Math.PI) state.status = Math.PI;
+    const additive = int5(context, 24, 0) !== 0, average = int5(context, 28, 0) !== 0;
+    if (!additive && !average) return { swap: true };
+    const blockLength = Math.trunc(context.input.pixels.length / 4) * 4;
+    for (let i = 0; i < blockLength; i++) context.input.pixels[i] = blendPixel(context.output.pixels[i], context.input.pixels[i], average ? "average" : "additive");
+  });
+  return registry;
+}
+function rotoBlit(context, zoom, degrees, blend2, subpixel) {
+  const width = context.input.width, height = context.input.height;
+  const ds = width - 1 << 16, dt = height - 1 << 16;
+  if (ds === 0 || dt === 0) {
+    context.output.copyFrom(context.input);
+    return;
+  }
+  const cosine = Math.cos(degrees * Math.PI / 180) * zoom, sine = Math.sin(degrees * Math.PI / 180) * zoom;
+  const dsDx = Math.trunc(cosine * 65536), dtDy = Math.trunc(cosine * 65536);
+  const dsDy = -Math.trunc(sine * 65536), dtDx = Math.trunc(sine * 65536);
+  if (dsDx <= -ds || dsDx >= ds || dtDx <= -dt || dtDx >= dt) return;
+  let sStart = -Math.trunc((width - 1) / 2) * dsDx - Math.trunc((height - 1) / 2) * dsDy + (width - 1) * (32768 + (1 << 20));
+  let tStart = -Math.trunc((width - 1) / 2) * dtDx - Math.trunc((height - 1) / 2) * dtDy + (height - 1) * (32768 + (1 << 20));
+  let output = 0;
+  for (let row = height; row > 0; row--) {
+    let s = modulo3(sStart, ds), t = modulo3(tStart, dt);
+    for (let x = width; x > 0; x--) {
+      const sample2 = subpixel ? bilinear2(context, s, t) : context.input.pixels[(s >> 16) + (t >> 16) * width];
+      context.output.pixels[output] = blend2 ? blendPixel(sample2, context.input.pixels[output], "average") : sample2;
+      output++;
+      s = modulo3(s + dsDx, ds);
+      t = modulo3(t + dtDx, dt);
+    }
+    sStart += dsDy;
+    tStart += dtDy;
+  }
+}
+function bilinear2(context, s, t) {
+  const x = s >> 16, y = t >> 16, fx = s >> 8 & 255, fy = t >> 8 & 255, width = context.input.width;
+  const pixels = context.input.pixels, base2 = x + y * width;
+  const weights = [table4(255 - fx, 255 - fy), table4(fx, 255 - fy), table4(255 - fx, fy), table4(fx, fy)];
+  const samples = [pixels[base2], pixels[base2 + 1], pixels[base2 + width], pixels[base2 + width + 1]];
+  return channels3(samples, weights);
+}
+function interference(context, points, alpha, rgb2) {
+  const width = context.input.width, height = context.input.height;
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    if (rgb2 && (points.length === 3 || points.length === 6)) {
+      const values = [0, 0, 0];
+      for (let index = 0; index < points.length; index++) {
+        const pixel = displaced(context, x, y, points[index]);
+        const channel = index % 3;
+        values[channel] = Math.min(255, values[channel] + table4(pixel >>> channel * 8 & 255, alpha));
+      }
+      context.output.pixels[x + y * width] = values[0] | values[1] << 8 | values[2] << 16;
+    } else {
+      let red = 0, green = 0, blue = 0;
+      for (const point of points) {
+        const pixel = displaced(context, x, y, point);
+        blue += table4(pixel & 255, alpha);
+        green += table4(pixel >>> 8 & 255, alpha);
+        red += table4(pixel >>> 16 & 255, alpha);
+      }
+      context.output.pixels[x + y * width] = Math.min(255, blue) | Math.min(255, green) << 8 | Math.min(255, red) << 16;
+    }
+  }
+}
+function displaced(context, x, y, point) {
+  const sx = x - point[0], sy = y - point[1];
+  return sx >= 0 && sy >= 0 && sx < context.input.width && sy < context.input.height ? context.input.pixels[sx + sy * context.input.width] : 0;
+}
+function createFountain(rotation) {
+  const length = 256 * 30;
+  return { rotation, radius: new Float32Array(length), radialVelocity: new Float32Array(length), height: new Float32Array(length), heightVelocity: new Float32Array(length), axisX: new Float32Array(length), axisY: new Float32Array(length), color: new Uint32Array(length) };
+}
+function renderFountain(context, state, velocity2, colors, tilt) {
+  const columns = 30;
+  for (let row = 254; row >= 0; row--) for (let column = 0; column < columns; column++) {
+    const source3 = row * columns + column, target = source3 + columns, acceleration = 1.3 / (row + 100);
+    state.radius[target] = state.radius[source3] + state.radialVelocity[source3];
+    state.heightVelocity[target] = state.heightVelocity[source3] + 0.05;
+    state.radialVelocity[target] = state.radialVelocity[source3] + acceleration;
+    state.height[target] = state.height[source3] + state.heightVelocity[target];
+    state.axisX[target] = state.axisX[source3];
+    state.axisY[target] = state.axisY[source3];
+    state.color[target] = state.color[source3];
+  }
+  const colorTable = fountainColors(colors);
+  for (let column = 0; column < columns; column++) {
+    let energy = Math.trunc((context.audio.waveform[0][column] ^ 128) * 5 / 4) - 64;
+    if (context.beat) energy += 128;
+    energy = Math.min(255, energy);
+    const radial = Math.abs(energy / 200) + 1, index = column;
+    state.radius[index] = 1;
+    state.height[index] = 250;
+    state.heightVelocity[index] = -radial * (100 + (state.heightVelocity[index] - state.heightVelocity[index])) / 100 * 2.8;
+    state.color[index] = colorTable[Math.min(63, Math.trunc(energy / 4))] ?? 0;
+    const angle = column * Math.PI * 2 / columns;
+    state.axisX[index] = Math.sin(angle);
+    state.axisY[index] = Math.cos(angle);
+    state.radialVelocity[index] = 0;
+  }
+  const rotateZ = rotationMatrix(2, state.rotation), rotateY = rotationMatrix(1, tilt), translated = translationMatrix(0, -20, 400);
+  const matrix = multiplyMatrices(multiplyMatrices(rotateZ, rotateY), translated);
+  const projection = Math.min(context.input.width * 440 / 640, context.input.height * 440 / 480);
+  for (let index = 0; index < state.radius.length; index++) {
+    const [x, y, z] = applyMatrix(matrix, state.axisX[index] * state.radius[index], state.height[index], state.axisY[index] * state.radius[index]);
+    const scale = projection / z;
+    if (scale <= 1e-7) continue;
+    const px = Math.trunc(x * scale) + Math.trunc(context.input.width / 2), py = Math.trunc(y * scale) + Math.trunc(context.input.height / 2);
+    if (px >= 0 && py >= 0 && px < context.input.width && py < context.input.height) {
+      const at = px + py * context.input.width;
+      context.input.pixels[at] = blendLine(state.color[index], context.input.pixels[at], context.line.blendMode, context.line.adjustableAlpha);
+    }
+  }
+  state.rotation += velocity2 / 5;
+  if (state.rotation >= 360) state.rotation -= 360;
+  if (state.rotation < 0) state.rotation += 360;
+}
+function fountainColors(colors) {
+  const tableOut = new Uint32Array(64);
+  for (let segment = 0; segment < 4; segment++) for (let step = 0; step < 16; step++) tableOut[segment * 16 + step] = mixColor(colors[segment], colors[segment + 1], step, 16);
+  return tableOut;
+}
+function readFiveColors(context) {
+  const defaults = [1862424, 16714275, 2760052, 9451225, 7047423];
+  return defaults.map((fallback, index) => int5(context, 4 + index * 4, fallback) & 16777215);
+}
+function rotationMatrix(axis2, degrees) {
+  const m = new Array(16).fill(0), m1 = axis2 % 3, m2 = (m1 + 1) % 3, c = Math.cos(degrees * Math.PI / 180), s = Math.sin(degrees * Math.PI / 180);
+  m[(axis2 - 1) * 4 + axis2 - 1] = 1;
+  m[15] = 1;
+  m[m1 * 4 + m1] = c;
+  m[m1 * 4 + m2] = s;
+  m[m2 * 4 + m2] = c;
+  m[m2 * 4 + m1] = -s;
+  return m;
+}
+function translationMatrix(x, y, z) {
+  return [1, 0, 0, x, 0, 1, 0, y, 0, 0, 1, z, 0, 0, 0, 1];
+}
+function multiplyMatrices(destination, source3) {
+  const out = new Array(16);
+  for (let row = 0; row < 4; row++) for (let column = 0; column < 4; column++) out[row * 4 + column] = source3[row * 4] * destination[column] + source3[row * 4 + 1] * destination[4 + column] + source3[row * 4 + 2] * destination[8 + column] + source3[row * 4 + 3] * destination[12 + column];
+  return out;
+}
+function applyMatrix(m, x, y, z) {
+  return [x * m[0] + y * m[1] + z * m[2] + m[3], x * m[4] + y * m[5] + z * m[6] + m[7], x * m[8] + y * m[9] + z * m[10] + m[11]];
+}
+function channels3(samples, weights) {
+  let out = 0;
+  for (let channel = 0; channel < 3; channel++) {
+    let value = 0;
+    for (let i = 0; i < 4; i++) value += table4(samples[i] >>> channel * 8 & 255, weights[i]);
+    out |= (value & 255) << channel * 8;
+  }
+  return out;
+}
+function mixColor(a, b, numerator, denominator) {
+  let out = 0;
+  for (let channel = 0; channel < 3; channel++) out |= Math.trunc(((a >>> channel * 8 & 255) * (denominator - numerator) + (b >>> channel * 8 & 255) * numerator) / denominator) << channel * 8;
+  return out;
+}
+function table4(x, y) {
+  return Math.trunc(x / 255 * y);
+}
+function modulo3(value, divisor) {
+  const result = value % divisor;
+  return result < 0 ? result + divisor : result;
+}
+function int5(context, offset, fallback) {
+  return offset + 4 <= context.component.payload.length ? new DataView(context.component.payload.buffer, context.component.payload.byteOffset, context.component.payload.byteLength).getInt32(offset, true) : fallback;
+}
+function float(context, offset, fallback) {
+  return offset + 4 <= context.component.payload.length ? new DataView(context.component.payload.buffer, context.component.payload.byteOffset, context.component.payload.byteLength).getFloat32(offset, true) : fallback;
+}
+
+// src/avs/effects/movement.ts
+var TEXT4 = new TextDecoder("windows-1252");
+var CUSTOM_EFFECT = 32767;
+var LAST_BUILTIN_EFFECT = 23;
+var OFFSET_MASK = (1 << 22) - 1;
+var EVALUATED_BUILTINS = {
+  18: {
+    source: "d=d*(1-(sin((r-$pi*.5)*7)*.03));r=r+(cos(d*12)*.03)",
+    rectangular: false
+  },
+  19: {
+    source: "d=d*(1-(sin((r-$pi*.5)*12)*.05));r=r+(cos(d*18)*.05);d=d*(1-((d-.4)*.03));r=r+((d-.4)*.13)",
+    rectangular: false
+  },
+  20: { source: "x=x+(cos(y*18)*.02);y=y+(sin(x*14)*.03)", rectangular: true },
+  21: {
+    source: "x=x+(cos(abs(y-.5)*8)*.02);y=y+(sin(abs(x-.5)*8)*.05);x=x*.95;y=y*.95",
+    rectangular: true
+  },
+  22: {
+    source: "y=y*(1+(sin(r+$pi/2)*.3));x=x*(1+(cos(r+$pi/2)*.3));x=x*.995;y=y*.995",
+    rectangular: true
+  },
+  23: { source: "y=(r*6)/$pi;x=d", rectangular: true }
+};
+function decodeAvsMovement(payload) {
+  let offset = 0;
+  let effect3 = readI322(payload, offset, 1);
+  offset += 4;
+  let expression = "";
+  let rectangular = false;
+  if (effect3 === CUSTOM_EFFECT) {
+    if (asciiEquals(payload, offset, "!rect ")) {
+      offset += 6;
+      rectangular = true;
+    }
+    if (payload[offset] === 1) {
+      offset++;
+      const length = readI322(payload, offset, 0);
+      offset += 4;
+      if (length > 0 && offset + length <= payload.length) {
+        expression = nulText5(payload.subarray(offset, offset + length));
+        offset += length;
+      }
+    } else {
+      const length = 256 - (rectangular ? 6 : 0);
+      if (offset + length <= payload.length) {
+        expression = nulText5(payload.subarray(offset, offset + length));
+        offset += length;
+      }
+    }
+  }
+  const blend2 = readI322(payload, offset, 0) !== 0;
+  offset += 4;
+  const sourceMapped = readI322(payload, offset, 0);
+  offset += 4;
+  rectangular = readI322(payload, offset, rectangular ? 1 : 0) !== 0;
+  offset += 4;
+  const subpixel = readI322(payload, offset, 0) !== 0;
+  offset += 4;
+  const wrap2 = readI322(payload, offset, 0) !== 0;
+  offset += 4;
+  if (effect3 === 0 && offset + 4 <= payload.length) effect3 = readI322(payload, offset, 0);
+  if (effect3 !== CUSTOM_EFFECT && effect3 > LAST_BUILTIN_EFFECT || effect3 < 0) effect3 = 0;
+  return { effect: effect3, expression, blend: blend2, sourceMapped, rectangular, subpixel, wrap: wrap2 };
+}
+function registerAvsMovement(registry, global = new AvsEelGlobalState()) {
+  const states = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(15, (context) => {
+    let state = states.get(context.component.path);
+    if (!state) {
+      const config = decodeAvsMovement(context.component.payload);
+      state = {
+        config,
+        program: movementProgram(config),
+        sourceMapped: config.sourceMapped,
+        width: 0,
+        height: 0,
+        table: null,
+        randomState: hashPath7(context.component.path)
+      };
+      states.set(context.component.path, state);
+    }
+    if (state.config.effect === 0) return;
+    if (!state.table || state.width !== context.input.width || state.height !== context.input.height) {
+      state.table = buildMovementTable(context, state, global);
+      state.width = context.input.width;
+      state.height = context.input.height;
+    }
+    if (context.preinit) return;
+    if ((state.sourceMapped & 2) !== 0 && context.beat) state.sourceMapped ^= 1;
+    if ((state.sourceMapped & 1) !== 0) renderForward(context, state.table, state.config.blend);
+    else renderInverse(context, state.table, state.config.blend);
+    return { swap: true };
+  });
+  return registry;
+}
+function movementProgram(config) {
+  const source3 = config.effect === CUSTOM_EFFECT ? config.expression : EVALUATED_BUILTINS[config.effect]?.source;
+  if (!source3?.trim()) return null;
+  try {
+    return compileAvsEel(source3);
+  } catch {
+    return null;
+  }
+}
+function buildMovementTable(context, state, global) {
+  const { width, height } = context.input;
+  const count = width * height;
+  const config = state.config;
+  const bilinear3 = config.subpixel && width > 1 && height > 1 && count < 1 << 22 && (config.effect === CUSTOM_EFFECT || config.effect >= 3 && config.effect <= 23 && config.effect !== 7);
+  const table7 = {
+    offsets: new Uint32Array(count),
+    xWeights: new Uint8Array(count),
+    yWeights: new Uint8Array(count),
+    bilinear: bilinear3
+  };
+  if (config.effect === 1) {
+    for (let i = 0; i < count; i++) {
+      const dx = nextRandom3(state) % 3 - 1;
+      const dy = nextRandom3(state) % 3 - 1;
+      table7.offsets[i] = clamp17(i + dx + dy * width, 0, count - 1);
+    }
+    return table7;
+  }
+  if (config.effect === 2) {
+    const shift = Math.trunc(width / 64);
+    for (let y = 0; y < height; y++) {
+      let sourceX = shift;
+      for (let x = 0; x < width; x++) {
+        table7.offsets[x + y * width] = sourceX + y * width;
+        sourceX++;
+        if (sourceX >= width) sourceX -= width;
+      }
+    }
+    return table7;
+  }
+  if (config.effect === 7) {
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        let sourceX = x;
+        let sourceY = y;
+        if ((x & 2) === 0 && (y & 2) === 0) {
+          sourceX = Math.trunc(width / 2 + ((x & ~1) - width / 2) * 7 / 8);
+          sourceY = Math.trunc(height / 2 + ((y & ~1) - height / 2) * 7 / 8);
+        }
+        table7.offsets[x + y * width] = clamp17(sourceX, 0, width - 1) + clamp17(sourceY, 0, height - 1) * width;
+      }
+    }
+    return table7;
+  }
+  if (state.program) buildEvaluatedTable(context, state, table7, global);
+  else if (config.effect >= 3 && config.effect <= 17) buildNativeTable(state, table7, width, height);
+  else fillIdentity(table7, width, height);
+  return table7;
+}
+function buildNativeTable(state, table7, width, height) {
+  const halfWidth = Math.trunc(width / 2);
+  const halfHeight = Math.trunc(height / 2);
+  const maxDistance = Math.sqrt(width * width + height * height) / 2;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const xd = x - halfWidth;
+      const yd = y - halfHeight;
+      let distance = Math.hypot(xd, yd);
+      let angle = Math.atan2(yd, xd);
+      let xOffset = 0;
+      switch (state.config.effect) {
+        case 3:
+          angle += 0.1 - 0.2 * distance / maxDistance;
+          distance *= 0.96;
+          break;
+        case 4:
+          distance *= 0.99 * (1 - Math.sin(angle) / 32);
+          angle += 0.03 * Math.sin(distance / maxDistance * Math.PI * 4);
+          break;
+        case 5:
+          distance *= 0.94 + Math.cos(angle * 32) * 0.06;
+          break;
+        case 6:
+          distance *= 1.01 + Math.cos(angle * 4) * 0.04;
+          angle += 0.03 * Math.sin(distance / maxDistance * Math.PI * 4);
+          break;
+        case 8:
+          angle += 0.1 * Math.sin(distance / maxDistance * Math.PI * 5);
+          break;
+        case 9: {
+          const t = Math.sin(distance / maxDistance * Math.PI);
+          distance -= 8 * t ** 5;
+          break;
+        }
+        case 10: {
+          const t = Math.sin(distance / maxDistance * Math.PI);
+          distance -= 8 * t ** 5;
+          const swirl = Math.cos(distance / maxDistance * Math.PI / 2);
+          angle += 0.1 * swirl ** 3;
+          break;
+        }
+        case 11:
+          distance *= 0.95 + Math.cos(angle * 5 - Math.PI / 2.5) * 0.03;
+          break;
+        case 12:
+          angle += 0.04;
+          distance *= 0.96 + Math.cos(distance / maxDistance * Math.PI) * 0.05;
+          break;
+        case 13: {
+          const t = Math.cos(distance / maxDistance * Math.PI);
+          angle += 0.07 * t;
+          distance *= 0.98 + t * 0.1;
+          break;
+        }
+        case 14:
+          angle += 0.1 - 0.2 * distance / maxDistance;
+          distance *= 0.96;
+          xOffset = 8;
+          break;
+        case 15:
+          distance = maxDistance * 0.15;
+          break;
+        case 16:
+          angle = Math.cos(angle * 3);
+          break;
+        case 17:
+          distance *= 1 - (distance / maxDistance - 0.35) * 0.5;
+          angle += 0.1;
+          break;
+      }
+      const sampleX = halfWidth + Math.cos(angle) * distance + 0.5 + xOffset * width / 256;
+      const sampleY = halfHeight + Math.sin(angle) * distance + 0.5;
+      storeCoordinate(table7, x + y * width, sampleX, sampleY, width, height, state.config.wrap);
+    }
+  }
+}
+function buildEvaluatedTable(context, state, table7, global) {
+  const { width, height } = context.input;
+  const halfWidth = Math.trunc(width / 2);
+  const halfHeight = Math.trunc(height / 2);
+  const maxDistance = Math.sqrt(width * width + height * height) / 2;
+  const vm = new AvsEelVm({ global, seed: state.randomState });
+  vm.setHost({
+    getosc: (band, span, channel) => avsAudioSample(context.audio, "osc", band, span, channel),
+    getspec: (band, span, channel) => avsAudioSample(context.audio, "spec", band, span, channel)
+  });
+  vm.set("sw", width);
+  vm.set("sh", height);
+  const rectangular = state.config.effect === CUSTOM_EFFECT ? state.config.rectangular : EVALUATED_BUILTINS[state.config.effect]?.rectangular === true;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const xd = x - halfWidth;
+      const yd = y - halfHeight;
+      vm.set("x", halfWidth === 0 ? 0 : xd / halfWidth);
+      vm.set("y", halfHeight === 0 ? 0 : yd / halfHeight);
+      vm.set("d", maxDistance === 0 ? 0 : Math.hypot(xd, yd) / maxDistance);
+      vm.set("r", Math.atan2(yd, xd) + Math.PI / 2);
+      vm.execute(state.program);
+      let sampleX;
+      let sampleY;
+      if (rectangular) {
+        sampleX = (vm.get("x") + 1) * halfWidth;
+        sampleY = (vm.get("y") + 1) * halfHeight;
+      } else {
+        const distance = vm.get("d") * maxDistance;
+        const angle = vm.get("r") - Math.PI / 2;
+        sampleX = halfWidth + Math.cos(angle) * distance;
+        sampleY = halfHeight + Math.sin(angle) * distance;
+      }
+      if (!table7.bilinear) {
+        sampleX += 0.5;
+        sampleY += 0.5;
+      }
+      storeCoordinate(table7, x + y * width, sampleX, sampleY, width, height, state.config.wrap);
+    }
+  }
+}
+function storeCoordinate(table7, destination, rawX, rawY, width, height, wrap2) {
+  if (!table7.bilinear) {
+    let x2 = Math.trunc(rawX);
+    let y2 = Math.trunc(rawY);
+    if (wrap2) {
+      x2 = modulo4(x2, width);
+      y2 = modulo4(y2, height);
+    } else {
+      x2 = clamp17(x2, 0, width - 1);
+      y2 = clamp17(y2, 0, height - 1);
+    }
+    table7.offsets[destination] = x2 + y2 * width;
+    return;
+  }
+  let x = Math.trunc(rawX);
+  let y = Math.trunc(rawY);
+  let xPartial = Math.trunc(32 * (rawX - x));
+  let yPartial = Math.trunc(32 * (rawY - y));
+  if (wrap2) {
+    x = modulo4(x, width - 1);
+    y = modulo4(y, height - 1);
+  } else {
+    if (x < 0) {
+      x = 0;
+      xPartial = 0;
+    } else if (x >= width - 1) {
+      x = width - 2;
+      xPartial = 31;
+    }
+    if (y < 0) {
+      y = 0;
+      yPartial = 0;
+    } else if (y >= height - 1) {
+      y = height - 2;
+      yPartial = 31;
+    }
+  }
+  const packed = (x + y * width | yPartial << 22 | xPartial << 27) >>> 0;
+  table7.offsets[destination] = packed & OFFSET_MASK;
+  table7.xWeights[destination] = packed >>> 24 & 31 << 3;
+  table7.yWeights[destination] = packed >>> 19 & 31 << 3;
+}
+function renderInverse(context, table7, blend2) {
+  const source3 = context.input.pixels;
+  const output = context.output.pixels;
+  const width = context.input.width;
+  for (let i = 0; i < output.length; i++) {
+    const mapped = table7.bilinear ? sampleBilinear(source3, table7.offsets[i], width, table7.xWeights[i], table7.yWeights[i]) : source3[table7.offsets[i]];
+    output[i] = blend2 ? averagePixel3(source3[i], mapped) : mapped;
+  }
+}
+function renderForward(context, table7, blend2) {
+  const source3 = context.input.pixels;
+  const output = context.output.pixels;
+  if (blend2) output.set(source3);
+  else output.fill(0);
+  for (let i = 0; i < source3.length; i++) {
+    const destination = table7.offsets[i];
+    output[destination] = maximumPixel(source3[i], output[destination]);
+  }
+  if (blend2) {
+    for (let i = 0; i < output.length; i++) output[i] = averagePixel3(output[i], source3[i]);
+  }
+}
+function sampleBilinear(source3, offset, width, xp, yp) {
+  const weights = [
+    table5(255 - xp, 255 - yp),
+    table5(xp, 255 - yp),
+    table5(255 - xp, yp),
+    table5(xp, yp)
+  ];
+  const pixels = [source3[offset], source3[offset + 1], source3[offset + width], source3[offset + width + 1]];
+  const channel = (shift) => {
+    let value = 0;
+    for (let i = 0; i < 4; i++) value += table5(pixels[i] >>> shift & 255, weights[i]);
+    return value & 255;
+  };
+  return channel(0) | channel(8) << 8 | channel(16) << 16;
+}
+function fillIdentity(table7, width, height) {
+  for (let i = 0; i < width * height; i++) table7.offsets[i] = i;
+}
+function averagePixel3(a, b) {
+  return (a >>> 1 & 8355711) + (b >>> 1 & 8355711) & 16777215;
+}
+function maximumPixel(a, b) {
+  return Math.max(a & 255, b & 255) | Math.max(a >>> 8 & 255, b >>> 8 & 255) << 8 | Math.max(a >>> 16 & 255, b >>> 16 & 255) << 16;
+}
+function nextRandom3(state) {
+  let x = state.randomState || 1831565813;
+  x ^= x << 13;
+  x ^= x >>> 17;
+  x ^= x << 5;
+  state.randomState = x >>> 0;
+  return state.randomState;
+}
+function table5(x, y) {
+  return Math.trunc(x / 255 * y);
+}
+function modulo4(value, modulus) {
+  if (modulus <= 0) return 0;
+  const result = value % modulus;
+  return result < 0 ? result + modulus : result;
+}
+function readI322(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+}
+function asciiEquals(payload, offset, value) {
+  if (offset + value.length > payload.length) return false;
+  for (let i = 0; i < value.length; i++) if (payload[offset + i] !== value.charCodeAt(i)) return false;
+  return true;
+}
+function nulText5(bytes) {
+  const end = bytes.indexOf(0);
+  return TEXT4.decode(end < 0 ? bytes : bytes.subarray(0, end));
+}
+function clamp17(value, minimum, maximum) {
+  return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+function hashPath7(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+
+// src/avs/effects/low-count-builtins.ts
+function registerAvsLowCountBuiltins(registry = new AvsEffectRegistry()) {
+  const simpleStates = /* @__PURE__ */ new Map();
+  const ringStates = /* @__PURE__ */ new Map();
+  const gridStates = /* @__PURE__ */ new Map();
+  const grainStates = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(0, (context) => {
+    if (context.preinit) return;
+    const colors = colorList(context, 4);
+    if (colors.length === 0) return;
+    const state = simpleStates.get(context.component.path) ?? { colorPosition: 0 };
+    simpleStates.set(context.component.path, state);
+    const color = cycleColor(colors, state);
+    renderSimple(context, int6(context, 0, 40), color);
+  });
+  registry.registerBuiltin(14, (context) => {
+    if (context.preinit) return;
+    const count = int6(context, 4, 1);
+    const colors = readColors(context, 8, count);
+    if (colors.length === 0) return;
+    const state = ringStates.get(context.component.path) ?? { colorPosition: 0 };
+    ringStates.set(context.component.path, state);
+    const tail = 8 + colors.length * 4;
+    renderRing(context, int6(context, 0, 40), cycleColor(colors, state), int6(context, tail, 8), int6(context, tail + 4, 0));
+  });
+  registry.registerBuiltin(17, (context) => {
+    if (context.preinit) return;
+    const colors = colorList(context, 0);
+    if (colors.length === 0) return;
+    let state = gridStates.get(context.component.path);
+    if (!state) {
+      state = { colorPosition: 0, x: 0, y: 0 };
+      gridStates.set(context.component.path, state);
+    }
+    const tail = 4 + colors.length * 4;
+    const spacing = Math.max(2, int6(context, tail, 8));
+    while (state.x < 0) state.x += spacing * 256;
+    while (state.y < 0) state.y += spacing * 256;
+    const sx = (state.x >>> 8) % spacing;
+    const sy = (state.y >>> 8) % spacing;
+    const color = cycleColor(colors, state);
+    const blend2 = int6(context, tail + 12, 3);
+    for (let y = sy; y < context.input.height; y += spacing) for (let x = sx; x < context.input.width; x += spacing) {
+      const index = x + y * context.input.width;
+      const destination = context.input.pixels[index];
+      context.input.pixels[index] = blend2 === 1 ? blendPixel(color, destination, "additive") : blend2 === 2 ? blendPixel(color, destination, "average") : blend2 === 3 ? blendLine(color, destination, context.line.blendMode, context.line.adjustableAlpha) : color;
+    }
+    state.x += int6(context, tail + 4, 128);
+    state.y += int6(context, tail + 8, 128);
+  });
+  registry.registerBuiltin(24, (context) => {
+    if (context.preinit || int6(context, 0, 1) === 0) return;
+    let state = grainStates.get(context.component.path);
+    if (!state || state.width !== context.input.width || state.height !== context.input.height) {
+      const random = hashPath8(context.component.path);
+      state = { width: context.input.width, height: context.input.height, depth: new Uint8Array(context.input.pixels.length * 2), random };
+      for (let i = 0; i < state.depth.length; i += 2) {
+        state.random = xorshift322(state.random);
+        state.depth[i] = state.random % 255;
+        state.random = xorshift322(state.random);
+        state.depth[i + 1] = state.random % 100;
+      }
+      grainStates.set(context.component.path, state);
+    }
+    const staticGrain = int6(context, 16, 0) !== 0;
+    const threshold = Math.trunc(int6(context, 12, 100) * 255 / 100);
+    for (let i = 0; i < context.input.pixels.length; i++) {
+      const pixel = context.input.pixels[i];
+      if (pixel === 0) continue;
+      let gate3;
+      let scale;
+      if (staticGrain) {
+        scale = state.depth[i * 2];
+        gate3 = state.depth[i * 2 + 1];
+      } else {
+        state.random = xorshift322(state.random);
+        gate3 = state.random & 255;
+        state.random = xorshift322(state.random);
+        scale = state.random & 255;
+      }
+      const grain = gate3 < threshold ? scalePixel(pixel, scale) : 0;
+      context.input.pixels[i] = int6(context, 4, 0) !== 0 ? blendPixel(grain, pixel, "additive") : int6(context, 8, 0) !== 0 ? blendPixel(grain, pixel, "average") : grain;
+    }
+  });
+  return registry;
+}
+function renderSimple(context, effect3, color) {
+  const width = context.input.width;
+  const height = context.input.height;
+  const yScale = height / 512;
+  const channel = effect3 >>> 2 & 3;
+  const vertical = effect3 >>> 4 & 3;
+  const source3 = (effect3 & 3) > 1 ? context.audio.waveform : context.audio.spectrum;
+  const data = selectChannel(source3, channel);
+  const point = (x, y) => plot(context, x, y, color);
+  if ((effect3 & 64) !== 0) {
+    if ((effect3 & 2) !== 0) {
+      const center = vertical === 2 ? height / 4 : vertical * height / 2;
+      for (let x = 0; x < width; x++) point(x, Math.trunc(center + interpolateSigned(data, x * 288 / width) * yScale));
+    } else {
+      const { center, scale, adjust } = analyzerVertical(vertical, height, yScale);
+      for (let x = 0; x < width; x++) point(x, Math.trunc(center + adjust + interpolate(data, x * 200 / width) * scale - 1));
+    }
+    return;
+  }
+  switch (effect3 & 3) {
+    case 0: {
+      const { center, scale, adjust } = analyzerVertical(vertical, height, yScale);
+      for (let x = 0; x < width; x++) drawLine(context, x, center - adjust, x, Math.trunc(center + adjust + interpolate(data, x * 200 / width) * scale - 1), color);
+      break;
+    }
+    case 1: {
+      const { center, scale } = analyzerVertical(vertical, height, yScale);
+      let lx = 0, ly = Math.trunc(center + data[0] * scale);
+      for (let x = 1; x < 200; x++) {
+        const ox = Math.trunc(x * width / 200);
+        const oy = Math.trunc(center + data[x] * scale);
+        drawLine(context, lx, ly, ox, oy, color);
+        lx = ox;
+        ly = oy;
+      }
+      break;
+    }
+    case 2: {
+      const center = vertical === 2 ? height / 4 : vertical * height / 2;
+      let lx = 0, ly = Math.trunc(center + (data[0] ^ 128) * yScale);
+      for (let x = 1; x < 288; x++) {
+        const ox = Math.trunc(x * width / 288);
+        const oy = Math.trunc(center + (data[x] ^ 128) * yScale);
+        drawLine(context, lx, ly, ox, oy, color);
+        lx = ox;
+        ly = oy;
+      }
+      break;
+    }
+    case 3: {
+      const center = vertical === 2 ? height / 4 : vertical * height / 2;
+      const start = Math.trunc(center + yScale * 128) - 1;
+      for (let x = 0; x < width; x++) drawLine(context, x, start, x, Math.trunc(center + interpolateSigned(data, x * 288 / width) * yScale), color);
+      break;
+    }
+  }
+}
+function renderRing(context, effect3, color, size, spectrumMode) {
+  const channel = effect3 >>> 2 & 3;
+  const horizontal = effect3 >>> 4;
+  const source3 = spectrumMode ? context.audio.spectrum : context.audio.waveform;
+  const data = selectChannel(source3, channel);
+  const radius = Math.min(context.input.height * size / 32, context.input.width * size / 32);
+  const cx = horizontal === 2 ? context.input.width / 2 : horizontal === 0 ? context.input.width / 4 : context.input.width * 3 / 4;
+  const cy = context.input.height / 2;
+  const amplitude = (q) => spectrumMode ? 0.1 + (data[q * 2] / 2 + data[q * 2 + 1] / 2) / 255 * 0.9 : 0.1 + (data[q] ^ 128) / 255 * 0.9;
+  let lastX = Math.trunc(cx + radius * amplitude(0));
+  let lastY = Math.trunc(cy);
+  for (let q = 1; q <= 80; q++) {
+    const index = q > 40 ? 80 - q : q;
+    const angle = -Math.PI * 2 * q / 80;
+    const scale = amplitude(index);
+    const x = Math.trunc(cx + Math.cos(angle) * radius * scale);
+    const y = Math.trunc(cy + Math.sin(angle) * radius * scale);
+    drawLine(context, x, y, lastX, lastY, color);
+    lastX = x;
+    lastY = y;
+  }
+}
+function colorList(context, offset) {
+  return readColors(context, offset + 4, int6(context, offset, 1));
+}
+function readColors(context, offset, count) {
+  if (count < 1 || count > 16) return [];
+  const result = [];
+  for (let i = 0; i < count && offset + i * 4 + 4 <= context.component.payload.length; i++) result.push(int6(context, offset + i * 4, 0) & 16777215);
+  return result;
+}
+function cycleColor(colors, state) {
+  state.colorPosition = (state.colorPosition + 1) % (colors.length * 64);
+  const index = Math.trunc(state.colorPosition / 64);
+  const fraction = state.colorPosition & 63;
+  return channels23(colors[index], colors[(index + 1) % colors.length], (a, b) => Math.trunc((a * (63 - fraction) + b * fraction) / 64));
+}
+function selectChannel(source3, channel) {
+  if (channel < 2) return source3[channel];
+  const center = new Uint8Array(576);
+  for (let i = 0; i < 576; i++) center[i] = Math.trunc(signed2(source3[0][i]) / 2) + Math.trunc(signed2(source3[1][i]) / 2) & 255;
+  return center;
+}
+function analyzerVertical(position, height, yScale) {
+  let center = height / 2, scale = yScale, adjust = 1;
+  if (position !== 1) {
+    scale = -scale;
+    adjust = 0;
+  }
+  if (position === 2) center -= scale * 128;
+  return { center: Math.trunc(center), scale, adjust };
+}
+function interpolate(data, at) {
+  const i = Math.trunc(at), f = at - i;
+  return data[i] * (1 - f) + data[i + 1] * f;
+}
+function interpolateSigned(data, at) {
+  const i = Math.trunc(at), f = at - i;
+  return (data[i] ^ 128) * (1 - f) + (data[i + 1] ^ 128) * f;
+}
+function signed2(value) {
+  return value << 24 >> 24;
+}
+function plot(context, x, y, color) {
+  x = Math.trunc(x);
+  y = Math.trunc(y);
+  if (x < 0 || y < 0 || x >= context.input.width || y >= context.input.height) return;
+  const index = x + y * context.input.width;
+  context.input.pixels[index] = blendLine(color, context.input.pixels[index], context.line.blendMode, context.line.adjustableAlpha);
+}
+function drawLine(context, x0, y0, x1, y1, color) {
+  x0 = Math.trunc(x0);
+  y0 = Math.trunc(y0);
+  x1 = Math.trunc(x1);
+  y1 = Math.trunc(y1);
+  const dx = Math.abs(x1 - x0), sx = x0 < x1 ? 1 : -1, dy = -Math.abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+  let error = dx + dy;
+  while (x0 !== x1 || y0 !== y1) {
+    plot(context, x0, y0, color);
+    const twice = 2 * error;
+    if (twice >= dy) {
+      error += dy;
+      x0 += sx;
+    }
+    if (twice <= dx) {
+      error += dx;
+      y0 += sy;
+    }
+  }
+}
+function scalePixel(pixel, scale) {
+  return channels23(pixel, 0, (value) => value * scale >>> 8);
+}
+function channels23(a, b, fn) {
+  return fn(a & 255, b & 255) | fn(a >>> 8 & 255, b >>> 8 & 255) << 8 | fn(a >>> 16 & 255, b >>> 16 & 255) << 16;
+}
+function int6(context, offset, fallback) {
+  return offset + 4 <= context.component.payload.length ? new DataView(context.component.payload.buffer, context.component.payload.byteOffset, context.component.payload.byteLength).getInt32(offset, true) : fallback;
+}
+function hashPath8(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+function xorshift322(value) {
+  let state = value || 1831565813;
+  state ^= state << 13;
+  state ^= state >>> 17;
+  state ^= state << 5;
+  return state >>> 0;
+}
+
+// src/avs/effects/multifilter.ts
+var AVS_MULTIFILTER_APE_ID = "Jheriko : MULTIFILTER";
+function decodeAvsMultiFilterConfig(payload) {
+  const native = new Uint8Array(16);
+  const view = new DataView(native.buffer);
+  view.setInt32(0, 1, true);
+  if (payload.length <= native.length) native.set(payload);
+  return {
+    enabled: view.getInt32(0, true) !== 0,
+    effect: view.getInt32(4, true),
+    toggleOnBeat: view.getInt32(8, true) !== 0,
+    reactiveAlpha: view.getInt32(12, true) !== 0
+  };
+}
+function registerAvsMultiFilter(registry = new AvsEffectRegistry()) {
+  let toggleState = false;
+  registry.registerApe(AVS_MULTIFILTER_APE_ID, (context) => {
+    const config = decodeAvsMultiFilterConfig(context.component.payload);
+    if (!config.enabled) return;
+    if (config.toggleOnBeat && (context.beat || context.preinit)) toggleState = !toggleState;
+    if (config.toggleOnBeat && !toggleState && !config.reactiveAlpha) return;
+    if (config.effect >= 0 && config.effect <= 2) {
+      if (config.reactiveAlpha) return;
+      chrome(context, config.effect + 1);
+      return;
+    }
+    if (config.effect === 3) return infiniteRootBorder(context);
+  });
+  return registry;
+}
+function chrome(context, repetitions) {
+  for (let index = 0; index < context.input.pixels.length; index++) {
+    let pixel = context.input.pixels[index];
+    for (let pass6 = 0; pass6 < repetitions; pass6++) {
+      let next = 0;
+      for (let shift = 0; shift <= 24; shift += 8) {
+        const value = pixel >>> shift & 255;
+        const doubled = Math.min(255, value + value);
+        const folded = Math.max(0, doubled - value);
+        next |= Math.min(255, folded + folded) << shift;
+      }
+      pixel = next >>> 0;
+    }
+    context.input.pixels[index] = pixel;
+  }
+}
+function infiniteRootBorder(context) {
+  const source3 = context.input.pixels;
+  const target = context.output.pixels;
+  const width = context.input.width;
+  for (let y = 0; y < context.input.height; y++) {
+    for (let x = 0; x < width; x++) {
+      const index = y * width + x;
+      target[index] = 0;
+      if ((source3[index] | 0) > 0) {
+        target[index] = 4294967295;
+        if (x > 0) target[index - 1] = 4294967295;
+        if (y > 0) target[index - width] = 4294967295;
+      }
+    }
+  }
+  return { swap: true };
+}
+
+// src/avs/effects/named-apes.ts
+var AVS_CHANNEL_SHIFT_APE_ID = "Channel Shift";
+var AVS_COLOR_REDUCTION_APE_ID = "Color Reduction";
+var AVS_MULTIPLIER_APE_ID = "Multiplier";
+var CHANNEL_MODES = [1183, 1020, 1018, 1022, 1019, 1021];
+function decodeAvsChannelShift(payload) {
+  const native = new Uint8Array(8);
+  const view = new DataView(native.buffer);
+  view.setInt32(0, 1020, true);
+  view.setInt32(4, 1, true);
+  if (payload.length <= native.length) native.set(payload);
+  return {
+    mode: view.getInt32(0, true),
+    randomizeOnBeat: view.getInt32(4, true) !== 0
+  };
+}
+function decodeAvsColorReduction(payload) {
+  if (payload.length !== 264) return { legacyFilename: "", levels: 0 };
+  return {
+    legacyFilename: nulText6(payload.subarray(0, 260)),
+    levels: readI323(payload, 260, 0)
+  };
+}
+function decodeAvsMultiplier(payload) {
+  return { mode: payload.length === 4 ? readI323(payload, 0, 0) : 0 };
+}
+function registerAvsNamedApeEffects(registry = new AvsEffectRegistry()) {
+  const shifts = /* @__PURE__ */ new Map();
+  registry.registerApe(AVS_CHANNEL_SHIFT_APE_ID, (context) => {
+    if (context.preinit) return;
+    const config = decodeAvsChannelShift(context.component.payload);
+    let state = shifts.get(context.component.path);
+    if (!state) {
+      state = { mode: config.mode, randomState: hashPath9(context.component.path) };
+      shifts.set(context.component.path, state);
+    }
+    if (context.beat && config.randomizeOnBeat) {
+      state.randomState = xorshift323(state.randomState);
+      state.mode = CHANNEL_MODES[state.randomState % CHANNEL_MODES.length];
+    }
+    shiftChannels(context, state.mode);
+  });
+  registry.registerApe(AVS_COLOR_REDUCTION_APE_ID, (context) => {
+    if (context.preinit) return;
+    reduceColors(context, decodeAvsColorReduction(context.component.payload).levels);
+  });
+  registry.registerApe(AVS_MULTIPLIER_APE_ID, (context) => {
+    if (context.preinit) return;
+    multiplyColors(context, decodeAvsMultiplier(context.component.payload).mode);
+  });
+  return registry;
+}
+function shiftChannels(context, mode4) {
+  if (mode4 === 1183 || !CHANNEL_MODES.includes(mode4)) return;
+  for (let i = 0; i < context.input.pixels.length; i++) {
+    const pixel = context.input.pixels[i];
+    const red = pixel >>> 16 & 255;
+    const green = pixel >>> 8 & 255;
+    const blue = pixel & 255;
+    let next;
+    switch (mode4) {
+      case 1020:
+        next = [red, blue, green];
+        break;
+      // RBG
+      case 1018:
+        next = [green, blue, red];
+        break;
+      // GBR
+      case 1022:
+        next = [green, red, blue];
+        break;
+      // GRB
+      case 1019:
+        next = [blue, red, green];
+        break;
+      // BRG
+      case 1021:
+        next = [blue, green, red];
+        break;
+      // BGR
+      default:
+        next = [red, green, blue];
+        break;
+    }
+    context.input.pixels[i] = next[0] << 16 | next[1] << 8 | next[2];
+  }
+}
+function reduceColors(context, rawLevels) {
+  const levels = clamp18(Math.trunc(rawLevels), 0, 8);
+  const mask = levels === 0 ? 0 : 255 << 8 - levels & 255;
+  const rgbMask = mask | mask << 8 | mask << 16;
+  for (let i = 4; i < context.input.pixels.length; i++) {
+    context.input.pixels[i] = context.input.pixels[i] & rgbMask;
+  }
+}
+function multiplyColors(context, mode4) {
+  const pixels = context.input.pixels;
+  if (mode4 === 0 || mode4 === 7) {
+    for (let i = pixels.length - 1; i >= 1; i--) {
+      const pixel = pixels[i] & 16777215;
+      pixels[i] = mode4 === 0 ? pixel === 0 ? 0 : 16777215 : pixel === 16777215 ? 16777215 : 0;
+    }
+    return;
+  }
+  if (mode4 < 1 || mode4 > 6) return;
+  const end = pixels.length - (pixels.length & 1);
+  for (let i = 0; i < end; i++) {
+    const pixel = pixels[i];
+    if (mode4 <= 3) {
+      const factor = 1 << 4 - mode4;
+      pixels[i] = channels5(pixel, (value) => Math.min(255, value * factor));
+    } else {
+      const shift = mode4 - 3;
+      pixels[i] = channels5(pixel, (value) => value >>> shift);
+    }
+  }
+}
+function channels5(pixel, fn) {
+  const blue = fn(pixel & 255);
+  const green = fn(pixel >>> 8 & 255);
+  const red = fn(pixel >>> 16 & 255);
+  return blue | green << 8 | red << 16;
+}
+function readI323(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+}
+function nulText6(bytes) {
+  const end = bytes.indexOf(0);
+  return new TextDecoder("windows-1252").decode(end < 0 ? bytes : bytes.subarray(0, end));
+}
+function clamp18(value, minimum, maximum) {
+  return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+function hashPath9(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+function xorshift323(value) {
+  let state = value || 1831565813;
+  state ^= state << 13;
+  state ^= state >>> 17;
+  state ^= state << 5;
+  return state >>> 0;
+}
+
+// src/avs/effects/scripted-transforms.ts
+var TEXT5 = new TextDecoder("windows-1252");
+function decodeAvsDynamicColorModifier(payload) {
+  const decoded = decodeScripts(payload, 4);
+  return {
+    level: decoded.scripts[0],
+    frame: decoded.scripts[1],
+    beat: decoded.scripts[2],
+    init: decoded.scripts[3],
+    recompute: i327(payload, decoded.offset, 1) !== 0
+  };
+}
+function decodeAvsDynamicShift(payload) {
+  const decoded = decodeScripts(payload, 3);
+  return {
+    init: decoded.scripts[0],
+    frame: decoded.scripts[1],
+    beat: decoded.scripts[2],
+    blend: i327(payload, decoded.offset, 0) !== 0,
+    subpixel: i327(payload, decoded.offset + 4, 1) !== 0
+  };
+}
+function decodeAvsDynamicDistanceModifier(payload) {
+  const decoded = decodeScripts(payload, 4);
+  return {
+    point: decoded.scripts[0],
+    frame: decoded.scripts[1],
+    beat: decoded.scripts[2],
+    init: decoded.scripts[3],
+    blend: i327(payload, decoded.offset, 0) !== 0,
+    subpixel: i327(payload, decoded.offset + 4, 0) !== 0
+  };
+}
+function decodeAvsUniqueTone(payload) {
+  return {
+    enabled: i327(payload, 0, 1) !== 0,
+    color: i327(payload, 4, 16777215) & 16777215,
+    additive: i327(payload, 8, 0) !== 0,
+    average: i327(payload, 12, 0) !== 0,
+    invert: i327(payload, 16, 0) !== 0
+  };
+}
+function registerAvsScriptedTransforms(registry) {
+  registerDynamicColorModifier(registry);
+  registerDynamicShift(registry);
+  registerDynamicDistanceModifier(registry);
+  registerUniqueTone(registry);
+  return registry;
+}
+function registerDynamicColorModifier(registry) {
+  const states = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(45, (context) => {
+    const config = decodeAvsDynamicColorModifier(context.component.payload);
+    let state = states.get(context.component.path);
+    if (!state) {
+      state = {
+        vm: createVm(registry, context.component.path),
+        programs: compilePrograms([config.level, config.frame, config.beat, config.init]),
+        initialized: false,
+        red: new Uint8Array(256),
+        green: new Uint8Array(256),
+        blue: new Uint8Array(256),
+        tableValid: false
+      };
+      states.set(context.component.path, state);
+    }
+    if (context.preinit) return;
+    configureVm2(state.vm, context);
+    state.vm.set("beat", context.beat ? 1 : 0);
+    if (!state.initialized) {
+      execute4(state.programs[3], state.vm);
+      state.initialized = true;
+    }
+    execute4(state.programs[1], state.vm);
+    if (context.beat) execute4(state.programs[2], state.vm);
+    if (config.recompute || !state.tableValid) {
+      for (let value = 0; value < 256; value++) {
+        const normalized = value / 255;
+        state.vm.set("red", normalized);
+        state.vm.set("green", normalized);
+        state.vm.set("blue", normalized);
+        execute4(state.programs[0], state.vm);
+        state.red[value] = eelChannel(state.vm.get("red"));
+        state.green[value] = eelChannel(state.vm.get("green"));
+        state.blue[value] = eelChannel(state.vm.get("blue"));
+      }
+      state.tableValid = true;
+    }
+    const pixels = context.input.pixels;
+    for (let i = 0; i < pixels.length; i++) {
+      const pixel = pixels[i];
+      pixels[i] = state.blue[pixel & 255] | state.green[pixel >>> 8 & 255] << 8 | state.red[pixel >>> 16 & 255] << 16;
+    }
+  });
+}
+function registerDynamicShift(registry) {
+  const states = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(42, (context) => {
+    const config = decodeAvsDynamicShift(context.component.payload);
+    let state = states.get(context.component.path);
+    if (!state) {
+      state = {
+        vm: createVm(registry, context.component.path),
+        programs: compilePrograms([config.init, config.frame, config.beat]),
+        initialized: false,
+        width: 0,
+        height: 0
+      };
+      states.set(context.component.path, state);
+    }
+    configureVm2(state.vm, context);
+    state.vm.set("w", context.input.width);
+    state.vm.set("h", context.input.height);
+    state.vm.set("b", context.beat ? 1 : 0);
+    if (context.preinit) return;
+    if (!state.initialized || state.width !== context.input.width || state.height !== context.input.height) {
+      state.width = context.input.width;
+      state.height = context.input.height;
+      state.vm.set("x", 0);
+      state.vm.set("y", 0);
+      state.vm.set("alpha", 0.5);
+      execute4(state.programs[0], state.vm);
+      state.initialized = true;
+    }
+    execute4(state.programs[1], state.vm);
+    if (context.beat) execute4(state.programs[2], state.vm);
+    let doBlend = config.blend;
+    const alpha = Math.trunc(state.vm.get("alpha") * 255);
+    if (doBlend && alpha <= 0) return;
+    if (doBlend && alpha >= 255) doBlend = false;
+    if (config.subpixel && context.input.width > 1 && context.input.height > 1) {
+      renderSubpixelShift(context, state.vm.get("x"), state.vm.get("y"), doBlend, alpha);
+    } else {
+      renderNearestShift(context, Math.trunc(state.vm.get("x")), Math.trunc(state.vm.get("y")), doBlend, alpha);
+    }
+    return { swap: true };
+  });
+}
+function renderNearestShift(context, shiftX, shiftY, blend2, alpha) {
+  const { width, height } = context.input;
+  const source3 = context.input.pixels;
+  const output = context.output.pixels;
+  for (let y = 0; y < height; y++) {
+    const sourceY = y - shiftY;
+    for (let x = 0; x < width; x++) {
+      const index = x + y * width;
+      const sourceX = x - shiftX;
+      const shifted = sourceX >= 0 && sourceX < width && sourceY >= 0 && sourceY < height ? source3[sourceX + sourceY * width] : 0;
+      output[index] = blend2 ? blendPixel(shifted, source3[index], "adjustable", alpha) : shifted;
+    }
+  }
+}
+function renderSubpixelShift(context, vx, vy, blend2, alpha) {
+  const { width, height } = context.input;
+  const source3 = context.input.pixels;
+  const output = context.output.pixels;
+  let shiftX = Math.trunc(vx);
+  let shiftY = Math.trunc(vy);
+  let xPartial = Math.trunc((vx - shiftX) * 255);
+  let yPartial = Math.trunc((vy - shiftY) * 255);
+  if (xPartial < 0) xPartial = -xPartial;
+  else {
+    shiftX++;
+    xPartial = 255 - xPartial;
+  }
+  if (yPartial < 0) yPartial = -yPartial;
+  else {
+    shiftY++;
+    yPartial = 255 - yPartial;
+  }
+  xPartial = clamp19(xPartial, 0, 255);
+  yPartial = clamp19(yPartial, 0, 255);
+  shiftX = clamp19(shiftX, 1 - width, width - 1);
+  shiftY = clamp19(shiftY, 1 - height, height - 1);
+  const endX = clamp19(width - 1 + shiftX, 0, width - 1);
+  const endY = clamp19(height - 1 + shiftY, 0, height - 1);
+  const startX = Math.max(0, shiftX);
+  const startY = Math.max(0, shiftY);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const index = x + y * width;
+      let shifted = 0;
+      if (x >= startX && x < endX && y >= startY && y < endY) {
+        const sourceX = x - shiftX;
+        const sourceY = y - shiftY;
+        shifted = sampleBilinear2(source3, sourceX + sourceY * width, width, xPartial, yPartial);
+      }
+      output[index] = blend2 ? blendPixel(shifted, source3[index], "adjustable", alpha) : shifted;
+    }
+  }
+}
+function registerDynamicDistanceModifier(registry) {
+  const states = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(35, (context) => {
+    const config = decodeAvsDynamicDistanceModifier(context.component.payload);
+    let state = states.get(context.component.path);
+    if (!state) {
+      state = {
+        vm: createVm(registry, context.component.path),
+        programs: compilePrograms([config.point, config.frame, config.beat, config.init]),
+        initialized: false
+      };
+      states.set(context.component.path, state);
+    }
+    if (context.preinit) return;
+    configureVm2(state.vm, context);
+    state.vm.set("b", context.beat ? 1 : 0);
+    if (!state.initialized) {
+      execute4(state.programs[3], state.vm);
+      state.initialized = true;
+    }
+    execute4(state.programs[1], state.vm);
+    if (context.beat) execute4(state.programs[2], state.vm);
+    renderDynamicDistance(context, config, state);
+    return { swap: true };
+  });
+}
+function renderDynamicDistance(context, config, state) {
+  const { width, height } = context.input;
+  const maxDistance = Math.sqrt((width * width + height * height) / 4);
+  const tableLength = Math.max(33, Math.trunc(maxDistance + 32.9));
+  const distanceTable = new Int32Array(tableLength);
+  if (state.programs[0]) {
+    const computed = tableLength - 32;
+    for (let distance = 0; distance < computed; distance++) {
+      state.vm.set("d", distance / (maxDistance - 1));
+      execute4(state.programs[0], state.vm);
+      distanceTable[distance] = Math.trunc(state.vm.get("d") * 256 * maxDistance / (distance + 1));
+    }
+    const last2 = distanceTable[Math.max(0, computed - 1)];
+    for (let distance = computed; distance < tableLength; distance++) distanceTable[distance] = last2;
+  }
+  const source3 = context.input.pixels;
+  const output = context.output.pixels;
+  const halfWidth = Math.trunc(width / 2);
+  const halfHeight = Math.trunc(height / 2);
+  const bilinear3 = config.subpixel && width > 1 && height > 1;
+  for (let y = 0; y < height; y++) {
+    const relativeY = y - halfHeight;
+    let radiusSquared = halfWidth * halfWidth + halfWidth + relativeY * relativeY + 256;
+    let radiusDelta = -2 * halfWidth;
+    let relativeX = -halfWidth;
+    for (let x = 0; x < width; x++) {
+      const scale = distanceTable[Math.min(tableLength - 1, avsIntegerSquareRoot(radiusSquared))];
+      const scaledX = scale * relativeX + 128;
+      const scaledY = scale * relativeY + 128;
+      let sourceX = halfWidth + (scaledX >> 8);
+      let sourceY = halfHeight + (scaledY >> 8);
+      let sampled;
+      if (bilinear3) {
+        sourceX = clamp19(sourceX, 0, width - 2);
+        sourceY = clamp19(sourceY, 0, height - 2);
+        sampled = sampleBilinear2(source3, sourceX + sourceY * width, width, scaledX & 255, scaledY & 255);
+      } else {
+        sourceX = clamp19(sourceX, 0, width - 1);
+        sourceY = clamp19(sourceY, 0, height - 1);
+        sampled = source3[sourceX + sourceY * width];
+      }
+      const index = x + y * width;
+      output[index] = config.blend ? averagePixel4(sampled, source3[index]) : sampled;
+      radiusSquared += radiusDelta;
+      radiusDelta += 2;
+      relativeX++;
+    }
+  }
+}
+function registerUniqueTone(registry) {
+  registry.registerBuiltin(38, (context) => {
+    const config = decodeAvsUniqueTone(context.component.payload);
+    if (!config.enabled || context.preinit) return;
+    const red = config.color >>> 16 & 255;
+    const green = config.color >>> 8 & 255;
+    const blue = config.color & 255;
+    const pixels = context.input.pixels;
+    for (let i = 0; i < pixels.length; i++) {
+      const original = pixels[i];
+      let depth = Math.max(original & 255, original >>> 8 & 255, original >>> 16 & 255);
+      if (config.invert) depth = 255 - depth;
+      const tone = table6(depth, blue) | table6(depth, green) << 8 | table6(depth, red) << 16;
+      pixels[i] = config.additive ? blendPixel(tone, original, "additive") : config.average ? averagePixel4(original, tone) : tone;
+    }
+  });
+}
+function createVm(registry, path) {
+  return new AvsEelVm({ global: registry.eelGlobal, seed: hashPath10(path) });
+}
+function configureVm2(vm, context) {
+  vm.setHost({
+    getosc: (band, width, channel) => avsAudioSample(context.audio, "osc", band, width, channel),
+    getspec: (band, width, channel) => avsAudioSample(context.audio, "spec", band, width, channel)
+  });
+}
+function decodeScripts(payload, count) {
+  const scripts = new Array(count).fill("");
+  if (payload[0] === 1) {
+    let offset = 1;
+    for (let i = 0; i < count; i++) {
+      if (offset + 4 > payload.length) return { scripts, offset: payload.length };
+      const length = i327(payload, offset, 0);
+      offset += 4;
+      if (length > 0 && offset + length <= payload.length) {
+        scripts[i] = nulText7(payload.subarray(offset, offset + length));
+        offset += length;
+      }
+    }
+    return { scripts, offset };
+  }
+  const bytes = count * 256;
+  if (payload.length >= bytes) {
+    for (let i = 0; i < count; i++) scripts[i] = nulText7(payload.subarray(i * 256, (i + 1) * 256));
+    return { scripts, offset: bytes };
+  }
+  return { scripts, offset: 0 };
+}
+function compilePrograms(sources) {
+  return sources.map((source3) => {
+    if (!source3.trim()) return null;
+    try {
+      return compileAvsEel(source3);
+    } catch {
+      return null;
+    }
+  });
+}
+function execute4(program, vm) {
+  return program ? vm.execute(program) : 0;
+}
+function avsIntegerSquareRoot(value) {
+  const n = value >>> 0;
+  const sq = (index) => Math.trunc(Math.sqrt(index) * 16);
+  if (n >= 65536) {
+    if (n >= 16777216) {
+      if (n >= 268435456) return n >= 1073741824 ? sq(n >>> 24) << 8 : sq(n >>> 22) << 7;
+      return n >= 67108864 ? sq(n >>> 20) << 6 : sq(n >>> 18) << 5;
+    }
+    if (n >= 1048576) return n >= 4194304 ? sq(n >>> 16) << 4 : sq(n >>> 14) << 3;
+    return n >= 262144 ? sq(n >>> 12) << 2 : sq(n >>> 10) << 1;
+  }
+  if (n >= 256) {
+    if (n >= 4096) return n >= 16384 ? sq(n >>> 8) : sq(n >>> 6) >>> 1;
+    return n >= 1024 ? sq(n >>> 4) >>> 2 : sq(n >>> 2) >>> 3;
+  }
+  return Math.trunc(Math.sqrt(n));
+}
+function sampleBilinear2(source3, offset, width, xp, yp) {
+  const weights = [table6(255 - xp, 255 - yp), table6(xp, 255 - yp), table6(255 - xp, yp), table6(xp, yp)];
+  const pixels = [source3[offset], source3[offset + 1], source3[offset + width], source3[offset + width + 1]];
+  let result = 0;
+  for (let shift = 0; shift <= 16; shift += 8) {
+    let value = 0;
+    for (let i = 0; i < 4; i++) value += table6(pixels[i] >>> shift & 255, weights[i]);
+    result |= (value & 255) << shift;
+  }
+  return result;
+}
+function eelChannel(value) {
+  return clamp19(Math.trunc(value * 255 + 0.5), 0, 255);
+}
+function averagePixel4(a, b) {
+  return (a >>> 1 & 8355711) + (b >>> 1 & 8355711) & 16777215;
+}
+function table6(x, y) {
+  return Math.trunc(x / 255 * y);
+}
+function i327(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+}
+function nulText7(bytes) {
+  const end = bytes.indexOf(0);
+  return TEXT5.decode(end < 0 ? bytes : bytes.subarray(0, end));
+}
+function clamp19(value, minimum, maximum) {
+  return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+function hashPath10(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+
+// src/avs/effects/superscope.ts
+var TEXT6 = new TextDecoder("windows-1252");
+var MAX_POINTS = 128 * 1024;
+function decodeAvsSuperScope(payload) {
+  let offset = 0;
+  let scripts = ["", "", "", ""];
+  if (payload[0] === 1) {
+    offset = 1;
+    for (let i = 0; i < 4; i++) {
+      const decoded = readString3(payload, offset);
+      scripts[i] = decoded.value;
+      offset = decoded.next;
+    }
+  } else if (payload.length >= 1024) {
+    scripts = [0, 256, 512, 768].map((start) => nulText8(payload.subarray(start, start + 256)));
+    offset = 1024;
+  }
+  const channel = readI324(payload, offset, 2);
+  offset += 4;
+  const declaredColors = readI324(payload, offset, 1);
+  offset += 4;
+  const colors = [];
+  if (declaredColors >= 0 && declaredColors <= 16) {
+    for (let i = 0; i < declaredColors && offset + 4 <= payload.length; i++, offset += 4) {
+      colors.push(readI324(payload, offset, 0) & 16777215);
+    }
+  }
+  const mode4 = readI324(payload, offset, 0);
+  return {
+    point: scripts[0],
+    frame: scripts[1],
+    beat: scripts[2],
+    init: scripts[3],
+    channel,
+    colors,
+    lines: mode4 !== 0
+  };
+}
+function registerAvsSuperScope(registry, global = registry.eelGlobal) {
+  const states = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(36, (context) => {
+    let state = states.get(context.component.path);
+    if (!state) {
+      const config = decodeAvsSuperScope(context.component.payload);
+      const vm = new AvsEelVm({ global, seed: hashPath11(context.component.path) });
+      vm.set("n", 100);
+      state = {
+        vm,
+        programs: [
+          compileOrNull4(config.point),
+          compileOrNull4(config.frame),
+          compileOrNull4(config.beat),
+          compileOrNull4(config.init)
+        ],
+        initialized: false,
+        colorPosition: 0
+      };
+      states.set(context.component.path, state);
+    }
+    if (context.preinit) return;
+    renderSuperScope(context, decodeAvsSuperScope(context.component.payload), state);
+  });
+  return registry;
+}
+function renderSuperScope(context, config, state) {
+  if (config.colors.length === 0) return;
+  const { vm } = state;
+  vm.setHost({
+    getosc: (band, width, channel) => avsAudioSample(context.audio, "osc", band, width, channel),
+    getspec: (band, width, channel) => avsAudioSample(context.audio, "spec", band, width, channel)
+  });
+  state.colorPosition++;
+  if (state.colorPosition >= config.colors.length * 64) state.colorPosition = 0;
+  const color = interpolatedColor(config.colors, state.colorPosition);
+  vm.set("h", context.input.height);
+  vm.set("w", context.input.width);
+  vm.set("b", context.beat ? 1 : 0);
+  vm.set("blue", (color & 255) / 255);
+  vm.set("green", (color >>> 8 & 255) / 255);
+  vm.set("red", (color >>> 16 & 255) / 255);
+  vm.set("skip", 0);
+  vm.set("linesize", context.line.lineWidth >>> 0 & 255);
+  vm.set("drawmode", config.lines ? 1 : 0);
+  if (!state.initialized) {
+    execute5(state.programs[3], vm);
+    state.initialized = true;
+  }
+  execute5(state.programs[1], vm);
+  if (context.beat) execute5(state.programs[2], vm);
+  if (!state.programs[0]) return;
+  const count = Math.min(MAX_POINTS, Math.trunc(vm.get("n")));
+  if (count <= 0) return;
+  const data = scopeChannel(context, config.channel);
+  const xor = (config.channel & 4) !== 0 ? 0 : 128;
+  let canDraw = false;
+  let lastX = 0;
+  let lastY = 0;
+  for (let index = 0; index < count; index++) {
+    const audioPosition = index * 576 / count;
+    const sourceIndex = Math.trunc(audioPosition);
+    const fraction = audioPosition - sourceIndex;
+    const a = data[Math.min(575, sourceIndex)] ^ xor;
+    const b = data[Math.min(575, sourceIndex + 1)] ^ xor;
+    vm.set("v", (a * (1 - fraction) + b * fraction) / 128 - 1);
+    vm.set("i", count === 1 ? 0 : index / (count - 1));
+    vm.set("skip", 0);
+    execute5(state.programs[0], vm);
+    const x = Math.trunc((vm.get("x") + 1) * context.input.width * 0.5);
+    const y = Math.trunc((vm.get("y") + 1) * context.input.height * 0.5);
+    if (vm.get("skip") < 1e-5) {
+      const drawColor = makeByte(vm.get("blue")) | makeByte(vm.get("green")) << 8 | makeByte(vm.get("red")) << 16;
+      if (vm.get("drawmode") < 1e-5) {
+        drawPoint(context, x, y, drawColor);
+      } else if (canDraw && (drawColor !== 0 || context.line.blendMode !== 1)) {
+        drawLine2(context, lastX, lastY, x, y, drawColor, Math.trunc(vm.get("linesize") + 0.5));
+      }
+    }
+    canDraw = true;
+    lastX = x;
+    lastY = y;
+  }
+}
+function scopeChannel(context, selection) {
+  const source3 = (selection & 4) !== 0 ? context.audio.spectrum : context.audio.waveform;
+  const channel = selection & 3;
+  if (channel < 2) return source3[channel];
+  const centered = new Uint8Array(576);
+  for (let i = 0; i < centered.length; i++) {
+    centered[i] = Math.trunc(signed3(source3[0][i]) / 2) + Math.trunc(signed3(source3[1][i]) / 2) & 255;
+  }
+  return centered;
+}
+function drawPoint(context, x, y, color) {
+  if (x < 0 || y < 0 || x >= context.input.width || y >= context.input.height) return;
+  const index = x + y * context.input.width;
+  context.input.pixels[index] = blendLine(color, context.input.pixels[index], context.line.blendMode, context.line.adjustableAlpha);
+}
+function drawLine2(context, x1, y1, x2, y2, color, requestedWidth) {
+  const width = context.input.width;
+  const height = context.input.height;
+  const dx = Math.abs(x2 - x1);
+  const dy = Math.abs(y2 - y1);
+  const lineWidth = clamp20(requestedWidth, 1, 255);
+  const half = Math.trunc(lineWidth / 2);
+  const plot2 = (x, y) => {
+    if (x < 0 || y < 0 || x >= width || y >= height) return;
+    const index = x + y * width;
+    context.input.pixels[index] = blendLine(color, context.input.pixels[index], context.line.blendMode, context.line.adjustableAlpha);
+  };
+  if (dx === 0) {
+    for (let y = Math.max(Math.min(y1, y2), 0); y < Math.min(Math.max(y1, y2), height - 1); y++) {
+      for (let x = x1 - half; x < x1 - half + lineWidth; x++) plot2(x, y);
+    }
+    return;
+  }
+  if (y1 === y2) {
+    for (let y = y1 - half; y < y1 - half + lineWidth; y++) {
+      for (let x = Math.max(Math.min(x1, x2), 0); x < Math.min(Math.max(x1, x2), width - 1); x++) plot2(x, y);
+    }
+    return;
+  }
+  if (dy <= dx) {
+    if (x2 < x1) {
+      [x1, x2] = [x2, x1];
+      [y1, y2] = [y2, y1];
+    }
+    const yIncrement = y2 > y1 ? 1 : -1;
+    let y = y1 - half;
+    let decision = 2 * dy - dx;
+    const east = 2 * dy;
+    const northEast = decision - dx;
+    while (x1 < x2) {
+      for (let py = y; py < y + lineWidth; py++) plot2(x1, py);
+      if (decision < 0) decision += east;
+      else {
+        decision += northEast;
+        y += yIncrement;
+      }
+      x1++;
+    }
+  } else {
+    if (y2 < y1) {
+      [x1, x2] = [x2, x1];
+      [y1, y2] = [y2, y1];
+    }
+    const xIncrement = x2 > x1 ? 1 : -1;
+    let x = x1 - half;
+    let decision = 2 * dx - dy;
+    const east = 2 * dx;
+    const northEast = decision - dy;
+    while (y1 < y2) {
+      for (let px = x; px < x + lineWidth; px++) plot2(px, y1);
+      if (decision < 0) decision += east;
+      else {
+        decision += northEast;
+        x += xIncrement;
+      }
+      y1++;
+    }
+  }
+}
+function execute5(program, vm) {
+  return program ? vm.execute(program) : 0;
+}
+function compileOrNull4(source3) {
+  if (!source3.trim()) return null;
+  try {
+    return compileAvsEel(source3);
+  } catch {
+    return null;
+  }
+}
+function interpolatedColor(colors, position) {
+  const index = Math.trunc(position / 64);
+  const fraction = position & 63;
+  const first = colors[index];
+  const second = colors[(index + 1) % colors.length];
+  const channel = (shift) => Math.trunc(
+    ((first >>> shift & 255) * (63 - fraction) + (second >>> shift & 255) * fraction) / 64
+  );
+  return channel(0) | channel(8) << 8 | channel(16) << 16;
+}
+function readString3(payload, offset) {
+  if (offset + 4 > payload.length) return { value: "", next: payload.length };
+  const length = readU32(payload, offset, 0);
+  const start = offset + 4;
+  const end = Math.min(payload.length, start + length);
+  return { value: nulText8(payload.subarray(start, end)), next: end };
+}
+function readI324(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+}
+function readU32(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(offset, true) : fallback;
+}
+function nulText8(bytes) {
+  const end = bytes.indexOf(0);
+  return TEXT6.decode(end < 0 ? bytes : bytes.subarray(0, end));
+}
+function signed3(value) {
+  return value < 128 ? value : value - 256;
+}
+function makeByte(value) {
+  return value <= 0 ? 0 : value >= 1 ? 255 : Math.trunc(value * 255);
+}
+function clamp20(value, minimum, maximum) {
+  return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+function hashPath11(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+
+// src/avs/effects/text.ts
+var WINDOWS_1252 = new TextDecoder("windows-1252");
+var CHOOSEFONT32_BYTES = 60;
+var LOGFONTA_BYTES = 60;
+function decodeAvsText(payload) {
+  let offset = 0;
+  const read = (fallback) => {
+    const value = i328(payload, offset, fallback);
+    offset += 4;
+    return value;
+  };
+  const enabled = read(1) !== 0;
+  const color = read(16777215) & 16777215;
+  const additive = read(0) !== 0;
+  const average = read(0) !== 0;
+  const onBeat = read(0) !== 0;
+  const insertBlank = read(0) !== 0;
+  const randomPosition = read(0) !== 0;
+  const verticalAlign = read(4);
+  const horizontalAlign = read(1);
+  const beatFrames = read(15);
+  const normalFrames = read(15);
+  const chooseFont = fixedBytes(payload, offset, CHOOSEFONT32_BYTES);
+  offset += CHOOSEFONT32_BYTES;
+  const logFont = fixedBytes(payload, offset, LOGFONTA_BYTES);
+  offset += LOGFONTA_BYTES;
+  const textLength = read(0);
+  let text = "";
+  if (textLength > 0 && offset + textLength <= payload.length) {
+    text = nulText9(payload.subarray(offset, offset + textLength));
+    offset += textLength;
+  }
+  return {
+    enabled,
+    color,
+    additive,
+    average,
+    onBeat,
+    insertBlank,
+    randomPosition,
+    verticalAlign,
+    horizontalAlign,
+    beatFrames,
+    normalFrames,
+    font: decodeFont(chooseFont, logFont),
+    text,
+    outline: read(0) !== 0,
+    outlineColor: read(0) & 16777215,
+    horizontalShiftPercent: read(0),
+    verticalShiftPercent: read(0),
+    outlineSize: read(1),
+    randomWord: read(0) !== 0,
+    shadow: read(0) !== 0
+  };
+}
+function registerAvsText(registry, options = {}) {
+  const states = /* @__PURE__ */ new Map();
+  const rasterize = options.rasterize ?? rasterizePortableText;
+  registry.registerBuiltin(28, (context) => {
+    const config = decodeAvsText(context.component.payload);
+    if (!config.enabled || context.preinit) return;
+    let state = states.get(context.component.path);
+    if (!state) {
+      state = {
+        currentWord: 0,
+        beatFrames: 0,
+        normalFrames: 0,
+        oddEven: 0,
+        horizontalAlign: config.horizontalAlign,
+        verticalAlign: config.verticalAlign,
+        horizontalShift: config.horizontalShiftPercent,
+        verticalShift: config.verticalShiftPercent,
+        randomState: hashPath12(context.component.path)
+      };
+      states.set(context.component.path, state);
+    }
+    const shouldAdvance = !config.onBeat && state.normalFrames >= config.normalFrames || config.onBeat && context.beat && state.beatFrames === 0;
+    const words = config.text.split(";");
+    if (shouldAdvance) {
+      if (!(config.insertBlank && state.oddEven % 2 === 0)) {
+        state.currentWord = config.randomWord ? randomBound2(state, options.random, words.length) : (state.currentWord + 1) % words.length;
+      }
+      state.oddEven = (state.oddEven + 1) % 2;
+    }
+    if (config.onBeat && context.beat && state.beatFrames === 0) state.beatFrames = config.beatFrames;
+    let text = expandText(words[state.currentWord] ?? "", registry, options);
+    if (config.insertBlank && state.oddEven === 0) text = "";
+    if (shouldAdvance) {
+      state.normalFrames = 0;
+      if (config.randomPosition) {
+        const measured = rasterize({
+          ...request(config, context, text, 0, 0),
+          horizontalAlign: 0,
+          verticalAlign: 0
+        });
+        state.horizontalAlign = 0;
+        state.verticalAlign = 0;
+        if (measured.textWidth < context.input.width) {
+          const bound = Math.trunc((context.input.width - measured.textWidth) / context.input.width * 100);
+          state.horizontalShift = randomBound2(state, options.random, bound);
+        }
+        if (measured.textHeight < context.input.height) {
+          const bound = Math.trunc((context.input.height - measured.textHeight) / context.input.height * 100);
+          state.verticalShift = randomBound2(state, options.random, bound);
+        }
+      } else {
+        state.horizontalAlign = config.horizontalAlign;
+        state.verticalAlign = config.verticalAlign;
+        state.horizontalShift = config.horizontalShiftPercent;
+        state.verticalShift = config.verticalShiftPercent;
+      }
+    }
+    if (!(config.onBeat && state.beatFrames === 0)) {
+      const bitmap = rasterize(request(
+        config,
+        context,
+        text,
+        state.horizontalShift,
+        state.verticalShift,
+        state.horizontalAlign,
+        state.verticalAlign
+      ));
+      if (bitmap.pixels.length !== context.input.pixels.length || bitmap.mask.length !== bitmap.pixels.length) {
+        throw new RangeError("AVS Text rasterizer returned a bitmap with the wrong dimensions");
+      }
+      for (let i = 0; i < bitmap.pixels.length; i++) {
+        if (!bitmap.mask[i]) continue;
+        const rendered = bitmap.pixels[i];
+        const original = context.input.pixels[i];
+        context.input.pixels[i] = config.additive ? blendPixel(rendered, original, "additive") : config.average ? blendPixel(rendered, original, "average") : rendered;
+      }
+    }
+    if (!config.onBeat) state.normalFrames++;
+    if (config.onBeat && state.beatFrames) state.beatFrames--;
+  });
+  return registry;
+}
+function request(config, context, text, horizontalShiftPercent, verticalShiftPercent, horizontalAlign = config.horizontalAlign, verticalAlign = config.verticalAlign) {
+  return {
+    width: context.input.width,
+    height: context.input.height,
+    text,
+    color: config.color,
+    outline: config.outline,
+    shadow: config.shadow,
+    outlineColor: config.outlineColor,
+    outlineSize: config.outlineSize,
+    horizontalAlign,
+    verticalAlign,
+    horizontalShiftPercent,
+    verticalShiftPercent,
+    font: config.font
+  };
+}
+function expandText(text, registry, options) {
+  return text.replace(/\$\(([^)]*)\)/gi, (whole, body) => {
+    const lower = body.toLowerCase();
+    if (lower.startsWith("playpos")) return formatTime(options.playbackPositionMs?.() ?? 0, lower);
+    if (lower.startsWith("playlen")) return formatTime(options.playbackLengthMs?.() ?? 0, lower);
+    if (lower.startsWith("title")) {
+      let title = (options.title?.() ?? "").replace(/\s*- Winamp\s*$/i, "");
+      const specification = lower.slice(5);
+      const noNumber = specification.startsWith(":n");
+      if (!noNumber) title = title.replace(/^\d+\.\s+/, "");
+      const maximum = Number.parseInt(specification.replace(/^:n?/, ""), 10);
+      return maximum > 0 ? title.slice(0, maximum) : title;
+    }
+    const register = /^reg(\d\d)(?::([0-9]*)(?:\.([0-9]+))?)?$/.exec(lower);
+    if (register) {
+      const value = registry.eelGlobal.registers[Number(register[1])] ?? 0;
+      const precision = register[3] === void 0 ? 6 : Number(register[3]);
+      const formatted = value.toFixed(precision);
+      const width = Number(register[2] ?? 0);
+      return width > formatted.length ? formatted.padStart(width) : formatted;
+    }
+    return whole;
+  }).slice(0, 255);
+}
+function formatTime(milliseconds, specification) {
+  const digits = clamp21(Number.parseInt(specification.split(".")[1] ?? "0", 10) || 0, 0, 3);
+  const value = Math.max(0, Math.trunc(milliseconds));
+  const base2 = `${Math.trunc(value / 6e4)}:${String(Math.trunc(value / 1e3) % 60).padStart(2, "0")}`;
+  return digits ? `${base2}.${String(value % 1e3).padStart(3, "0").slice(0, digits)}` : base2;
+}
+function rasterizePortableText(request2) {
+  const pixels = new Uint32Array(request2.width * request2.height);
+  const mask = new Uint8Array(pixels.length);
+  const scale = Math.max(1, Math.trunc(Math.abs(request2.font.height || 7) / 7));
+  const glyphWidth = 6 * scale;
+  const textWidth = Math.max(0, request2.text.length * glyphWidth - scale);
+  const textHeight = 7 * scale;
+  let left = request2.horizontalAlign === 2 ? request2.width - textWidth : request2.horizontalAlign === 1 ? Math.trunc((request2.width - textWidth) / 2) : 0;
+  let top = (request2.verticalAlign & 8) !== 0 ? request2.height - textHeight : (request2.verticalAlign & 4) !== 0 ? Math.trunc((request2.height - textHeight) / 2) : 0;
+  left += Math.trunc(request2.horizontalShiftPercent * request2.width / 100);
+  top += Math.trunc(request2.verticalShiftPercent * request2.height / 100);
+  const foreground = new Uint8Array(pixels.length);
+  for (let index = 0; index < request2.text.length; index++) {
+    const glyph = glyphFor(request2.text[index]);
+    for (let row = 0; row < 7; row++) for (let column = 0; column < 5; column++) {
+      if ((glyph[row] >>> 4 - column & 1) === 0) continue;
+      fillMask(
+        foreground,
+        request2.width,
+        request2.height,
+        left + index * glyphWidth + column * scale,
+        top + row * scale,
+        scale
+      );
+    }
+  }
+  const outlineMask = new Uint8Array(pixels.length);
+  if (request2.outline || request2.shadow) {
+    const radius = Math.max(1, Math.abs(Math.trunc(request2.outlineSize)));
+    for (let y = 0; y < request2.height; y++) for (let x = 0; x < request2.width; x++) {
+      if (!foreground[x + y * request2.width]) continue;
+      if (request2.shadow) stamp(outlineMask, request2.width, request2.height, x + radius, y + radius, 0);
+      else for (let dy = -radius; dy <= radius; dy++) for (let dx = -radius; dx <= radius; dx++) {
+        if (dx || dy) stamp(outlineMask, request2.width, request2.height, x + dx, y + dy, 0);
+      }
+    }
+  }
+  for (let i = 0; i < pixels.length; i++) {
+    if (outlineMask[i]) {
+      pixels[i] = request2.outlineColor;
+      mask[i] = 1;
+    }
+    if (foreground[i]) {
+      pixels[i] = request2.color;
+      mask[i] = 1;
+    }
+  }
+  return { pixels, mask, textWidth, textHeight };
+}
+function fillMask(mask, width, height, x, y, size) {
+  for (let dy = 0; dy < size; dy++) for (let dx = 0; dx < size; dx++) stamp(mask, width, height, x + dx, y + dy, 1);
+}
+function stamp(mask, width, height, x, y, value) {
+  if (x >= 0 && y >= 0 && x < width && y < height) mask[x + y * width] = value || 1;
+}
+function glyphFor(character) {
+  const glyph = GLYPHS[character.toUpperCase()];
+  if (glyph) return glyph;
+  const code = character.charCodeAt(0);
+  return [31, 17, code >>> 0 & 31, code >>> 2 & 31, code >>> 4 & 31, 17, 31];
+}
+var GLYPHS = {
+  " ": [0, 0, 0, 0, 0, 0, 0],
+  "!": [4, 4, 4, 4, 4, 0, 4],
+  "-": [0, 0, 0, 31, 0, 0, 0],
+  ".": [0, 0, 0, 0, 0, 6, 6],
+  ":": [0, 6, 6, 0, 6, 6, 0],
+  "0": [14, 17, 19, 21, 25, 17, 14],
+  "1": [4, 12, 4, 4, 4, 4, 14],
+  "2": [14, 17, 1, 2, 4, 8, 31],
+  "3": [30, 1, 1, 14, 1, 1, 30],
+  "4": [2, 6, 10, 18, 31, 2, 2],
+  "5": [31, 16, 16, 30, 1, 1, 30],
+  "6": [14, 16, 16, 30, 17, 17, 14],
+  "7": [31, 1, 2, 4, 8, 8, 8],
+  "8": [14, 17, 17, 14, 17, 17, 14],
+  "9": [14, 17, 17, 15, 1, 1, 14],
+  A: [14, 17, 17, 31, 17, 17, 17],
+  B: [30, 17, 17, 30, 17, 17, 30],
+  C: [14, 17, 16, 16, 16, 17, 14],
+  D: [30, 17, 17, 17, 17, 17, 30],
+  E: [31, 16, 16, 30, 16, 16, 31],
+  F: [31, 16, 16, 30, 16, 16, 16],
+  G: [14, 17, 16, 23, 17, 17, 15],
+  H: [17, 17, 17, 31, 17, 17, 17],
+  I: [14, 4, 4, 4, 4, 4, 14],
+  J: [7, 2, 2, 2, 18, 18, 12],
+  K: [17, 18, 20, 24, 20, 18, 17],
+  L: [16, 16, 16, 16, 16, 16, 31],
+  M: [17, 27, 21, 21, 17, 17, 17],
+  N: [17, 25, 21, 19, 17, 17, 17],
+  O: [14, 17, 17, 17, 17, 17, 14],
+  P: [30, 17, 17, 30, 16, 16, 16],
+  Q: [14, 17, 17, 17, 21, 18, 13],
+  R: [30, 17, 17, 30, 20, 18, 17],
+  S: [15, 16, 16, 14, 1, 1, 30],
+  T: [31, 4, 4, 4, 4, 4, 4],
+  U: [17, 17, 17, 17, 17, 17, 14],
+  V: [17, 17, 17, 17, 17, 10, 4],
+  W: [17, 17, 17, 21, 21, 21, 10],
+  X: [17, 17, 10, 4, 10, 17, 17],
+  Y: [17, 17, 10, 4, 4, 4, 4],
+  Z: [31, 1, 2, 4, 8, 16, 31]
+};
+function decodeFont(chooseFont, logFont) {
+  return {
+    height: i328(logFont, 0, 0),
+    width: i328(logFont, 4, 0),
+    weight: i328(logFont, 16, 0),
+    italic: logFont[20] !== 0,
+    underline: logFont[21] !== 0,
+    strikeout: logFont[22] !== 0,
+    face: nulText9(logFont.subarray(28, 60)),
+    rawChooseFont: chooseFont,
+    rawLogFont: logFont
+  };
+}
+function fixedBytes(payload, offset, length) {
+  const bytes = new Uint8Array(length);
+  bytes.set(payload.subarray(offset, Math.min(payload.length, offset + length)));
+  return bytes;
+}
+function randomBound2(state, hook, bound) {
+  if (bound <= 0) return 0;
+  const value = hook ? Math.trunc(hook()) >>> 0 : nextRandom4(state);
+  return value % bound;
+}
+function nextRandom4(state) {
+  let value = state.randomState || 1831565813;
+  value ^= value << 13;
+  value ^= value >>> 17;
+  value ^= value << 5;
+  state.randomState = value >>> 0;
+  return state.randomState;
+}
+function i328(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+}
+function nulText9(bytes) {
+  const end = bytes.indexOf(0);
+  return WINDOWS_1252.decode(end < 0 ? bytes : bytes.subarray(0, end));
+}
+function clamp21(value, minimum, maximum) {
+  return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+function hashPath12(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+
+// src/avs/effects/texer.ts
+var AVS_TEXER_APE_ID = "Texer";
+var AVS_TEXER_II_APE_ID = "Acko.net: Texer II";
+var TEXT7 = new TextDecoder("windows-1252");
+var MAX_TEXER_II_PARTICLES = 65536;
+function decodeAvsTexerConfig(payload) {
+  const mode4 = readI325(payload, 276, 0);
+  return {
+    image: payload.length >= 276 ? nulText10(payload.subarray(16, 276)) : "",
+    addToInput: (mode4 & 3) === 2,
+    colorize: (mode4 & 12) === 8,
+    particles: readI325(payload, 280, 100)
+  };
+}
+function decodeAvsTexer2Config(payload) {
+  const rawVersion = readI325(payload, 0, 0);
+  let offset = 280;
+  const scripts = [];
+  for (let index = 0; index < 4; index++) {
+    const decoded = readLengthString(payload, offset);
+    scripts.push(decoded.value);
+    offset = decoded.next;
+  }
+  return {
+    version: rawVersion === 1 ? 1 : 0,
+    image: payload.length >= 264 ? nulText10(payload.subarray(4, 264)) : "",
+    resize: readI325(payload, 264, 0) !== 0,
+    wrap: readI325(payload, 268, 0) !== 0,
+    colorize: readI325(payload, 272, 1) !== 0,
+    init: scripts[0],
+    frame: scripts[1],
+    beat: scripts[2],
+    point: scripts[3]
+  };
+}
+function registerAvsTexerEffects(registry = new AvsEffectRegistry(), options = {}) {
+  registry.registerApe(AVS_TEXER_APE_ID, (context) => {
+    const config = decodeAvsTexerConfig(context.component.payload);
+    const bitmap = options.bitmapResolver?.(config.image);
+    if (!bitmap) return;
+    renderTexer(context, config, bitmap);
+    return { swap: true };
+  });
+  const states = /* @__PURE__ */ new Map();
+  registry.registerApe(AVS_TEXER_II_APE_ID, (context) => {
+    const config = decodeAvsTexer2Config(context.component.payload);
+    let state = states.get(context.component.path);
+    if (!state) {
+      const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath13(context.component.path) });
+      state = {
+        vm,
+        programs: [
+          compileOrNull5(config.init),
+          compileOrNull5(config.frame),
+          compileOrNull5(config.beat),
+          compileOrNull5(config.point)
+        ],
+        initialized: false
+      };
+      states.set(context.component.path, state);
+    }
+    const bitmap = resolveTexer2Bitmap(config.image, options);
+    renderTexer2(context, config, bitmap, state);
+  });
+  return registry;
+}
+function renderTexer(context, config, bitmap) {
+  const source3 = context.input.pixels;
+  const output = context.output.pixels;
+  if (config.addToInput) output.set(source3);
+  else output.fill(0);
+  let drawn = 0;
+  for (let y = 0; y < context.input.height; y++) {
+    for (let x = 0; x < context.input.width; x++) {
+      const mask = source3[y * context.input.width + x] & 16777215;
+      if (mask === 0) continue;
+      drawTexerStamp(output, context.input.width, context.input.height, bitmap, x, y, config.colorize ? mask : null);
+      drawn++;
+      if (drawn >= config.particles) return;
+    }
+  }
+}
+function drawTexerStamp(output, width, height, bitmap, centreX, centreY, mask) {
+  const startX = centreX - Math.trunc(bitmap.width / 2);
+  const startY = centreY - Math.trunc(bitmap.height / 2);
+  for (let imageY = 0; imageY < bitmap.height; imageY++) {
+    const y = startY + imageY;
+    if (y < 0 || y >= height) continue;
+    for (let imageX = 0; imageX < bitmap.width; imageX++) {
+      const x = startX + imageX;
+      if (x < 0 || x >= width) continue;
+      let source3 = bitmap.pixels[imageY * bitmap.width + imageX];
+      if (mask !== null) source3 = filterPixel(source3, mask);
+      const index = y * width + x;
+      output[index] = blendTexerPixel(source3, output[index], 1, 0);
+    }
+  }
+}
+function renderTexer2(context, config, bitmap, state) {
+  const { vm } = state;
+  vm.setHost({
+    getosc: (band, width, channel) => avsAudioSample(context.audio, "osc", band, width, channel),
+    getspec: (band, width, channel) => avsAudioSample(context.audio, "spec", band, width, channel)
+  });
+  vm.set("i", 0);
+  vm.set("x", 0);
+  vm.set("y", 0);
+  vm.set("v", 0);
+  vm.set("w", context.input.width);
+  vm.set("h", context.input.height);
+  vm.set("b", context.beat || context.preinit ? 1 : 0);
+  vm.set("iw", bitmap.width);
+  vm.set("ih", bitmap.height);
+  vm.set("sizex", 1);
+  vm.set("sizey", 1);
+  vm.set("red", 1);
+  vm.set("green", 1);
+  vm.set("blue", 1);
+  vm.set("skip", 0);
+  if (!state.initialized || context.preinit) {
+    vm.set("n", 0);
+    execute6(state.programs[0], vm);
+    state.initialized = true;
+  }
+  execute6(state.programs[1], vm);
+  if (context.beat && !context.preinit) execute6(state.programs[2], vm);
+  const count = clamp22(roundEven(vm.get("n")), 0, MAX_TEXER_II_PARTICLES);
+  if (count <= 0) return;
+  let progress = 0;
+  const step = 1 / (count - 1);
+  for (let index = 0; index < count; index++) {
+    vm.set("i", progress);
+    progress += step;
+    vm.set("skip", 0);
+    const sample2 = Math.trunc(index * 575 / count);
+    const left = signedByte2(context.audio.waveform[0][sample2]);
+    const right = signedByte2(context.audio.waveform[1][sample2]);
+    vm.set("v", (left + right) / 256);
+    execute6(state.programs[3], vm);
+    if (vm.get("skip") !== 0) continue;
+    const sizeX = Math.abs(vm.get("sizex"));
+    const sizeY = Math.abs(vm.get("sizey"));
+    if (sizeX <= 0.01 || sizeY <= 0.01) continue;
+    const color = config.colorize ? byteColor(vm.get("blue")) | byteColor(vm.get("green")) << 8 | byteColor(vm.get("red")) << 16 : 16777215;
+    const flipX = vm.get("sizex") < 0;
+    const flipY = vm.get("sizey") < 0;
+    let x = vm.get("x");
+    let y = vm.get("y");
+    if (config.wrap) {
+      let overlapCoordinateX;
+      let overlapCoordinateY;
+      if (config.version === 0) {
+        overlapCoordinateX = x;
+        overlapCoordinateY = y;
+        x -= x > 1 ? 2 : x < -1 ? -2 : 0;
+        y -= y > 1 ? 2 : y < -1 ? -2 : 0;
+      } else {
+        x -= roundAway(x / 2) * 2;
+        y -= roundAway(y / 2) * 2;
+        overlapCoordinateX = x;
+        overlapCoordinateY = y;
+      }
+      const overlapX = overlapsEdge(overlapCoordinateX, sizeX, bitmap.width, context.input.width);
+      const overlapY = overlapsEdge(overlapCoordinateY, sizeY, bitmap.height, context.input.height);
+      const shiftX = x > 0 ? 2 : -2;
+      const shiftY = y > 0 ? 2 : -2;
+      if (overlapX) drawTexer2Particle(context, config, bitmap, x - shiftX, y, sizeX, sizeY, color, flipX, flipY);
+      if (overlapY) drawTexer2Particle(context, config, bitmap, x, y - shiftY, sizeX, sizeY, color, flipX, flipY);
+      if (overlapX && overlapY) {
+        drawTexer2Particle(context, config, bitmap, x - shiftX, y - shiftY, sizeX, sizeY, color, flipX, flipY);
+      }
+    }
+    drawTexer2Particle(context, config, bitmap, x, y, sizeX, sizeY, color, flipX, flipY);
+  }
+}
+function drawTexer2Particle(context, config, bitmap, x, y, sizeX, sizeY, color, flipX, flipY) {
+  if (config.resize) drawScaledParticle(context, bitmap, x, y, sizeX, sizeY, color, flipX, flipY);
+  else drawUnscaledParticle(context, bitmap, x, y, color, config.colorize, flipX, flipY);
+}
+function drawUnscaledParticle(context, bitmap, x, y, color, colorize, flipX, flipY) {
+  const screenMaxX = context.input.width - 1;
+  const screenMaxY = context.input.height - 1;
+  const imageMaxX = bitmap.width - 1;
+  const imageMaxY = bitmap.height - 1;
+  let left = roundEven((x * 0.5 + 0.5) * screenMaxX) - Math.trunc(imageMaxX / 2);
+  let top = roundEven((y * 0.5 + 0.5) * screenMaxY) - Math.trunc(imageMaxY / 2);
+  let right = left + imageMaxX - 1;
+  let bottom = top + imageMaxY - 1;
+  if (right < 0 || left > screenMaxX || bottom < 0 || top > screenMaxY) return;
+  let textureX = left < 0 && right !== left ? roundEven(-left / (right - left) * imageMaxX) : 0;
+  let textureY = top < 0 && bottom !== top ? roundEven(-top / (bottom - top) * imageMaxY) : 0;
+  left = Math.max(0, left);
+  top = Math.max(0, top);
+  right = Math.min(screenMaxX, right);
+  bottom = Math.min(screenMaxY, bottom);
+  if (right <= left || bottom <= top) return;
+  for (let drawY = top; drawY <= bottom; drawY++, textureY++) {
+    let tx = textureX;
+    for (let drawX = left; drawX <= right; drawX++, tx++) {
+      let source3 = sampleBitmap(bitmap, tx, textureY, flipX, flipY);
+      if (colorize) source3 = filterPixel(source3, color);
+      const destination = drawY * context.input.width + drawX;
+      context.input.pixels[destination] = blendTexerPixel(
+        source3,
+        context.input.pixels[destination],
+        context.line.blendMode,
+        context.line.adjustableAlpha
+      );
+    }
+  }
+}
+function drawScaledParticle(context, bitmap, x, y, sizeX, sizeY, color, flipX, flipY) {
+  const screenMaxX = context.input.width - 1;
+  const screenMaxY = context.input.height - 1;
+  const imageMaxX = bitmap.width - 1;
+  const imageMaxY = bitmap.height - 1;
+  const centreX = (x * 0.5 + 0.5) * screenMaxX;
+  const centreY = (y * 0.5 + 0.5) * screenMaxY;
+  const leftF = -imageMaxX * 0.5 * sizeX + 0.5 + centreX;
+  const topF = -imageMaxY * 0.5 * sizeY + 0.5 + centreY;
+  const rightF = (imageMaxX - 1) * 0.5 * sizeX + 0.5 + centreX;
+  const bottomF = (imageMaxY - 1) * 0.5 * sizeY + 0.5 + centreY;
+  let left = roundEven(leftF);
+  let top = roundEven(topF);
+  let right = roundEven(rightF);
+  let bottom = roundEven(bottomF);
+  if (right < 0 || left > screenMaxX || bottom < 0 || top > screenMaxY) return;
+  let x0 = (0.5 - fractional(leftF + 0.5)) / (rightF - leftF);
+  let y0 = (0.5 - fractional(topF + 0.5)) / (bottomF - topF);
+  if (leftF < 0) x0 = -leftF / (rightF - leftF);
+  if (topF < 0) y0 = -topF / (bottomF - topF);
+  left = Math.max(0, left);
+  top = Math.max(0, top);
+  right = Math.min(screenMaxX, right);
+  bottom = Math.min(screenMaxY, bottom);
+  if (right <= left || bottom <= top) return;
+  const fx0 = x0 * imageMaxX;
+  const fy0 = y0 * imageMaxY;
+  let cx = (roundEven(fx0) << 16) + 65535 - Math.trunc((0.5 - (fx0 - roundEven(fx0))) * 65536);
+  let cy = (roundEven(fy0) << 16) + 65535 - Math.trunc((0.5 - (fy0 - roundEven(fy0))) * 65536);
+  const stepX = Math.trunc((imageMaxX - 1) / (rightF - leftF + 1) * 65536);
+  const stepY = Math.trunc((imageMaxY - 1) / (bottomF - topF + 1) * 65536);
+  if (cx < 0) {
+    cx += stepX;
+    left++;
+  }
+  if (cy < 0) {
+    cy += stepY;
+    top++;
+  }
+  if (right <= left || bottom <= top) return;
+  for (let drawY = top, fy = cy; drawY <= bottom; drawY++, fy += stepY) {
+    for (let drawX = left, fx = cx; drawX <= right; drawX++, fx += stepX) {
+      const source3 = filterPixel(sampleBilinearFixed(bitmap, fx, fy, flipX, flipY), color);
+      const destination = drawY * context.input.width + drawX;
+      context.input.pixels[destination] = blendTexerPixel(
+        source3,
+        context.input.pixels[destination],
+        context.line.blendMode,
+        context.line.adjustableAlpha
+      );
+    }
+  }
+}
+function sampleBilinearFixed(bitmap, fx, fy, flipX, flipY) {
+  const x = clamp22(fx >> 16, 0, Math.max(0, bitmap.width - 2));
+  const y = clamp22(fy >> 16, 0, Math.max(0, bitmap.height - 2));
+  const dx = fx >>> 8 & 255;
+  const dy = fy >>> 8 & 255;
+  let result = 0;
+  for (let shift = 0; shift <= 16; shift += 8) {
+    const a = sampleBitmap(bitmap, x, y, flipX, flipY) >>> shift & 255;
+    const b = sampleBitmap(bitmap, x + 1, y, flipX, flipY) >>> shift & 255;
+    const c = sampleBitmap(bitmap, x, y + 1, flipX, flipY) >>> shift & 255;
+    const d = sampleBitmap(bitmap, x + 1, y + 1, flipX, flipY) >>> shift & 255;
+    const upper = (a * (255 - dx) >>> 8) + (b * dx >>> 8);
+    const lower = (c * (255 - dx) >>> 8) + (d * dx >>> 8);
+    result |= ((upper * (255 - dy) >>> 8) + (lower * dy >>> 8) & 255) << shift;
+  }
+  return result;
+}
+function sampleBitmap(bitmap, x, y, flipX, flipY) {
+  const sx = flipX ? bitmap.width - x - 1 : x;
+  const sy = flipY ? bitmap.height - y - 1 : y;
+  return bitmap.pixels[clamp22(sy, 0, bitmap.height - 1) * bitmap.width + clamp22(sx, 0, bitmap.width - 1)];
+}
+function filterPixel(pixel, color) {
+  return channels6(pixel, color, (source3, mask) => source3 * mask >>> 8);
+}
+function blendTexerPixel(source3, destination, mode4, amount) {
+  source3 &= 16777215;
+  destination &= 16777215;
+  switch (mode4) {
+    case 1:
+      return channels6(source3, destination, (s, d) => Math.min(255, s + d));
+    case 2:
+      return channels6(source3, destination, Math.max);
+    case 3:
+      return (source3 >>> 1 & 8355711) + (destination >>> 1 & 8355711);
+    case 4:
+      return channels6(source3, destination, (s, d) => Math.max(0, d - s));
+    case 5:
+      return channels6(source3, destination, (s, d) => Math.max(0, s - d));
+    case 6:
+      return channels6(source3, destination, (s, d) => s * d >>> 8);
+    case 7: {
+      const alpha = clamp22(amount, 0, 255);
+      return channels6(source3, destination, (s, d) => (s * alpha >>> 8) + (d * (256 - alpha) >>> 8));
+    }
+    case 8:
+      return (source3 ^ destination) & 16777215;
+    case 9:
+      return channels6(source3, destination, Math.min);
+    default:
+      return source3;
+  }
+}
+function channels6(a, b, fn) {
+  return fn(a & 255, b & 255) & 255 | (fn(a >>> 8 & 255, b >>> 8 & 255) & 255) << 8 | (fn(a >>> 16 & 255, b >>> 16 & 255) & 255) << 16;
+}
+function resolveTexer2Bitmap(name, options) {
+  if (name && name !== "(default image)") {
+    const resolved = options.bitmapResolver?.(name);
+    if (resolved) return resolved;
+  }
+  return options.defaultTexer2Bitmap ?? defaultTexer2Bitmap();
+}
+var defaultBitmap;
+function defaultTexer2Bitmap() {
+  if (defaultBitmap) return defaultBitmap;
+  const encoded = "AAAAAAAAAAAAAAAAAAAAAAAAAAADAwMICAgNDQ0QEBASEhIQEBANDQ0ICAgDAwMBAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADAwMLCwsWFhYhISEqKiovLy8yMjIvLy8qKiohISEWFhYLCwsDAwMAAAAAAAAAAAAAAAAAAAAAAAAAAAAFBQUSEhIiIiIyMjJBQUFNTU1UVFRXV1dUVFRNTU1BQUEyMjIiIiISEhIFBQUAAAAAAAAAAAAAAAAAAAAFBQUUFBQoKCg+Pj5TU1NlZWV0dHR9fX2AgIB9fX10dHRmZmZTU1M+Pj4oKCgUFBQFBQUAAAAAAAAAAAADAwMREREoKChCQkJdXV13d3eNjY2cnJylpaWoqKilpaWcnJyNjY13d3ddXV1CQkIoKCgREREDAwMAAAAAAAAKCgohISE+Pj5dXV19fX2ampqvr6/AwMDKysrNzc3KysrAwMCvr6+ampp9fX1dXV0+Pj4hISEKCgoAAAADAwMVFRUxMTFTU1N2dnaZmZm2trbOzs7e3t7o6Ojr6+vo6Oje3t7Nzc22traZmZl2dnZTU1MxMTEVFRUDAwMHBwcfHx9AQEBlZWWMjIyvr6/Nzc3l5eXy8vL4+Pj6+vr4+Pjy8vLl5eXNzc2vr6+MjIxlZWVAQEAfHx8HBwcMDAwoKChMTExzc3Obm5u/v7/d3d3y8vL6+vr9/f3+/v79/f36+vry8vLd3d2/v7+bm5tzc3NMTEwoKCgLCwsPDw8uLi5TU1N8fHykpKTIyMjn5+f4+Pj9/f3////////////9/f34+Pjn5+fIyMikpKR8fHxTU1MuLi4PDw8QEBAwMDBVVVV+fn6mpqbLy8vp6en5+fn+/v7////////////+/v75+fnp6enLy8umpqZ+fn5VVVUwMDAQEBAPDw8tLS1SUlJ7e3ujo6PHx8fm5ub39/f9/f3+/v7////+/v79/f339/fm5ubHx8ejo6N7e3tSUlItLS0PDw8LCwsoKChKSkpxcXGampq9vb3c3Nzx8fH6+vr9/f3+/v79/f36+vrx8fHc3Ny9vb2amppxcXFKSkooKCgLCwsGBgYfHx8/Pz9jY2OKioqtra3Ly8vj4+Px8fH39/f5+fn39/fx8fHj4+PLy8utra2KiopjY2M/Pz8fHx8GBgYDAwMUFBQwMDBQUFB0dHSWlpazs7PKysrb29vl5eXo6Ojl5eXb29vLy8uzs7OWlpZ0dHRQUFAwMDAUFBQCAgIAAAAJCQkgICA8PDxaWlp6enqWlpasrKy8vLzGxsbJycnGxsa8vLysrKyWlpZ6enpaWlo8PDwgICAJCQkAAAAAAAACAgIQEBAmJiY/Pz9aWlpzc3OJiYmZmZmhoaGkpKShoaGZmZmJiYlzc3NaWlpAQEAmJiYQEBACAgIAAAAAAAAAAAAEBAQSEhImJiY7OztQUFBiYmJwcHB5eXl8fHx5eXlwcHBiYmJQUFA7OzsmJiYSEhIEBAQAAAAAAAAAAAAAAAAAAAAEBAQPDw8fHx8vLy8+Pj5JSUlQUFBTU1NQUFBJSUk+Pj4vLy8fHx8PDw8EBAQAAAAAAAAAAAAAAAAAAAAAAAAAAAACAgIJCQkTExMeHh4mJiYsLCwuLi4sLCwmJiYdHR0TExMJCQkCAgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAgIGBgYKCgoODg4PDw8ODg4KCgoGBgYDAwMAAAAAAAAAAAAAAAAAAAAA";
+  const raw = atob(encoded);
+  const pixels = new Uint32Array(21 * 21);
+  for (let index = 0; index < pixels.length; index++) {
+    const offset = index * 3;
+    pixels[index] = raw.charCodeAt(offset) | raw.charCodeAt(offset + 1) << 8 | raw.charCodeAt(offset + 2) << 16;
+  }
+  defaultBitmap = { width: 21, height: 21, pixels };
+  return defaultBitmap;
+}
+function overlapsEdge(coordinate, size, imagePixels, screenPixels) {
+  const half = size * (imagePixels - 1) / screenPixels;
+  const absolute = Math.abs(coordinate);
+  return absolute + half > 1 && absolute - half < 1;
+}
+function readLengthString(payload, offset) {
+  if (offset + 4 > payload.length) return { value: "", next: payload.length };
+  const length = readU322(payload, offset, 0);
+  const start = offset + 4;
+  const end = Math.min(payload.length, start + length);
+  return { value: nulText10(payload.subarray(start, end)), next: end };
+}
+function nulText10(bytes) {
+  const end = bytes.indexOf(0);
+  return TEXT7.decode(end < 0 ? bytes : bytes.subarray(0, end));
+}
+function readI325(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+}
+function readU322(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(offset, true) : fallback;
+}
+function compileOrNull5(source3) {
+  if (!source3.trim()) return null;
+  try {
+    return compileAvsEel(source3);
+  } catch {
+    return null;
+  }
+}
+function execute6(program, vm) {
+  return program ? vm.execute(program) : 0;
+}
+function signedByte2(value) {
+  return value < 128 ? value : value - 256;
+}
+function byteColor(value) {
+  return clamp22(roundEven(value * 255), 0, 255);
+}
+function roundEven(value) {
+  if (!Number.isFinite(value)) return 0;
+  const floor = Math.floor(value);
+  const fraction = value - floor;
+  if (fraction < 0.5) return floor;
+  if (fraction > 0.5) return floor + 1;
+  return (floor & 1) === 0 ? floor : floor + 1;
+}
+function roundAway(value) {
+  return value < 0 ? -Math.round(-value) : Math.round(value);
+}
+function fractional(value) {
+  return value - Math.trunc(value);
+}
+function clamp22(value, minimum, maximum) {
+  return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+function hashPath13(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+
+// src/avs/effects/registry.ts
+function createAvsCompatibilityRegistry(classicOptions = {}, texerOptions = {}) {
+  const registry = new AvsEffectRegistry();
+  registerAvsAddBorders(registry);
+  registerAvsCoreEffects(registry);
+  registerAvsBasicTransforms(registry);
+  registerAvsBeatParticleEffects(registry);
+  registerAvsBump(registry);
+  registerAvsClassicEffects(registry, classicOptions);
+  registerAvsColorMap(registry);
+  registerAvsConvolutionFilter(registry);
+  registerAvsMovement(registry);
+  registerAvsLowCountBuiltins(registry);
+  registerAvsMultiFilter(registry);
+  registerAvsDynamicMovement(registry);
+  registerAvsFinalLowCountBuiltins(registry);
+  registerAvsNamedApeEffects(registry);
+  registerAvsScriptedTransforms(registry);
+  registerAvsSuperScope(registry);
+  registerAvsText(registry);
+  registerAvsTexerEffects(registry, texerOptions);
+  return registry;
+}
+
+// src/avs/runtime.ts
+var AvsCompatibilityRuntime = class {
+  preset;
+  registry;
+  executor;
+  hostAudio = new AvsAudioAccumulator();
+  pcmAudio = new AvsAudioAnalyser();
+  surface;
+  constructor(preset2, width, height, registry = createAvsCompatibilityRegistry()) {
+    this.preset = "components" in preset2 ? preset2 : parseAvsPreset(preset2);
+    this.registry = registry;
+    this.executor = new AvsExecutor(this.preset, registry);
+    this.surface = new AvsFramebuffer(width, height);
+  }
+  get framebuffer() {
+    return this.surface;
+  }
+  resize(width, height) {
+    if (this.surface.width === width && this.surface.height === height) return;
+    this.surface = new AvsFramebuffer(width, height);
+    this.executor.reset();
+  }
+  pushHostAudio(waveform, spectrum) {
+    this.hostAudio.push(waveform, spectrum);
+  }
+  renderHostFrame(preinit = false) {
+    return this.render(this.hostAudio.consume(), preinit);
+  }
+  renderPcm(pcm, preinit = false) {
+    return this.render(this.pcmAudio.analyse(pcm), preinit);
+  }
+  render(audio2 = emptyAudio(), preinit = false) {
+    const stats2 = this.executor.render(this.surface, audio2, preinit);
+    return { framebuffer: this.surface, stats: stats2 };
+  }
+  /** Browser-ready RGBA8 copy. Packed AVS RGB is B,G,R in byte order on LE. */
+  rgbaBytes(alpha = 255) {
+    const rgba = new Uint8ClampedArray(this.surface.pixels.length * 4);
+    for (let i = 0; i < this.surface.pixels.length; i++) {
+      const pixel = this.surface.pixels[i];
+      rgba[i * 4] = pixel >>> 16 & 255;
+      rgba[i * 4 + 1] = pixel >>> 8 & 255;
+      rgba[i * 4 + 2] = pixel & 255;
+      rgba[i * 4 + 3] = alpha;
+    }
+    return rgba;
+  }
+  reset() {
+    this.executor.reset();
+    this.hostAudio.reset();
+    this.pcmAudio.reset();
+    this.surface.clear();
+  }
+};
+function emptyAudio() {
+  return {
+    waveform: [new Uint8Array(AVS_AUDIO_SAMPLES), new Uint8Array(AVS_AUDIO_SAMPLES)],
+    spectrum: [new Uint8Array(AVS_AUDIO_SAMPLES), new Uint8Array(AVS_AUDIO_SAMPLES)],
+    beat: false,
+    beatLevel: 0
+  };
+}
+
+// assets/avs/avsres_texer_circle_edgeonly_19x19.bmp
+var avsres_texer_circle_edgeonly_19x19_default = "./avs/avsres_texer_circle_edgeonly_19x19-2AU2Z2B4.bmp";
+
+// assets/avs/avsres_texer_circle_edgeonly_29x29.bmp
+var avsres_texer_circle_edgeonly_29x29_default = "./avs/avsres_texer_circle_edgeonly_29x29-AEV25G5H.bmp";
+
+// assets/avs/avsres_texer_circle_heavyblur_19x19.bmp
+var avsres_texer_circle_heavyblur_19x19_default = "./avs/avsres_texer_circle_heavyblur_19x19-XCIMZX4U.bmp";
+
+// assets/avs/avsres_texer_circle_heavyblur_21x21.bmp
+var avsres_texer_circle_heavyblur_21x21_default = "./avs/avsres_texer_circle_heavyblur_21x21-DZ5ZZ76B.bmp";
+
+// assets/avs/avsres_texer_circle_sharp_19x19.bmp
+var avsres_texer_circle_sharp_19x19_default = "./avs/avsres_texer_circle_sharp_19x19-BXF25YUK.bmp";
+
+// assets/avs/flow3.0-5.bmp
+var flow3_0_5_default = "./avs/flow3.0-5-I6AULOEX.bmp";
+
+// assets/avs/skupers_lp6_02.bmp
+var skupers_lp6_02_default = "./avs/skupers_lp6_02-HFOTKZGN.bmp";
+
+// assets/avs/skupers_lp7_01.bmp
+var skupers_lp7_01_default = "./avs/skupers_lp7_01-NIIPBEPY.bmp";
+
+// assets/avs/sv_architectimage_256.bmp
+var sv_architectimage_256_default = "./avs/sv_architectimage_256-X6GDU76I.bmp";
+
+// assets/avs/sv_architectimage_buffer.bmp
+var sv_architectimage_buffer_default = "./avs/sv_architectimage_buffer-KS7TL4M3.bmp";
+
+// assets/avs/sv_texer_simplefade.bmp
+var sv_texer_simplefade_default = "./avs/sv_texer_simplefade-UNROLEGO.bmp";
+
+// assets/avs/tug_3dpack_texer4.bmp
+var tug_3dpack_texer4_default = "./avs/tug_3dpack_texer4-Z5RSPR47.bmp";
+
+// assets/avs/tug_bit2_texer5.bmp
+var tug_bit2_texer5_default = "./avs/tug_bit2_texer5-ZZPSCHKO.bmp";
+
+// assets/avs/tug_ti_texer2.bmp
+var tug_ti_texer2_default = "./avs/tug_ti_texer2-6UGAP5LW.bmp";
+
+// assets/avs/whacko6-06.bmp
+var whacko6_06_default = "./avs/whacko6-06-5BTGWY46.bmp";
+
+// assets/avs/whacko6-07.bmp
+var whacko6_07_default = "./avs/whacko6-07-F2MCLU2T.bmp";
+
+// src/avs/bundled-bitmaps.ts
+var BUNDLED = {
+  "avsres_texer_circle_edgeonly_19x19.bmp": avsres_texer_circle_edgeonly_19x19_default,
+  "avsres_texer_circle_edgeonly_29x29.bmp": avsres_texer_circle_edgeonly_29x29_default,
+  "avsres_texer_circle_heavyblur_19x19.bmp": avsres_texer_circle_heavyblur_19x19_default,
+  "avsres_texer_circle_heavyblur_21x21.bmp": avsres_texer_circle_heavyblur_21x21_default,
+  "avsres_texer_circle_sharp_19x19.bmp": avsres_texer_circle_sharp_19x19_default,
+  "flow3.0-5.bmp": flow3_0_5_default,
+  "skupers_lp6_02.bmp": skupers_lp6_02_default,
+  "skupers_lp7_01.bmp": skupers_lp7_01_default,
+  "sv_architectimage_256.bmp": sv_architectimage_256_default,
+  "sv_architectimage_buffer.bmp": sv_architectimage_buffer_default,
+  "sv_texer_simplefade.bmp": sv_texer_simplefade_default,
+  "tug_3dpack_texer4.bmp": tug_3dpack_texer4_default,
+  "tug_bit2_texer5.bmp": tug_bit2_texer5_default,
+  "tug_ti_texer2.bmp": tug_ti_texer2_default,
+  "whacko6-06.bmp": whacko6_06_default,
+  "whacko6-07.bmp": whacko6_07_default
+};
+var bundledResolver;
+function loadBundledAvsBitmapResolver() {
+  bundledResolver ??= Promise.all(Object.entries(BUNDLED).map(async ([name, url]) => {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Could not load AVS bitmap ${name}: HTTP ${response.status}`);
+    return [name, new Uint8Array(await response.arrayBuffer())];
+  })).then((entries) => createAvsBitmapResolver(new Map(entries)));
+  return bundledResolver;
+}
+
 // src/shaders/present.wgsl
 var present_default = "// Final pass: HDR accumulation -> swapchain.\n//\n// Everything upstream is rgba16float and freely exceeds 1.0. This is the only\n// place that becomes a displayable image, so it owns bloom, tone mapping and\n// the vignette, and it is the only place that should.\n\nstruct Post {\n  bloom    : f32,\n  exposure : f32,\n  vignette : f32,\n  aspect   : f32,\n  grain    : f32,\n  time     : f32,\n  pad0     : f32,\n  pad1     : f32,\n};\n\n@group(0) @binding(0) var src : texture_2d<f32>;\n@group(0) @binding(1) var samp : sampler;\n@group(0) @binding(2) var<uniform> P : Post;\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  let p = array<vec2<f32>, 3>(\n    vec2<f32>(-1.0, -1.0), vec2<f32>( 3.0, -1.0), vec2<f32>(-1.0,  3.0),\n  );\n  return vec4<f32>(p[vi], 0.0, 1.0);\n}\n\n// Narkowicz ACES. A *look*, not a correction \u2014 it rolls highlights off so\n// additive accumulation stops clipping to flat white.\nfn aces(x: vec3<f32>) -> vec3<f32> {\n  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;\n  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));\n}\n\nfn hash21(p: vec2<f32>) -> f32 {\n  var p3 = fract(vec3<f32>(p.xyx) * 0.1031);\n  p3 = p3 + dot(p3, p3.yzx + 33.33);\n  return fract((p3.x + p3.y) * p3.z);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let dims = vec2<f32>(textureDimensions(src));\n  let uv = frag.xy / dims;\n  let texel = 1.0 / dims;\n\n  var col = textureSampleLevel(src, samp, uv, 0.0).rgb;\n\n  // Cheap threshold bloom. A real mip chain belongs here (plan \xA74.11) \u2014 this is\n  // a fixed 12-tap ring, which is honest for a vertical slice and would be the\n  // wrong answer at 2K120.\n  if (P.bloom > 0.001) {\n    var sum = vec3<f32>(0.0);\n    let radius = 9.0;\n    for (var i = 0; i < 12; i = i + 1) {\n      let a = f32(i) * 0.5235988;           // 2pi/12\n      let o = vec2<f32>(cos(a), sin(a)) * radius * texel;\n      let s = textureSampleLevel(src, samp, uv + o, 0.0).rgb;\n      sum = sum + max(s - vec3<f32>(0.6), vec3<f32>(0.0));\n    }\n    col = col + sum * (P.bloom / 12.0);\n  }\n\n  col = col * P.exposure;\n\n  // Vignette. Multiplicative and gentle \u2014 art-direction \xA74.3 wants most of the\n  // frame near-black, and this helps without eating the subject.\n  let d = length((uv - 0.5) * vec2<f32>(P.aspect, 1.0));\n  col = col * mix(1.0, smoothstep(1.05, 0.25, d), P.vignette);\n\n  col = aces(col);\n\n  // Grain after tone mapping, so it lives in display space and does not get\n  // crushed by the curve.\n  if (P.grain > 0.001) {\n    let n = hash21(frag.xy + vec2<f32>(P.time * 60.0, P.time * 37.0)) - 0.5;\n    col = col + vec3<f32>(n * P.grain * 0.06);\n  }\n\n  return vec4<f32>(col, 1.0);\n}\n";
 
 // src/main.ts
 var $ = (id) => document.getElementById(id);
 var canvas = $("stage");
+var avsCanvas = document.createElement("canvas");
+avsCanvas.id = "avs-stage";
+avsCanvas.setAttribute("aria-label", "Imported Winamp AVS preset");
+avsCanvas.style.cssText = "display:none;position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none;image-rendering:pixelated";
+canvas.insertAdjacentElement("afterend", avsCanvas);
+var avsContext = avsCanvas.getContext("2d", { alpha: false });
 var hud = $("hud");
 var err = $("err");
 var post = {
@@ -9976,6 +16163,9 @@ async function ensureDetector() {
 function resetTransport(now) {
   tempo.reset();
   tierB.reset();
+  resetSeekDependentState(now);
+}
+function resetSeekDependentState(now) {
   scheduler.reset();
   stack.reset();
   renderer.resetLayerState();
@@ -9983,6 +16173,28 @@ function resetTransport(now) {
   lastPoll = now;
   stats.scheduledEvents = 0;
   stats.lateBy = 0;
+}
+async function toggleTransport() {
+  if (!audio.canTransport) return;
+  if (audio.isPlaying) await audio.pause();
+  else await audio.resume();
+  detector.timeOrigin = (audio.ctx?.currentTime ?? 0) - audio.currentTime;
+}
+function skipBar(direction) {
+  if (!audio.canTransport) return;
+  const from = audio.currentTime;
+  const bpm = timeline.bpm(from) || tempo.bpm || 120;
+  const target = Math.max(0, from + direction * 4 * 60 / bpm);
+  const deltaBeats = (target - from) * bpm / 60;
+  audio.seek(target);
+  if (tempo.locked && timeline === tierB) {
+    tempo.seekByBeats(deltaBeats, target);
+    tierB.seekByBeats(deltaBeats, target);
+    resetSeekDependentState(target);
+  } else {
+    resetTransport(target);
+  }
+  detector.timeOrigin = (audio.ctx?.currentTime ?? 0) - audio.currentTime;
 }
 var DEFAULT_PRESET = {
   version: 1,
@@ -10214,6 +16426,9 @@ var transition = new Transition();
 var outgoingFrame = null;
 var captureOutgoing = false;
 function applyPreset(next, spec, now = 0, bpm = 120) {
+  avsRuntime = null;
+  avsPresetName = "";
+  avsCanvas.style.display = "none";
   preset = next;
   stack.load(next);
   rebuildRequests();
@@ -10260,6 +16475,42 @@ var renderer = new Renderer({ gpu, timer, audioGpu });
 renderer.register(...SOURCE_PASSES, ...OPERATOR_PASSES);
 renderer.prune(stack.all.map((l) => l.id));
 var knownLayerIds = stack.all.map((l) => l.id).join("|");
+var avsRuntime = null;
+var avsPresetName = "";
+var avsUnsupported = 0;
+var avsPcmLeft = new Float32Array(576);
+var avsPcmRight = new Float32Array(576);
+async function loadAvsPreset(bytes, fileName) {
+  const maxWidth = 640;
+  const width = Math.max(1, Math.min(maxWidth, gpu.width));
+  const height = Math.max(1, Math.round(width * gpu.height / gpu.width));
+  const bitmapResolver = await loadBundledAvsBitmapResolver();
+  const registry = createAvsCompatibilityRegistry({}, { bitmapResolver });
+  avsRuntime = new AvsCompatibilityRuntime(bytes, width, height, registry);
+  avsUnsupported = avsRuntime.render(void 0, true).stats.unsupported;
+  avsPresetName = fileName.replace(/\.avs$/i, "");
+  avsCanvas.width = width;
+  avsCanvas.height = height;
+  avsCanvas.style.display = "block";
+  director.enabled = false;
+}
+function renderAvsPreset(audioFrame) {
+  if (!avsRuntime || !avsContext) return;
+  const frames2 = Math.max(1, Math.trunc(audioFrame.waveform.length / 2));
+  for (let i = 0; i < 576; i++) {
+    const source3 = Math.min(frames2 - 1, Math.trunc(i * frames2 / 576));
+    avsPcmLeft[i] = audioFrame.waveform[source3 * 2] ?? 0;
+    avsPcmRight[i] = audioFrame.waveform[source3 * 2 + 1] ?? avsPcmLeft[i];
+  }
+  const frame2 = avsRuntime.renderPcm({ left: avsPcmLeft, right: avsPcmRight });
+  avsUnsupported = frame2.stats.unsupported;
+  const image = new ImageData(
+    new Uint8ClampedArray(avsRuntime.rgbaBytes()),
+    frame2.framebuffer.width,
+    frame2.framebuffer.height
+  );
+  avsContext.putImageData(image, 0, 0);
+}
 var presentPipeline = createFullscreenPipeline(gpu, "present", present_default, gpu.swapFormat);
 var postParams = device.createBuffer({
   label: "post-params",
@@ -10305,7 +16556,16 @@ var ui = new LayerUI({
   onAutoChange(on) {
     director.enabled = on;
   },
+  async onTogglePlayback() {
+    await toggleTransport();
+  },
+  onSkipBar(direction) {
+    skipBar(direction);
+  },
   onLoadPreset(next) {
+    avsRuntime = null;
+    avsPresetName = "";
+    avsCanvas.style.display = "none";
     preset = next;
     stack.load(next);
     rebuildRequests();
@@ -10314,6 +16574,9 @@ var ui = new LayerUI({
     knownLayerIds = stack.all.map((l) => l.id).join("|");
     presetError = "";
     ui.setPreset(next);
+  },
+  async onLoadAvsPreset(bytes, fileName) {
+    await loadAvsPreset(bytes, fileName);
   },
   // Fires on EVERY edit, including each step of a slider drag, so it must not do
   // per-edit work. `prune` clears the whole bind-group cache, which is a frame
@@ -10329,7 +16592,7 @@ var ui = new LayerUI({
   // UI test, which needs the production layout visibly open for page capture.
   open: !golden || uiTest
 });
-var f32 = new Float32Array(8);
+var f322 = new Float32Array(8);
 var last = performance.now();
 var frames = 0;
 var fpsAcc = 0;
@@ -10385,10 +16648,12 @@ function renderFrame(nowMs) {
     t = audio.currentTime;
     a = snapshot(t);
   }
+  if (!audio.isPaused || harness) renderAvsPreset(a);
   tierB.update(t);
   const tlBpm = timeline.bpm(t);
   const bpm = tlBpm > 0 ? tlBpm : 120;
-  const dBeats = dt / (60 / bpm);
+  const transportDt = audio.isPaused && !harness ? 0 : dt;
+  const dBeats = transportDt / (60 / bpm);
   director.outputLatency = scheduler.outputLatency;
   transition.update(t);
   if (!transition.active && outgoingFrame) {
@@ -10412,6 +16677,7 @@ function renderFrame(nowMs) {
   lastPoll = t;
   peakLevel = Math.max(a.level, peakLevel - dt * 0.9);
   const nowBeats = timeline.slotAt(t) / SLOTS_PER_BEAT;
+  const transportBeats = tlBpm > 0 ? nowBeats : t * bpm / 60;
   stack.update(nowBeats);
   const framed = stack.frame(nowBeats);
   plan = framed.plan;
@@ -10431,7 +16697,7 @@ function renderFrame(nowMs) {
     beats: nowBeats,
     bpm,
     dtBeats: dBeats,
-    dtSeconds: dt,
+    dtSeconds: transportDt,
     frame: frameCount
   };
   let output = renderer.execute(encoder, plan, frameState);
@@ -10449,8 +16715,8 @@ function renderFrame(nowMs) {
     renderer.releaseTarget(composite);
   }
   const aspect = gpu.width / gpu.height;
-  f32.set([post.bloom, post.exposure, post.vignette, aspect, post.grain, t, 0, 0]);
-  device.queue.writeBuffer(postParams, 0, f32);
+  f322.set([post.bloom, post.exposure, post.vignette, aspect, post.grain, t, 0, 0]);
+  device.queue.writeBuffer(postParams, 0, f322);
   {
     const pass6 = timer.beginPass(encoder, gpu.context.getCurrentTexture().createView(), "present", "clear");
     pass6.setPipeline(presentPipeline);
@@ -10470,7 +16736,14 @@ function renderFrame(nowMs) {
     fpsAcc = 0;
   }
   if (frames === 0) updateHud(t, bpm);
-  ui.update({ bpm, locked: tempo.locked, confidence: timeline.confidence, beats: nowBeats });
+  ui.update({
+    bpm,
+    locked: tempo.locked,
+    confidence: timeline.confidence,
+    beats: transportBeats,
+    playing: audio.isPlaying,
+    canControl: audio.canTransport
+  });
   if (overlay.visible) {
     overlay.draw({
       audio: a,
@@ -10503,7 +16776,8 @@ function updateHud(t, bpm) {
   };
   const lines = [
     [bold(`${fps.toFixed(0)} fps`), ` \xB7 ${gpu.width}\xD7${gpu.height}`, ...harness ? [" \xB7 ", bold("GOLDEN")] : []],
-    ["preset ", bold(preset.name), ` \xB7 ${stack.length} layers \xB7 auto `, bold(director.enabled ? "on" : "off"), ` (${director.dynamic ? `${director.minBars}\u2013${director.maxBars}bar responsive` : `${director.every}bar`})`],
+    ["preset ", bold(avsRuntime ? `${avsPresetName} (AVS compatibility)` : preset.name), ` \xB7 ${avsRuntime ? "legacy ordered graph" : `${stack.length} layers`} \xB7 auto `, bold(director.enabled ? "on" : "off"), ` (${director.dynamic ? `${director.minBars}\u2013${director.maxBars}bar responsive` : `${director.every}bar`})`],
+    ...avsRuntime ? [[`AVS unsupported records this frame: `, bold(avsUnsupported)]] : [],
     ["tempo ", bold(lock), ` \xB7 horizon ${timeline.horizonSec.toFixed(2)}s`],
     [`slot ${timeline.slotAt(t).toFixed(0)} \xB7 scheduled ${stats.scheduledEvents} \xB7 late ${(stats.lateBy * 1e3).toFixed(1)}ms`],
     [`audio clock ${t.toFixed(2)}s \xB7 level ${peakLevel.toFixed(2)}`],
@@ -10628,6 +16902,14 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "?") {
     openGuide();
     return;
+  }
+  if (e.code === "Space") {
+    e.preventDefault();
+    void toggleTransport();
+  }
+  if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+    e.preventDefault();
+    skipBar(e.key === "ArrowRight" ? 1 : -1);
   }
   if (e.key === "p") {
     director.enabled = !director.enabled;

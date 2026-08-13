@@ -126,6 +126,34 @@
 .ui-stat dd.is-idle {
   color: var(--ui-dim);
 }
+.ui-transport-controls {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr 1fr;
+  gap: .45rem;
+  margin-top: .5rem;
+}
+.ui-transport-button {
+  min-height: 2rem;
+  border: 1px solid var(--ui-line);
+  border-radius: 7px;
+  background: var(--ui-sunk);
+  color: var(--ui-fg);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: .04em;
+  cursor: pointer;
+}
+.ui-transport-button:hover:not(:disabled) {
+  border-color: var(--ui-accent);
+}
+.ui-transport-button.is-primary {
+  background: color-mix(in srgb, var(--ui-accent) 14%, var(--ui-sunk));
+}
+.ui-transport-button:disabled {
+  opacity: .38;
+  cursor: default;
+}
 .ui-preset-section {
   background: rgba(255, 255, 255, .018);
 }
