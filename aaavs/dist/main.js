@@ -11035,13 +11035,389 @@ var Lexer = class {
   }
 };
 
-// src/avs/eel/compiler.ts
+// src/avs/eel/jit.ts
 var CLOSE = 1e-5;
+var HELPERS = {
+  truth(value) {
+    return Math.abs(value) >= CLOSE;
+  },
+  close(a, b) {
+    return Math.abs(a - b) < CLOSE;
+  },
+  integer(value) {
+    return Number.isFinite(value) ? Math.trunc(value) : 0;
+  },
+  finite(value) {
+    return Number.isFinite(value) ? value : 0;
+  },
+  divide(a, b) {
+    return Math.abs(b) < Number.EPSILON ? 0 : Number.isFinite(a / b) ? a / b : 0;
+  },
+  modulo(a, b) {
+    return Math.abs(b) < Number.EPSILON ? 0 : Number.isFinite(a % b) ? a % b : 0;
+  },
+  assignment(operator, left, right) {
+    let result;
+    switch (operator) {
+      case "=":
+        result = right;
+        break;
+      case "+=":
+        result = left + right;
+        break;
+      case "-=":
+        result = left - right;
+        break;
+      case "*=":
+        result = left * right;
+        break;
+      case "/=":
+        result = this.divide(left, right);
+        break;
+      case "%=":
+        result = this.modulo(left, right);
+        break;
+      case "|=":
+        result = this.integer(left) | this.integer(right);
+        break;
+      case "&=":
+        result = this.integer(left) & this.integer(right);
+        break;
+      case "^=":
+        result = this.integer(left) ^ this.integer(right);
+        break;
+      case "**=":
+        result = Math.pow(left, right);
+        break;
+      default:
+        result = 0;
+    }
+    return this.finite(result);
+  }
+};
+function compileAvsEelJit(node) {
+  const builder = new Builder();
+  let result;
+  try {
+    result = builder.expression(node);
+  } catch (error) {
+    if (error instanceof UnsupportedJitNode) return null;
+    throw error;
+  }
+  const declarations = [...builder.variables.values()].map((index) => `const a${index}=b[${index}].values,j${index}=b[${index}].index;`).join("");
+  const source3 = `${declarations}return function(){${builder.lines.join("")}return ${result};}`;
+  if (source3.length > 24e3) return null;
+  let factory;
+  try {
+    factory = new Function("vm", "b", "H", source3);
+  } catch {
+    return null;
+  }
+  const names = [...builder.variables.keys()];
+  return (vm) => factory(vm, names.map((name) => vm.bindVariable(name)), HELPERS);
+}
+var Builder = class {
+  variables = /* @__PURE__ */ new Map();
+  lines = [];
+  temporary = 0;
+  expression(node) {
+    switch (node.kind) {
+      case "number":
+        return numberLiteral(node.value);
+      case "variable":
+        return this.variable(node.name);
+      case "sequence": {
+        let result = "0";
+        for (const value of node.values) {
+          result = this.expression(value);
+          const next = this.temp();
+          this.lines.push(`const ${next}=H.finite(${result});`);
+          result = next;
+        }
+        return result;
+      }
+      case "unary":
+        return this.unary(node.operator, node.value);
+      case "binary":
+        return this.binary(node.operator, node.left, node.right);
+      case "conditional":
+        return this.conditional(node.condition, node.yes, node.no);
+      case "assign":
+        return this.assign(node.operator, node.target, node.value);
+      case "call":
+        return this.call(node.name, node.args);
+    }
+  }
+  variable(rawName) {
+    if (rawName === "$pi") return "Math.PI";
+    if (rawName === "$e") return "Math.E";
+    if (rawName === "$phi") return "((1+Math.sqrt(5))*.5)";
+    const index = this.variableIndex(rawName);
+    return `(a${index}[j${index}]??0)`;
+  }
+  variableLocation(rawName) {
+    const index = this.variableIndex(rawName);
+    return `a${index}[j${index}]`;
+  }
+  variableIndex(rawName) {
+    const name = normalizeVariable(rawName);
+    let index = this.variables.get(name);
+    if (index === void 0) {
+      index = this.variables.size;
+      this.variables.set(name, index);
+    }
+    return index;
+  }
+  unary(operator, valueNode) {
+    const value = this.expression(valueNode);
+    switch (operator) {
+      case "+":
+        return `H.finite(${value})`;
+      case "-":
+        return `H.finite(-(${value}))`;
+      case "!":
+        return `(H.truth(${value})?0:1)`;
+      case "~":
+        return `(~H.integer(${value}))`;
+      default:
+        throw new UnsupportedJitNode();
+    }
+  }
+  binary(operator, leftNode, rightNode) {
+    const left = this.store(this.expression(leftNode));
+    if (operator === "&&" || operator === "||") {
+      const result = this.temp();
+      this.lines.push(`let ${result};`);
+      if (operator === "&&") {
+        this.lines.push(`if(H.truth(${left})){`);
+        const right2 = this.expression(rightNode);
+        this.lines.push(`${result}=H.truth(${right2})?1:0;}else{${result}=0;}`);
+      } else {
+        this.lines.push(`if(H.truth(${left})){${result}=1;}else{`);
+        const right2 = this.expression(rightNode);
+        this.lines.push(`${result}=H.truth(${right2})?1:0;}`);
+      }
+      return result;
+    }
+    const right = this.expression(rightNode);
+    switch (operator) {
+      case "+":
+        return `H.finite((${left})+(${right}))`;
+      case "-":
+        return `H.finite((${left})-(${right}))`;
+      case "*":
+        return `H.finite((${left})*(${right}))`;
+      case "/":
+        return `H.divide(${left},${right})`;
+      case "%":
+        return `H.modulo(${left},${right})`;
+      case "**":
+        return `H.finite(Math.pow(${left},${right}))`;
+      case "|":
+        return `(H.integer(${left})|H.integer(${right}))`;
+      case "&":
+        return `(H.integer(${left})&H.integer(${right}))`;
+      case "^":
+        return `(H.integer(${left})^H.integer(${right}))`;
+      case "<<":
+        return `(H.integer(${left})<<(H.integer(${right})&31))`;
+      case ">>":
+        return `(H.integer(${left})>>(H.integer(${right})&31))`;
+      case "<":
+        return `((${left})<(${right})?1:0)`;
+      case "<=":
+        return `((${left})<=(${right})?1:0)`;
+      case ">":
+        return `((${left})>(${right})?1:0)`;
+      case ">=":
+        return `((${left})>=(${right})?1:0)`;
+      case "==":
+        return `(H.close(${left},${right})?1:0)`;
+      case "!=":
+        return `(H.close(${left},${right})?0:1)`;
+      case "===":
+        return `((${left})===(${right})?1:0)`;
+      case "!==":
+        return `((${left})!==(${right})?1:0)`;
+      default:
+        throw new UnsupportedJitNode();
+    }
+  }
+  conditional(conditionNode, yesNode, noNode) {
+    const condition = this.expression(conditionNode);
+    const result = this.temp();
+    this.lines.push(`let ${result};if(H.truth(${condition})){`);
+    const yes = this.expression(yesNode);
+    this.lines.push(`${result}=${yes};}else{`);
+    const no = this.expression(noNode);
+    this.lines.push(`${result}=${no};}`);
+    return result;
+  }
+  assign(operator, target, valueNode) {
+    if (target.kind === "variable") {
+      if (target.name === "$pi" || target.name === "$e" || target.name === "$phi") throw new UnsupportedJitNode();
+      const targetAccess = this.variableLocation(target.name);
+      const right = this.expression(valueNode);
+      const rightTemp = this.store(right);
+      const left = this.store(targetAccess);
+      const result = this.temp();
+      this.lines.push(`const ${result}=H.assignment(${JSON.stringify(operator)},${left},${rightTemp});`);
+      this.lines.push(`${targetAccess}=${result};`);
+      return result;
+    }
+    if (isMemoryCall(target)) {
+      const address = this.store(this.expression(target.args[0]));
+      const right = this.store(this.expression(valueNode));
+      const global = target.name === "gmegabuf";
+      const left = this.store(`vm.readMemory(${global},${address})`);
+      const result = this.temp();
+      this.lines.push(`const ${result}=H.assignment(${JSON.stringify(operator)},${left},${right});`);
+      this.lines.push(`vm.writeMemory(${global},${address},${result});`);
+      return result;
+    }
+    throw new UnsupportedJitNode();
+  }
+  call(name, nodes) {
+    if (name === "if") return this.conditional(nodes[0], nodes[1], nodes[2]);
+    if (name === "loop") {
+      const count = this.store(this.expression(nodes[0]));
+      const iterations = this.temp();
+      const result = this.temp();
+      const iterator = this.temp();
+      this.lines.push(`const ${iterations}=Math.min(Math.max(0,H.integer(${count})),vm.maxLoopIterations);let ${result}=0;for(let ${iterator}=0;${iterator}<${iterations};${iterator}++){`);
+      const body = this.expression(nodes[1]);
+      this.lines.push(`${result}=${body};}`);
+      return `H.finite(${result})`;
+    }
+    if (name === "assign") {
+      const target = nodes[0];
+      if (target.kind === "variable") {
+        const access = this.variableLocation(target.name);
+        const value = this.store(`H.finite(${this.expression(nodes[1])})`);
+        this.lines.push(`${access}=${value};`);
+        return value;
+      }
+      if (isMemoryCall(target)) {
+        const address = this.store(this.expression(target.args[0]));
+        const value = this.store(`H.finite(${this.expression(nodes[1])})`);
+        this.lines.push(`vm.writeMemory(${target.name === "gmegabuf"},${address},${value});`);
+        return value;
+      }
+      throw new UnsupportedJitNode();
+    }
+    if (name === "megabuf" || name === "gmegabuf") {
+      return `vm.readMemory(${name === "gmegabuf"},${this.expression(nodes[0])})`;
+    }
+    const args = nodes.map((node) => this.store(this.expression(node)));
+    const one = (fn) => `H.finite(${fn}(${args[0]}))`;
+    const two = (fn) => `H.finite(${fn}(${args[0]},${args[1]}))`;
+    switch (name) {
+      case "sin":
+        return one("Math.sin");
+      case "cos":
+        return one("Math.cos");
+      case "tan":
+        return one("Math.tan");
+      case "asin":
+        return one("Math.asin");
+      case "acos":
+        return one("Math.acos");
+      case "atan":
+        return one("Math.atan");
+      case "atan2":
+        return two("Math.atan2");
+      case "sqrt":
+        return one("Math.sqrt");
+      case "sqr":
+        return `H.finite((${args[0]})*(${args[0]}))`;
+      case "invsqrt":
+        return `H.finite(1/Math.sqrt(${args[0]}))`;
+      case "pow":
+        return two("Math.pow");
+      case "exp":
+        return one("Math.exp");
+      case "log":
+        return one("Math.log");
+      case "log10":
+        return one("Math.log10");
+      case "abs":
+        return one("Math.abs");
+      case "floor":
+        return one("Math.floor");
+      case "ceil":
+        return one("Math.ceil");
+      case "int":
+        return one("Math.trunc");
+      case "sign":
+        return `((${args[0]})<0?-1:((${args[0]})>0?1:0))`;
+      case "min":
+        return two("Math.min");
+      case "max":
+        return two("Math.max");
+      case "equal":
+        return `(H.close(${args[0]},${args[1]})?1:0)`;
+      case "above":
+        return `((${args[0]})>(${args[1]})?1:0)`;
+      case "below":
+        return `((${args[0]})<(${args[1]})?1:0)`;
+      case "band":
+        return `(H.truth(${args[0]})&&H.truth(${args[1]})?1:0)`;
+      case "bor":
+        return `(H.truth(${args[0]})||H.truth(${args[1]})?1:0)`;
+      case "bnot":
+        return `(H.truth(${args[0]})?0:1)`;
+      case "rand":
+        return `vm.random(${args[0]})`;
+      case "getosc":
+        return `vm.host("getosc",${args[0]},${args[1]},${args[2]})`;
+      case "getspec":
+        return `vm.host("getspec",${args[0]},${args[1]},${args[2]})`;
+      case "gettime":
+        return `vm.host("gettime",${args[0]})`;
+      case "getkbmouse":
+        return `vm.host("getkbmouse",${args[0]})`;
+      default:
+        throw new UnsupportedJitNode();
+    }
+  }
+  store(expression) {
+    const temporary = this.temp();
+    this.lines.push(`const ${temporary}=${expression};`);
+    return temporary;
+  }
+  temp() {
+    return `t${this.temporary++}`;
+  }
+};
+var UnsupportedJitNode = class extends Error {
+};
+function isMemoryCall(node) {
+  return node.kind === "call" && (node.name === "megabuf" || node.name === "gmegabuf") && node.args.length === 1;
+}
+function normalizeVariable(name) {
+  return name.toLowerCase().slice(0, 8);
+}
+function numberLiteral(value) {
+  return Number.isFinite(value) ? String(value) : "0";
+}
+
+// src/avs/eel/compiler.ts
+var CLOSE2 = 1e-5;
 function compileAvsEel(source3) {
   return compileAvsEelAst(parseAvsEel(source3));
 }
 function compileAvsEelAst(ast) {
-  const execute7 = compileNode(ast.body);
+  const fallback = compileNode(ast.body);
+  const bindJit = ast.source.length <= 1400 ? compileAvsEelJit(ast.body) : null;
+  let boundVm;
+  let boundExecute;
+  const execute7 = (vm) => {
+    if (vm !== boundVm) {
+      boundVm = vm;
+      boundExecute = bindJit ? bindJit(vm) : () => fallback(vm);
+    }
+    return boundExecute();
+  };
   return { source: ast.source, ast, execute: execute7 };
 }
 function compileNode(node) {
@@ -11052,8 +11428,9 @@ function compileNode(node) {
       if (node.name === "$pi") return () => Math.PI;
       if (node.name === "$e") return () => Math.E;
       if (node.name === "$phi") return () => (1 + Math.sqrt(5)) * 0.5;
-      const name = normalizeVariable(node.name);
-      return (vm) => vm.getVariable(name);
+      const name = normalizeVariable2(node.name);
+      const access = variableAccess(name);
+      return (vm) => access.get(vm);
     }
     case "sequence": {
       const values = node.values.map(compileNode);
@@ -11088,13 +11465,28 @@ function compileNode(node) {
     }
     case "assign": {
       if (node.target.kind === "variable") {
-        const name = normalizeVariable(node.target.name);
+        const name = normalizeVariable2(node.target.name);
+        const access = variableAccess(name);
         const value2 = compileNode(node.value);
         return (vm) => {
           const right = value2(vm);
-          const left = vm.getVariable(name);
+          const left = access.get(vm);
           const result = assignment(node.operator, left, right);
-          vm.setVariable(name, result);
+          access.set(vm, result);
+          return result;
+        };
+      }
+      if (node.target.kind === "call" && (node.target.name === "megabuf" || node.target.name === "gmegabuf")) {
+        arity(node.target.name, node.target.args, 1, node.target.span);
+        const global = node.target.name === "gmegabuf";
+        const index = compileNode(node.target.args[0]);
+        const value2 = compileNode(node.value);
+        return (vm) => {
+          const address = index(vm);
+          const right = value2(vm);
+          const left = vm.readMemory(global, address);
+          const result = assignment(node.operator, left, right);
+          vm.writeMemory(global, address, result);
           return result;
         };
       }
@@ -11184,10 +11576,21 @@ function compileCall(name, nodes, span) {
     arity(name, nodes, 2, span);
     const value = compileNode(nodes[1]);
     if (nodes[0].kind === "variable") {
-      const targetName = normalizeVariable(nodes[0].name);
+      const targetName = normalizeVariable2(nodes[0].name);
+      const access = variableAccess(targetName);
       return (vm) => {
         const result = finite2(value(vm));
-        vm.setVariable(targetName, result);
+        access.set(vm, result);
+        return result;
+      };
+    }
+    if (nodes[0].kind === "call" && (nodes[0].name === "megabuf" || nodes[0].name === "gmegabuf")) {
+      const global = nodes[0].name === "gmegabuf";
+      const index = compileNode(nodes[0].args[0]);
+      return (vm) => {
+        const address = index(vm);
+        const result = finite2(value(vm));
+        vm.writeMemory(global, address, result);
         return result;
       };
     }
@@ -11202,10 +11605,9 @@ function compileCall(name, nodes, span) {
   if (name === "megabuf" || name === "gmegabuf") {
     arity(name, nodes, 1, span);
     const index = compileNode(nodes[0]);
-    return (vm) => vm.memory(name === "gmegabuf", index(vm)).get();
+    return (vm) => vm.readMemory(name === "gmegabuf", index(vm));
   }
   const args = nodes.map(compileNode);
-  const values = (vm) => args.map((arg) => arg(vm));
   const one = (fn) => {
     arity(name, nodes, 1, span);
     return (vm) => finite2(fn(args[0](vm)));
@@ -11276,12 +11678,12 @@ function compileCall(name, nodes, span) {
     case "getosc":
     case "getspec": {
       arity(name, nodes, 3, span);
-      return (vm) => vm.host(name, values(vm));
+      return (vm) => vm.host(name, args[0](vm), args[1](vm), args[2](vm));
     }
     case "gettime":
     case "getkbmouse": {
       arity(name, nodes, 1, span);
-      return (vm) => vm.host(name, values(vm));
+      return (vm) => vm.host(name, args[0](vm));
     }
     default:
       throw new AvsEelCompileError(`Unknown EEL function ${name}`, span);
@@ -11292,8 +11694,16 @@ function compileReference(node) {
     if (node.name === "$pi" || node.name === "$e" || node.name === "$phi") {
       throw new AvsEelCompileError(`Cannot assign to constant ${node.name}`, node.span);
     }
-    const name = normalizeVariable(node.name);
-    return (vm) => vm.variable(name);
+    const name = normalizeVariable2(node.name);
+    let boundVm;
+    let reference;
+    return (vm) => {
+      if (vm !== boundVm) {
+        boundVm = vm;
+        reference = vm.variable(name);
+      }
+      return reference;
+    };
   }
   if (node.kind === "call" && (node.name === "megabuf" || node.name === "gmegabuf")) {
     arity(node.name, node.args, 1, node.span);
@@ -11319,10 +11729,10 @@ function arity(name, args, expected, span) {
   if (args.length !== expected) throw new AvsEelCompileError(`${name} expects ${expected} arguments, got ${args.length}`, span);
 }
 function truth(value) {
-  return Math.abs(value) >= CLOSE;
+  return Math.abs(value) >= CLOSE2;
 }
 function close(a, b) {
-  return Math.abs(a - b) < CLOSE;
+  return Math.abs(a - b) < CLOSE2;
 }
 function integer(value) {
   return Number.isFinite(value) ? Math.trunc(value) : 0;
@@ -11336,8 +11746,29 @@ function divide(a, b) {
 function modulo(a, b) {
   return Math.abs(b) < Number.EPSILON ? 0 : finite2(a % b);
 }
-function normalizeVariable(name) {
+function normalizeVariable2(name) {
   return name.toLowerCase().slice(0, 8);
+}
+function variableAccess(name) {
+  let boundVm;
+  let binding;
+  const resolve = (vm) => {
+    if (vm !== boundVm) {
+      boundVm = vm;
+      binding = vm.bindVariable(name);
+    }
+    return binding;
+  };
+  return {
+    get(vm) {
+      const cell = resolve(vm);
+      return cell.values[cell.index] ?? 0;
+    },
+    set(vm, value) {
+      const cell = resolve(vm);
+      cell.values[cell.index] = finite2(value);
+    }
+  };
 }
 function assignment(operator, left, right) {
   let result;
@@ -11420,11 +11851,13 @@ var AvsEelGlobalState = class {
 var AvsEelVm = class {
   global;
   localMemory = new AvsEelMemory();
-  variables = /* @__PURE__ */ new Map();
   maxLoopIterations;
   hostFunctions;
   randomState;
   references = /* @__PURE__ */ new Map();
+  bindings = /* @__PURE__ */ new Map();
+  variableIndexes = /* @__PURE__ */ new Map();
+  variableValues = [];
   constructor(options = {}) {
     this.global = options.global ?? new AvsEelGlobalState();
     this.hostFunctions = options.host ?? {};
@@ -11446,38 +11879,46 @@ var AvsEelVm = class {
   set(name, value) {
     this.variable(name).set(value);
   }
+  /** Resolve an EEL identifier to stable numeric storage once per VM. */
+  bindVariable(rawName) {
+    const name = rawName.toLowerCase().slice(0, 8);
+    const cached = this.bindings.get(name);
+    if (cached) return cached;
+    const register = registerIndex(name);
+    let binding;
+    if (register >= 0) {
+      binding = { values: this.global.registers, index: register };
+    } else {
+      let index = this.variableIndexes.get(name);
+      if (index === void 0) {
+        index = this.variableValues.length;
+        this.variableIndexes.set(name, index);
+        this.variableValues.push(0);
+      }
+      binding = { values: this.variableValues, index };
+    }
+    this.bindings.set(name, binding);
+    return binding;
+  }
   /** Fast path for compiler-normalized static identifiers. */
   getVariable(name) {
-    const register = registerIndex(name);
-    return register < 0 ? this.variables.get(name) ?? 0 : this.global.registers[register] ?? 0;
+    const binding = this.bindVariable(name);
+    return binding.values[binding.index] ?? 0;
   }
   /** Fast path for compiler-normalized static identifiers. */
   setVariable(name, value) {
-    const next = clean(value);
-    const register = registerIndex(name);
-    if (register < 0) this.variables.set(name, next);
-    else this.global.registers[register] = next;
+    const binding = this.bindVariable(name);
+    binding.values[binding.index] = clean(value);
   }
   variable(rawName) {
     const name = rawName.toLowerCase().slice(0, 8);
     const cached = this.references.get(name);
     if (cached) return cached;
-    const match = /^reg(\d\d)$/.exec(name);
-    if (match) {
-      const index = Number(match[1]);
-      const reference2 = {
-        get: () => this.global.registers[index] ?? 0,
-        set: (value) => {
-          this.global.registers[index] = clean(value);
-        }
-      };
-      this.references.set(name, reference2);
-      return reference2;
-    }
+    const binding = this.bindVariable(name);
     const reference = {
-      get: () => this.variables.get(name) ?? 0,
+      get: () => binding.values[binding.index] ?? 0,
       set: (value) => {
-        this.variables.set(name, clean(value));
+        binding.values[binding.index] = clean(value);
       }
     };
     this.references.set(name, reference);
@@ -11488,13 +11929,19 @@ var AvsEelVm = class {
     const index = memoryIndex(rawIndex);
     return { get: () => memory2.read(index), set: (value) => memory2.write(index, clean(value)) };
   }
-  host(name, args) {
+  readMemory(global, index) {
+    return (global ? this.global.memory : this.localMemory).read(index);
+  }
+  writeMemory(global, index, value) {
+    (global ? this.global.memory : this.localMemory).write(index, clean(value));
+  }
+  host(name, first, second = 0, third = 0) {
     const fn = this.hostFunctions[name];
     if (!fn) return 0;
     if (name === "getosc" || name === "getspec") {
-      return clean(fn(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0));
+      return clean(fn(first, second, third));
     }
-    return clean(fn(args[0] ?? 0));
+    return clean(fn(first));
   }
   random(limit) {
     let state = this.randomState + 2654435769 >>> 0;
@@ -11506,7 +11953,7 @@ var AvsEelVm = class {
     return bound > 1 ? this.randomState % bound : 0;
   }
   resetLocal() {
-    this.variables.clear();
+    this.variableValues.fill(0);
     this.localMemory.clear();
   }
 };
@@ -11542,6 +11989,14 @@ var AVS_LIST_BLEND_MODES = {
   12: "buffer-depth",
   13: "minimum"
 };
+var AVS_BLEND_TABLE = (() => {
+  const values = new Uint8Array(256 * 256);
+  for (let x = 0; x < 256; x++) {
+    const row = x << 8;
+    for (let y = 0; y < 256; y++) values[row | y] = Math.trunc(x / 255 * y);
+  }
+  return values;
+})();
 var AvsFramebuffer = class _AvsFramebuffer {
   constructor(width, height, pixels) {
     this.width = width;
@@ -11753,7 +12208,7 @@ function multiplyPixel(a, b) {
   return table(a & 255, b & 255) | table(a >>> 8 & 255, b >>> 8 & 255) << 8 | table(a >>> 16 & 255, b >>> 16 & 255) << 16;
 }
 function table(x, y) {
-  return Math.trunc(x / 255 * y);
+  return AVS_BLEND_TABLE[x << 8 | y];
 }
 function clampByte(value) {
   return value < 0 ? 0 : value > 255 ? 255 : Math.trunc(value);
@@ -12230,22 +12685,22 @@ function registerAvsClassicEffects(registry = new AvsEffectRegistry(), options =
       ctx.output.copyFrom(ctx.input);
       return { swap: true };
     }
-    let table7 = scatterTables.get(width);
-    if (!table7) {
-      table7 = new Int32Array(512);
-      for (let i = 0; i < table7.length; i++) {
+    let table6 = scatterTables.get(width);
+    if (!table6) {
+      table6 = new Int32Array(512);
+      for (let i = 0; i < table6.length; i++) {
         let dx = i % 8 - 4;
         let dy = Math.floor(i / 8) % 8 - 4;
         if (dx < 0) dx++;
         if (dy < 0) dy++;
-        table7[i] = width * dy + dx;
+        table6[i] = width * dy + dx;
       }
-      scatterTables.set(width, table7);
+      scatterTables.set(width, table6);
     }
     const edge = width * 4;
     ctx.output.pixels.set(ctx.input.pixels.subarray(0, edge), 0);
     for (let i = edge; i < width * (height - 4); i++) {
-      const offset = table7[normalizeRandom(randomInt(512), 512)];
+      const offset = table6[normalizeRandom(randomInt(512), 512)];
       ctx.output.pixels[i] = ctx.input.pixels[i + offset];
     }
     ctx.output.pixels.set(ctx.input.pixels.subarray(width * (height - 4)), width * (height - 4));
@@ -12568,11 +13023,11 @@ function decodeAvsColorMap(payload) {
   };
 }
 function buildAvsColorMapTable(points) {
-  const table7 = new Uint32Array(256);
+  const table6 = new Uint32Array(256);
   const sorted = points.length > 0 ? [...points].sort((a, b) => a.position - b.position || a.color - b.color) : defaultPoints();
   const first = sorted[0];
   const firstPosition = clamp13(first.position, 0, 255);
-  table7.fill(first.color & 16777215, 0, firstPosition);
+  table6.fill(first.color & 16777215, 0, firstPosition);
   for (let i = 0; i + 1 < sorted.length; i++) {
     const left = sorted[i];
     const right = sorted[i + 1];
@@ -12584,13 +13039,13 @@ function buildAvsColorMapTable(points) {
     let fraction = 0;
     for (let position = leftPosition; position <= rightPosition; position++) {
       const weight = Math.min(256, fraction >>> 8);
-      table7[position] = mix256(left.color, right.color, weight);
+      table6[position] = mix256(left.color, right.color, weight);
       fraction += increment;
     }
   }
   const last2 = sorted[sorted.length - 1];
-  table7.fill(last2.color & 16777215, clamp13(last2.position, 0, 255), 256);
-  return table7;
+  table6.fill(last2.color & 16777215, clamp13(last2.position, 0, 255), 256);
+  return table6;
 }
 function registerAvsColorMap(registry = new AvsEffectRegistry()) {
   const states = /* @__PURE__ */ new Map();
@@ -12611,8 +13066,8 @@ function registerAvsColorMap(registry = new AvsEffectRegistry()) {
       };
       states.set(context.component.path, state);
     }
-    const table7 = selectTable(config, state, context.beat);
-    transform(context, config, table7);
+    const table6 = selectTable(config, state, context.beat);
+    transform(context, config, table6);
   });
   return registry;
 }
@@ -12647,18 +13102,18 @@ function selectTable(config, state, beat) {
     state.previous = state.target;
     return state.tables[state.target];
   }
-  const table7 = new Uint32Array(256);
+  const table6 = new Uint32Array(256);
   const previous = state.tables[state.previous];
   const target = state.tables[state.target];
-  for (let i = 0; i < 256; i++) table7[i] = mix256(previous[i], target[i], state.progress);
-  return table7;
+  for (let i = 0; i < 256; i++) table6[i] = mix256(previous[i], target[i], state.progress);
+  return table6;
 }
-function transform(context, config, table7) {
+function transform(context, config, table6) {
   for (let i = 0; i < context.input.pixels.length; i++) {
     const destination = context.input.pixels[i] & 16777215;
     const key = colorKey(destination, config.key);
     if (key === null) continue;
-    const source3 = table7[key];
+    const source3 = table6[key];
     context.input.pixels[i] = blend(source3, destination, config.blendMode, config.adjustBlend);
   }
 }
@@ -12827,17 +13282,31 @@ function prepareConvolution(config) {
   if (firstNonzero < 0 && config.bias !== 0) firstNonzero = KERNEL_CELLS;
   const sums = coefficientSums(config.kernel, config.bias);
   const bias = Math.imul(config.bias, sign);
+  const minimumX = taps.reduce((minimum, tap) => Math.min(minimum, tap.dx), 0);
+  const maximumX = taps.reduce((maximum, tap) => Math.max(maximum, tap.dx), 0);
+  const divisor = Math.abs(config.scale) || 1;
+  const positiveTaps = taps.filter((tap) => tap.coefficient > 0);
+  const negativeTaps = taps.filter((tap) => tap.coefficient < 0);
   return {
     config,
     taps,
     rotatedTaps,
     bias,
     biasProduct: Math.imul(Math.abs(bias) & 65535, 256) & 65535,
-    divisor: Math.abs(config.scale) || 1,
+    divisor,
     hasNegative: bias < 0 || taps.some((tap) => tap.coefficient < 0),
     saturatePositive: sums.saturatePositive,
     saturateNegative: sums.saturateNegative,
-    swap: firstNonzero >= 0 && firstNonzero < 24
+    swap: firstNonzero >= 0 && firstNonzero < 24,
+    leftEdge: -minimumX,
+    rightEdge: maximumX,
+    scaleShift: divisor <= 32768 && (divisor & divisor - 1) === 0 ? Math.log2(divisor) : -1,
+    positiveDx: Int8Array.from(positiveTaps, (tap) => tap.dx),
+    positiveDy: Int8Array.from(positiveTaps, (tap) => tap.dy),
+    positiveCoefficients: Uint16Array.from(positiveTaps, (tap) => tap.coefficient),
+    negativeDx: Int8Array.from(negativeTaps, (tap) => tap.dx),
+    negativeDy: Int8Array.from(negativeTaps, (tap) => tap.dy),
+    negativeCoefficients: Uint16Array.from(negativeTaps, (tap) => -tap.coefficient)
   };
 }
 function renderConvolution(context, state) {
@@ -12847,6 +13316,10 @@ function renderConvolution(context, state) {
   const target = swap ? context.output.pixels : source3;
   const width = context.input.width;
   const height = context.input.height;
+  if (swap && !config.twoPass && state.bias === 0 && !state.saturatePositive && !state.saturateNegative && !config.absolute && !config.wrap && state.scaleShift >= 0) {
+    renderFastConvolution(source3, target, width, height, state);
+    return { swap: true };
+  }
   const first = new Uint16Array(4);
   const second = new Uint16Array(4);
   for (let y = 0; y < height; y++) {
@@ -12862,6 +13335,90 @@ function renderConvolution(context, state) {
     }
   }
   return swap ? { swap: true } : void 0;
+}
+function renderFastConvolution(source3, target, width, height, state) {
+  const dx = state.positiveDx;
+  const dy = state.positiveDy;
+  const coefficients = state.positiveCoefficients;
+  const tapCount = coefficients.length;
+  const negativeDx = state.negativeDx;
+  const negativeDy = state.negativeDy;
+  const negativeCoefficients = state.negativeCoefficients;
+  const negativeTapCount = negativeCoefficients.length;
+  if (negativeTapCount === 0 && tapCount === 1 && coefficients[0] === 1 && state.scaleShift === 0) {
+    const shiftX = dx[0];
+    const shiftY = dy[0];
+    for (let y = 0; y < height; y++) {
+      const sourceRow = clamp14(y + shiftY, 0, height - 1) * width;
+      const targetRow = y * width;
+      if (shiftX === 0) {
+        target.set(source3.subarray(sourceRow, sourceRow + width), targetRow);
+      } else {
+        for (let x = 0; x < width; x++) {
+          target[targetRow + x] = source3[sourceRow + clamp14(x + shiftX, 0, width - 1)];
+        }
+      }
+    }
+    return;
+  }
+  const rowBases = new Int32Array(tapCount);
+  const negativeRowBases = new Int32Array(negativeTapCount);
+  const interiorStart = Math.min(width, state.leftEdge);
+  const interiorEnd = Math.max(interiorStart, width - state.rightEdge);
+  const shift = state.scaleShift;
+  for (let y = 0; y < height; y++) {
+    for (let tap = 0; tap < tapCount; tap++) {
+      rowBases[tap] = clamp14(y + dy[tap], 0, height - 1) * width;
+    }
+    for (let tap = 0; tap < negativeTapCount; tap++) {
+      negativeRowBases[tap] = clamp14(y + negativeDy[tap], 0, height - 1) * width;
+    }
+    const targetRow = y * width;
+    for (let x = 0; x < width; x++) {
+      let redBlue = 0;
+      let green = 0;
+      let alpha = 0;
+      let negativeRedBlue = 0;
+      let negativeGreen = 0;
+      let negativeAlpha = 0;
+      const interior = x >= interiorStart && x < interiorEnd;
+      for (let tap = 0; tap < tapCount; tap++) {
+        const sourceX = interior ? x + dx[tap] : clamp14(x + dx[tap], 0, width - 1);
+        const pixel = source3[rowBases[tap] + sourceX];
+        const coefficient = coefficients[tap];
+        redBlue += (pixel & 16711935) * coefficient;
+        green += (pixel >>> 8 & 255) * coefficient;
+        alpha += (pixel >>> 24) * coefficient;
+      }
+      for (let tap = 0; tap < negativeTapCount; tap++) {
+        const sourceX = interior ? x + negativeDx[tap] : clamp14(x + negativeDx[tap], 0, width - 1);
+        const pixel = source3[negativeRowBases[tap] + sourceX];
+        const coefficient = negativeCoefficients[tap];
+        negativeRedBlue += (pixel & 16711935) * coefficient;
+        negativeGreen += (pixel >>> 8 & 255) * coefficient;
+        negativeAlpha += (pixel >>> 24) * coefficient;
+      }
+      let blue = redBlue & 65535;
+      let red = Math.floor(redBlue / 65536);
+      if (negativeTapCount !== 0) {
+        const negativeBlue = negativeRedBlue & 65535;
+        const negativeRed = Math.floor(negativeRedBlue / 65536);
+        blue = blue > negativeBlue ? blue - negativeBlue : 0;
+        green = green > negativeGreen ? green - negativeGreen : 0;
+        red = red > negativeRed ? red - negativeRed : 0;
+        alpha = alpha > negativeAlpha ? alpha - negativeAlpha : 0;
+      }
+      blue >>>= shift;
+      green >>>= shift;
+      red >>>= shift;
+      alpha >>>= shift;
+      if (blue > 255) blue = 255;
+      if (green > 255) green = 255;
+      if (red > 255) red = 255;
+      if (alpha > 255) alpha = 255;
+      target[targetRow + x] = (blue | green << 8 | red << 16 | alpha << 24) >>> 0;
+    }
+  }
 }
 function coefficientSums(kernel, bias) {
   let positive2 = 0;
@@ -12995,14 +13552,14 @@ function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
       state.position[2] = nextRandom(state, 32) - 6;
     } else if (context.beat) state.position = [...beat];
     const [first, second, third] = state.position;
-    const table7 = [[third, second, first], [second, first, third], [first, third, second], [third, third, third]];
+    const table6 = [[third, second, first], [second, first, third], [first, third, second], [third, third, third]];
     for (let i = 0; i < context.input.pixels.length; i++) {
       const pixel = context.input.pixels[i];
       const low = pixel & 255, middle = pixel >>> 8 & 255, high = pixel >>> 16 & 255;
       const x = middle - high;
       const y = high - low;
       const category = x > 0 && x > -y ? 0 : y < 0 && x < -y ? 1 : x < 0 && y > 0 ? 2 : 3;
-      const offsets = table7[category];
+      const offsets = table6[category];
       context.input.pixels[i] = clampByte3(low + offsets[0]) | clampByte3(middle + offsets[1]) << 8 | clampByte3(high + offsets[2]) << 16;
     }
   });
@@ -13822,6 +14379,10 @@ function registerAvsDynamicMovement(registry) {
         gridX: new Float64Array(0),
         gridY: new Float64Array(0),
         gridAlpha: new Float64Array(0),
+        cellX: new Uint16Array(0),
+        fractionX: new Float64Array(0),
+        cellY: new Uint16Array(0),
+        fractionY: new Float64Array(0),
         initialized: false
       };
       states.set(context.component.path, state);
@@ -13862,6 +14423,7 @@ function renderDynamicMovement(context, config, state) {
   const gridAlpha = state.gridAlpha;
   const width = context.input.width;
   const height = context.input.height;
+  prepareInterpolationAxis(state, width, height, columns, rows);
   const radius = Math.sqrt(width * width + height * height) * 0.5;
   for (let gy = 0; gy < rows; gy++) {
     const screenY = gy * height / (rows - 1);
@@ -13891,28 +14453,46 @@ function renderDynamicMovement(context, config, state) {
       gridAlpha[index] = clamp16(vm.get("alpha"), 0, 1);
     }
   }
+  const cellXs = state.cellX;
+  const fractionXs = state.fractionX;
+  const cellYs = state.cellY;
+  const fractionYs = state.fractionY;
+  if (!config.noMove && !config.bilinear) {
+    renderNearestGrid(
+      context,
+      config,
+      source3.pixels,
+      gridX,
+      gridY,
+      gridAlpha,
+      cellXs,
+      fractionXs,
+      cellYs,
+      fractionYs,
+      columns
+    );
+    return { swap: true };
+  }
   for (let y = 0; y < height; y++) {
-    const py = y * (rows - 1) / height;
-    const cellY = Math.min(rows - 2, Math.trunc(py));
-    const fy = py - cellY;
+    const cellY = cellYs[y];
+    const fy = fractionYs[y];
     for (let x = 0; x < width; x++) {
-      const px = x * (columns - 1) / width;
-      const cellX = Math.min(columns - 2, Math.trunc(px));
-      const fx = px - cellX;
+      const cellX = cellXs[x];
+      const fx = fractionXs[x];
       const topLeft = cellX + cellY * columns;
       const topRight = topLeft + 1;
       const bottomLeft = topLeft + columns;
       const bottomRight = bottomLeft + 1;
       const mappedX = bilerp(gridX[topLeft], gridX[topRight], gridX[bottomLeft], gridX[bottomRight], fx, fy);
       const mappedY = bilerp(gridY[topLeft], gridY[topRight], gridY[bottomLeft], gridY[bottomRight], fx, fy);
-      const alpha = Math.trunc(clamp16(bilerp(
+      const alpha = config.noMove || config.blend ? Math.trunc(clamp16(bilerp(
         gridAlpha[topLeft],
         gridAlpha[topRight],
         gridAlpha[bottomLeft],
         gridAlpha[bottomRight],
         fx,
         fy
-      ), 0, 1) * 255);
+      ), 0, 1) * 255) : 0;
       const index = x + y * width;
       if (config.noMove) {
         const maskSource = config.buffer === 0 ? 0 : source3.pixels[index];
@@ -13924,6 +14504,83 @@ function renderDynamicMovement(context, config, state) {
     }
   }
   return config.noMove ? void 0 : { swap: true };
+}
+function renderNearestGrid(context, config, source3, gridX, gridY, gridAlpha, cellXs, fractionXs, cellYs, fractionYs, columns) {
+  const width = context.input.width;
+  const height = context.input.height;
+  const destination = context.output.pixels;
+  const input = context.input.pixels;
+  const maxX = width - 1;
+  const maxY = height - 1;
+  const spanX = Math.max(1, maxX);
+  const spanY = Math.max(1, maxY);
+  const blendTable = AVS_BLEND_TABLE;
+  let index = 0;
+  for (let y = 0; y < height; y++) {
+    const cellY = cellYs[y];
+    const fy = fractionYs[y];
+    const inverseY = 1 - fy;
+    const row = cellY * columns;
+    for (let x = 0; x < width; x++, index++) {
+      const fx = fractionXs[x];
+      const topLeft = cellXs[x] + row;
+      const topRight = topLeft + 1;
+      const bottomLeft = topLeft + columns;
+      const bottomRight = bottomLeft + 1;
+      let mappedX = (gridX[topLeft] + (gridX[topRight] - gridX[topLeft]) * fx) * inverseY + (gridX[bottomLeft] + (gridX[bottomRight] - gridX[bottomLeft]) * fx) * fy;
+      let mappedY = (gridY[topLeft] + (gridY[topRight] - gridY[topLeft]) * fx) * inverseY + (gridY[bottomLeft] + (gridY[bottomRight] - gridY[bottomLeft]) * fx) * fy;
+      if (config.wrap) {
+        mappedX = (mappedX % spanX + spanX) % spanX;
+        mappedY = (mappedY % spanY + spanY) % spanY;
+      } else {
+        mappedX = clamp16(mappedX, 0, maxX);
+        mappedY = clamp16(mappedY, 0, maxY);
+      }
+      const sampled = source3[Math.trunc(mappedX) + Math.trunc(mappedY) * width];
+      if (!config.blend) {
+        destination[index] = sampled;
+        continue;
+      }
+      const rawAlpha = (gridAlpha[topLeft] + (gridAlpha[topRight] - gridAlpha[topLeft]) * fx) * inverseY + (gridAlpha[bottomLeft] + (gridAlpha[bottomRight] - gridAlpha[bottomLeft]) * fx) * fy;
+      const alpha = Math.trunc(clamp16(rawAlpha, 0, 1) * 255);
+      const inverse = 255 - alpha;
+      const current = input[index];
+      const low = blendTable[(sampled & 255) << 8 | alpha] + blendTable[(current & 255) << 8 | inverse];
+      const middle = blendTable[(sampled >>> 8 & 255) << 8 | alpha] + blendTable[(current >>> 8 & 255) << 8 | inverse];
+      const high = blendTable[(sampled >>> 16 & 255) << 8 | alpha] + blendTable[(current >>> 16 & 255) << 8 | inverse];
+      destination[index] = low | middle << 8 | high << 16;
+    }
+  }
+}
+function prepareInterpolationAxis(state, width, height, columns, rows) {
+  let rebuildX = false;
+  if (state.cellX.length !== width) {
+    state.cellX = new Uint16Array(width);
+    state.fractionX = new Float64Array(width);
+    rebuildX = true;
+  }
+  let rebuildY = false;
+  if (state.cellY.length !== height) {
+    state.cellY = new Uint16Array(height);
+    state.fractionY = new Float64Array(height);
+    rebuildY = true;
+  }
+  if (rebuildX) {
+    for (let x = 0; x < width; x++) {
+      const coordinate = x * (columns - 1) / width;
+      const cell = Math.min(columns - 2, Math.trunc(coordinate));
+      state.cellX[x] = cell;
+      state.fractionX[x] = coordinate - cell;
+    }
+  }
+  if (rebuildY) {
+    for (let y = 0; y < height; y++) {
+      const coordinate = y * (rows - 1) / height;
+      const cell = Math.min(rows - 2, Math.trunc(coordinate));
+      state.cellY[y] = cell;
+      state.fractionY[y] = coordinate - cell;
+    }
+  }
 }
 function sample(pixels, width, height, rawX, rawY, wrap2, bilinear3) {
   const maxX = bilinear3 ? Math.max(0, width - 2) : width - 1;
@@ -13992,7 +14649,7 @@ function bilerp(a, b, c, d, x, y) {
   return (a + (b - a) * x) * (1 - y) + (c + (d - c) * x) * y;
 }
 function table3(x, y) {
-  return Math.trunc(x / 255 * y);
+  return AVS_BLEND_TABLE[x << 8 | y];
 }
 function clamp16(value, minimum, maximum) {
   return value < minimum ? minimum : value > maximum ? maximum : value;
@@ -14353,7 +15010,7 @@ function buildMovementTable(context, state, global) {
   const count = width * height;
   const config = state.config;
   const bilinear3 = config.subpixel && width > 1 && height > 1 && count < 1 << 22 && (config.effect === CUSTOM_EFFECT || config.effect >= 3 && config.effect <= 23 && config.effect !== 7);
-  const table7 = {
+  const table6 = {
     offsets: new Uint32Array(count),
     xWeights: new Uint8Array(count),
     yWeights: new Uint8Array(count),
@@ -14363,21 +15020,21 @@ function buildMovementTable(context, state, global) {
     for (let i = 0; i < count; i++) {
       const dx = nextRandom3(state) % 3 - 1;
       const dy = nextRandom3(state) % 3 - 1;
-      table7.offsets[i] = clamp17(i + dx + dy * width, 0, count - 1);
+      table6.offsets[i] = clamp17(i + dx + dy * width, 0, count - 1);
     }
-    return table7;
+    return table6;
   }
   if (config.effect === 2) {
     const shift = Math.trunc(width / 64);
     for (let y = 0; y < height; y++) {
       let sourceX = shift;
       for (let x = 0; x < width; x++) {
-        table7.offsets[x + y * width] = sourceX + y * width;
+        table6.offsets[x + y * width] = sourceX + y * width;
         sourceX++;
         if (sourceX >= width) sourceX -= width;
       }
     }
-    return table7;
+    return table6;
   }
   if (config.effect === 7) {
     for (let y = 0; y < height; y++) {
@@ -14388,17 +15045,17 @@ function buildMovementTable(context, state, global) {
           sourceX = Math.trunc(width / 2 + ((x & ~1) - width / 2) * 7 / 8);
           sourceY = Math.trunc(height / 2 + ((y & ~1) - height / 2) * 7 / 8);
         }
-        table7.offsets[x + y * width] = clamp17(sourceX, 0, width - 1) + clamp17(sourceY, 0, height - 1) * width;
+        table6.offsets[x + y * width] = clamp17(sourceX, 0, width - 1) + clamp17(sourceY, 0, height - 1) * width;
       }
     }
-    return table7;
+    return table6;
   }
-  if (state.program) buildEvaluatedTable(context, state, table7, global);
-  else if (config.effect >= 3 && config.effect <= 17) buildNativeTable(state, table7, width, height);
-  else fillIdentity(table7, width, height);
-  return table7;
+  if (state.program) buildEvaluatedTable(context, state, table6, global);
+  else if (config.effect >= 3 && config.effect <= 17) buildNativeTable(state, table6, width, height);
+  else fillIdentity(table6, width, height);
+  return table6;
 }
-function buildNativeTable(state, table7, width, height) {
+function buildNativeTable(state, table6, width, height) {
   const halfWidth = Math.trunc(width / 2);
   const halfHeight = Math.trunc(height / 2);
   const maxDistance = Math.sqrt(width * width + height * height) / 2;
@@ -14471,11 +15128,11 @@ function buildNativeTable(state, table7, width, height) {
       }
       const sampleX = halfWidth + Math.cos(angle) * distance + 0.5 + xOffset * width / 256;
       const sampleY = halfHeight + Math.sin(angle) * distance + 0.5;
-      storeCoordinate(table7, x + y * width, sampleX, sampleY, width, height, state.config.wrap);
+      storeCoordinate(table6, x + y * width, sampleX, sampleY, width, height, state.config.wrap);
     }
   }
 }
-function buildEvaluatedTable(context, state, table7, global) {
+function buildEvaluatedTable(context, state, table6, global) {
   const { width, height } = context.input;
   const halfWidth = Math.trunc(width / 2);
   const halfHeight = Math.trunc(height / 2);
@@ -14508,16 +15165,16 @@ function buildEvaluatedTable(context, state, table7, global) {
         sampleX = halfWidth + Math.cos(angle) * distance;
         sampleY = halfHeight + Math.sin(angle) * distance;
       }
-      if (!table7.bilinear) {
+      if (!table6.bilinear) {
         sampleX += 0.5;
         sampleY += 0.5;
       }
-      storeCoordinate(table7, x + y * width, sampleX, sampleY, width, height, state.config.wrap);
+      storeCoordinate(table6, x + y * width, sampleX, sampleY, width, height, state.config.wrap);
     }
   }
 }
-function storeCoordinate(table7, destination, rawX, rawY, width, height, wrap2) {
-  if (!table7.bilinear) {
+function storeCoordinate(table6, destination, rawX, rawY, width, height, wrap2) {
+  if (!table6.bilinear) {
     let x2 = Math.trunc(rawX);
     let y2 = Math.trunc(rawY);
     if (wrap2) {
@@ -14527,7 +15184,7 @@ function storeCoordinate(table7, destination, rawX, rawY, width, height, wrap2) 
       x2 = clamp17(x2, 0, width - 1);
       y2 = clamp17(y2, 0, height - 1);
     }
-    table7.offsets[destination] = x2 + y2 * width;
+    table6.offsets[destination] = x2 + y2 * width;
     return;
   }
   let x = Math.trunc(rawX);
@@ -14554,26 +15211,43 @@ function storeCoordinate(table7, destination, rawX, rawY, width, height, wrap2) 
     }
   }
   const packed = (x + y * width | yPartial << 22 | xPartial << 27) >>> 0;
-  table7.offsets[destination] = packed & OFFSET_MASK;
-  table7.xWeights[destination] = packed >>> 24 & 31 << 3;
-  table7.yWeights[destination] = packed >>> 19 & 31 << 3;
+  table6.offsets[destination] = packed & OFFSET_MASK;
+  table6.xWeights[destination] = packed >>> 24 & 31 << 3;
+  table6.yWeights[destination] = packed >>> 19 & 31 << 3;
 }
-function renderInverse(context, table7, blend2) {
+function renderInverse(context, table6, blend2) {
   const source3 = context.input.pixels;
   const output = context.output.pixels;
   const width = context.input.width;
-  for (let i = 0; i < output.length; i++) {
-    const mapped = table7.bilinear ? sampleBilinear(source3, table7.offsets[i], width, table7.xWeights[i], table7.yWeights[i]) : source3[table7.offsets[i]];
-    output[i] = blend2 ? averagePixel3(source3[i], mapped) : mapped;
+  if (table6.bilinear) {
+    if (blend2) {
+      for (let i = 0; i < output.length; i++) {
+        output[i] = averagePixel3(source3[i], sampleBilinear(
+          source3,
+          table6.offsets[i],
+          width,
+          table6.xWeights[i],
+          table6.yWeights[i]
+        ));
+      }
+    } else {
+      for (let i = 0; i < output.length; i++) {
+        output[i] = sampleBilinear(source3, table6.offsets[i], width, table6.xWeights[i], table6.yWeights[i]);
+      }
+    }
+  } else if (blend2) {
+    for (let i = 0; i < output.length; i++) output[i] = averagePixel3(source3[i], source3[table6.offsets[i]]);
+  } else {
+    for (let i = 0; i < output.length; i++) output[i] = source3[table6.offsets[i]];
   }
 }
-function renderForward(context, table7, blend2) {
+function renderForward(context, table6, blend2) {
   const source3 = context.input.pixels;
   const output = context.output.pixels;
   if (blend2) output.set(source3);
   else output.fill(0);
   for (let i = 0; i < source3.length; i++) {
-    const destination = table7.offsets[i];
+    const destination = table6.offsets[i];
     output[destination] = maximumPixel2(source3[i], output[destination]);
   }
   if (blend2) {
@@ -14581,23 +15255,24 @@ function renderForward(context, table7, blend2) {
   }
 }
 function sampleBilinear(source3, offset, width, xp, yp) {
+  const blendTable = AVS_BLEND_TABLE;
   const inverseX = 255 - xp;
   const inverseY = 255 - yp;
-  const w0 = table5(inverseX, inverseY);
-  const w1 = table5(xp, inverseY);
-  const w2 = table5(inverseX, yp);
-  const w3 = table5(xp, yp);
+  const w0 = blendTable[inverseX << 8 | inverseY];
+  const w1 = blendTable[xp << 8 | inverseY];
+  const w2 = blendTable[inverseX << 8 | yp];
+  const w3 = blendTable[xp << 8 | yp];
   const p0 = source3[offset];
   const p1 = source3[offset + 1];
   const p2 = source3[offset + width];
   const p3 = source3[offset + width + 1];
-  const low = table5(p0 & 255, w0) + table5(p1 & 255, w1) + table5(p2 & 255, w2) + table5(p3 & 255, w3);
-  const middle = table5(p0 >>> 8 & 255, w0) + table5(p1 >>> 8 & 255, w1) + table5(p2 >>> 8 & 255, w2) + table5(p3 >>> 8 & 255, w3);
-  const high = table5(p0 >>> 16 & 255, w0) + table5(p1 >>> 16 & 255, w1) + table5(p2 >>> 16 & 255, w2) + table5(p3 >>> 16 & 255, w3);
+  const low = blendTable[(p0 & 255) << 8 | w0] + blendTable[(p1 & 255) << 8 | w1] + blendTable[(p2 & 255) << 8 | w2] + blendTable[(p3 & 255) << 8 | w3];
+  const middle = blendTable[(p0 >>> 8 & 255) << 8 | w0] + blendTable[(p1 >>> 8 & 255) << 8 | w1] + blendTable[(p2 >>> 8 & 255) << 8 | w2] + blendTable[(p3 >>> 8 & 255) << 8 | w3];
+  const high = blendTable[(p0 >>> 16 & 255) << 8 | w0] + blendTable[(p1 >>> 16 & 255) << 8 | w1] + blendTable[(p2 >>> 16 & 255) << 8 | w2] + blendTable[(p3 >>> 16 & 255) << 8 | w3];
   return low & 255 | (middle & 255) << 8 | (high & 255) << 16;
 }
-function fillIdentity(table7, width, height) {
-  for (let i = 0; i < width * height; i++) table7.offsets[i] = i;
+function fillIdentity(table6, width, height) {
+  for (let i = 0; i < width * height; i++) table6.offsets[i] = i;
 }
 function averagePixel3(a, b) {
   return (a >>> 1 & 8355711) + (b >>> 1 & 8355711) & 16777215;
@@ -14612,9 +15287,6 @@ function nextRandom3(state) {
   x ^= x << 5;
   state.randomState = x >>> 0;
   return state.randomState;
-}
-function table5(x, y) {
-  return Math.trunc(x / 255 * y);
 }
 function modulo4(value, modulus) {
   if (modulus <= 0) return 0;
@@ -15386,7 +16058,7 @@ function registerUniqueTone(registry) {
       const original = pixels[i];
       let depth = Math.max(original & 255, original >>> 8 & 255, original >>> 16 & 255);
       if (config.invert) depth = 255 - depth;
-      const tone = table6(depth, blue) | table6(depth, green) << 8 | table6(depth, red) << 16;
+      const tone = table5(depth, blue) | table5(depth, green) << 8 | table5(depth, red) << 16;
       pixels[i] = config.additive ? blendPixel(tone, original, "additive") : config.average ? averagePixel4(original, tone) : tone;
     }
   });
@@ -15453,12 +16125,12 @@ function avsIntegerSquareRoot(value) {
   return Math.trunc(Math.sqrt(n));
 }
 function sampleBilinear2(source3, offset, width, xp, yp) {
-  const weights = [table6(255 - xp, 255 - yp), table6(xp, 255 - yp), table6(255 - xp, yp), table6(xp, yp)];
+  const weights = [table5(255 - xp, 255 - yp), table5(xp, 255 - yp), table5(255 - xp, yp), table5(xp, yp)];
   const pixels = [source3[offset], source3[offset + 1], source3[offset + width], source3[offset + width + 1]];
   let result = 0;
   for (let shift = 0; shift <= 16; shift += 8) {
     let value = 0;
-    for (let i = 0; i < 4; i++) value += table6(pixels[i] >>> shift & 255, weights[i]);
+    for (let i = 0; i < 4; i++) value += table5(pixels[i] >>> shift & 255, weights[i]);
     result |= (value & 255) << shift;
   }
   return result;
@@ -15469,7 +16141,7 @@ function eelChannel(value) {
 function averagePixel4(a, b) {
   return (a >>> 1 & 8355711) + (b >>> 1 & 8355711) & 16777215;
 }
-function table6(x, y) {
+function table5(x, y) {
   return Math.trunc(x / 255 * y);
 }
 function i327(payload, offset, fallback) {
@@ -15545,7 +16217,8 @@ function registerAvsSuperScope(registry, global = registry.eelGlobal) {
         ],
         initialized: false,
         colorPosition: 0,
-        centeredAudio: new Uint8Array(576)
+        centeredAudio: new Uint8Array(576),
+        variables: bindVariables(vm)
       };
       states.set(context.component.path, state);
     }
@@ -15557,6 +16230,7 @@ function registerAvsSuperScope(registry, global = registry.eelGlobal) {
 function renderSuperScope(context, config, state) {
   if (config.colors.length === 0) return;
   const { vm } = state;
+  const variables = state.variables;
   vm.setHost({
     getosc: (band, width, channel) => avsAudioSample(context.audio, "osc", band, width, channel),
     getspec: (band, width, channel) => avsAudioSample(context.audio, "spec", band, width, channel)
@@ -15564,15 +16238,15 @@ function renderSuperScope(context, config, state) {
   state.colorPosition++;
   if (state.colorPosition >= config.colors.length * 64) state.colorPosition = 0;
   const color = interpolatedColor(config.colors, state.colorPosition);
-  vm.set("h", context.input.height);
-  vm.set("w", context.input.width);
-  vm.set("b", context.beat ? 1 : 0);
-  vm.set("blue", (color & 255) / 255);
-  vm.set("green", (color >>> 8 & 255) / 255);
-  vm.set("red", (color >>> 16 & 255) / 255);
-  vm.set("skip", 0);
-  vm.set("linesize", context.line.lineWidth >>> 0 & 255);
-  vm.set("drawmode", config.lines ? 1 : 0);
+  setBinding(variables.h, context.input.height);
+  setBinding(variables.w, context.input.width);
+  setBinding(variables.b, context.beat ? 1 : 0);
+  setBinding(variables.blue, (color & 255) / 255);
+  setBinding(variables.green, (color >>> 8 & 255) / 255);
+  setBinding(variables.red, (color >>> 16 & 255) / 255);
+  setBinding(variables.skip, 0);
+  setBinding(variables.linesize, context.line.lineWidth >>> 0 & 255);
+  setBinding(variables.drawmode, config.lines ? 1 : 0);
   if (!state.initialized) {
     execute5(state.programs[3], vm);
     state.initialized = true;
@@ -15580,7 +16254,7 @@ function renderSuperScope(context, config, state) {
   execute5(state.programs[1], vm);
   if (context.beat) execute5(state.programs[2], vm);
   if (!state.programs[0]) return;
-  const count = Math.min(MAX_POINTS, Math.trunc(vm.get("n")));
+  const count = Math.min(MAX_POINTS, Math.trunc(getBinding(variables.n)));
   if (count <= 0) return;
   const data = scopeChannel(context, config.channel, state.centeredAudio);
   const xor = (config.channel & 4) !== 0 ? 0 : 128;
@@ -15593,18 +16267,18 @@ function renderSuperScope(context, config, state) {
     const fraction = audioPosition - sourceIndex;
     const a = data[Math.min(575, sourceIndex)] ^ xor;
     const b = data[Math.min(575, sourceIndex + 1)] ^ xor;
-    vm.set("v", (a * (1 - fraction) + b * fraction) / 128 - 1);
-    vm.set("i", count === 1 ? 0 : index / (count - 1));
-    vm.set("skip", 0);
-    execute5(state.programs[0], vm);
-    const x = Math.trunc((vm.get("x") + 1) * context.input.width * 0.5);
-    const y = Math.trunc((vm.get("y") + 1) * context.input.height * 0.5);
-    if (vm.get("skip") < 1e-5) {
-      const drawColor = makeByte(vm.get("blue")) | makeByte(vm.get("green")) << 8 | makeByte(vm.get("red")) << 16;
-      if (vm.get("drawmode") < 1e-5) {
+    setBinding(variables.v, (a * (1 - fraction) + b * fraction) / 128 - 1);
+    setBinding(variables.i, count === 1 ? 0 : index / (count - 1));
+    setBinding(variables.skip, 0);
+    state.programs[0].execute(vm);
+    const x = Math.trunc((getBinding(variables.x) + 1) * context.input.width * 0.5);
+    const y = Math.trunc((getBinding(variables.y) + 1) * context.input.height * 0.5);
+    if (getBinding(variables.skip) < 1e-5) {
+      const drawColor = makeByte(getBinding(variables.blue)) | makeByte(getBinding(variables.green)) << 8 | makeByte(getBinding(variables.red)) << 16;
+      if (getBinding(variables.drawmode) < 1e-5) {
         drawPoint(context, x, y, drawColor);
       } else if (canDraw && (drawColor !== 0 || context.line.blendMode !== 1)) {
-        drawLine2(context, lastX, lastY, x, y, drawColor, Math.trunc(vm.get("linesize") + 0.5));
+        drawLine2(context, lastX, lastY, x, y, drawColor, Math.trunc(getBinding(variables.linesize) + 0.5));
       }
     }
     canDraw = true;
@@ -15692,6 +16366,30 @@ function drawLine2(context, x1, y1, x2, y2, color, requestedWidth) {
 }
 function execute5(program, vm) {
   return program ? vm.execute(program) : 0;
+}
+function bindVariables(vm) {
+  return {
+    n: vm.bindVariable("n"),
+    h: vm.bindVariable("h"),
+    w: vm.bindVariable("w"),
+    b: vm.bindVariable("b"),
+    blue: vm.bindVariable("blue"),
+    green: vm.bindVariable("green"),
+    red: vm.bindVariable("red"),
+    skip: vm.bindVariable("skip"),
+    linesize: vm.bindVariable("linesize"),
+    drawmode: vm.bindVariable("drawmode"),
+    v: vm.bindVariable("v"),
+    i: vm.bindVariable("i"),
+    x: vm.bindVariable("x"),
+    y: vm.bindVariable("y")
+  };
+}
+function getBinding(binding) {
+  return binding.values[binding.index] ?? 0;
+}
+function setBinding(binding, value) {
+  binding.values[binding.index] = Number.isFinite(value) ? value : 0;
 }
 function compileOrNull4(source3) {
   if (!source3.trim()) return null;
@@ -17301,6 +17999,156 @@ function clampIndex(value, length) {
   return Math.max(0, Math.min(length - 1, Math.trunc(value)));
 }
 
+// src/avs-worker-client.ts
+var AVS_PCM_SAMPLES = 576;
+var SingleFrameGate = class {
+  pending = false;
+  get busy() {
+    return this.pending;
+  }
+  tryBegin() {
+    if (this.pending) return false;
+    this.pending = true;
+    return true;
+  }
+  finish() {
+    this.pending = false;
+  }
+};
+function fillAvsPcm(waveform, pcm) {
+  if (pcm.length !== AVS_PCM_SAMPLES * 2) {
+    throw new RangeError(`AVS PCM buffer must contain ${AVS_PCM_SAMPLES * 2} samples`);
+  }
+  const frames2 = Math.max(1, Math.trunc(waveform.length / 2));
+  for (let i = 0; i < AVS_PCM_SAMPLES; i++) {
+    const source3 = Math.min(frames2 - 1, Math.trunc(i * frames2 / AVS_PCM_SAMPLES));
+    const left = waveform[source3 * 2] ?? 0;
+    pcm[i] = left;
+    pcm[AVS_PCM_SAMPLES + i] = waveform[source3 * 2 + 1] ?? left;
+  }
+}
+var AvsWorkerRenderer = class {
+  worker;
+  canvas;
+  context;
+  onFrame;
+  gate = new SingleFrameGate();
+  generation = 0;
+  sequence = 0;
+  pcm = new Float32Array(AVS_PCM_SAMPLES * 2);
+  loadResolve = null;
+  loadReject = null;
+  loaded = false;
+  disposed = false;
+  emaMs = 0;
+  unsupported = 0;
+  lastRenderMs = 0;
+  lastPresentMs = 0;
+  static supported() {
+    return typeof Worker !== "undefined" && typeof OffscreenCanvas !== "undefined";
+  }
+  constructor(options) {
+    this.canvas = options.canvas;
+    this.context = options.context;
+    this.onFrame = options.onFrame;
+    this.worker = options.createWorker?.() ?? new Worker(new URL("./avs-render.worker.js", import.meta.url), { type: "module", name: "aaavs-compat-renderer" });
+    this.worker.onmessage = (event) => this.receive(event.data);
+    this.worker.onerror = (event) => {
+      this.failLoad(new Error(event.message || "AVS render worker failed"));
+      this.gate.finish();
+    };
+  }
+  get active() {
+    return this.loaded && !this.disposed;
+  }
+  get busy() {
+    return this.gate.busy;
+  }
+  get averageRenderMs() {
+    return this.emaMs;
+  }
+  load(bytes, width, height) {
+    if (this.disposed) return Promise.reject(new Error("AVS render worker has been disposed"));
+    this.clear();
+    const generation = this.generation;
+    const preset2 = new Uint8Array(bytes).buffer;
+    return new Promise((resolve, reject) => {
+      this.loadResolve = resolve;
+      this.loadReject = reject;
+      this.worker.postMessage({ type: "load", generation, preset: preset2, width, height }, [preset2]);
+    });
+  }
+  /** Dispatches at most one frame. False means an existing frame is still running. */
+  render(audio2, width, height) {
+    if (!this.active || !this.gate.tryBegin()) return false;
+    fillAvsPcm(audio2.waveform, this.pcm);
+    const pcm = this.pcm.buffer;
+    this.worker.postMessage({
+      type: "render",
+      generation: this.generation,
+      sequence: ++this.sequence,
+      pcm,
+      width,
+      height
+    }, [pcm]);
+    return true;
+  }
+  clear() {
+    if (this.disposed) return;
+    this.failLoad(new Error("AVS preset load superseded"));
+    this.generation++;
+    this.loaded = false;
+    this.gate.finish();
+    this.worker.postMessage({ type: "clear", generation: this.generation });
+  }
+  dispose() {
+    if (this.disposed) return;
+    this.clear();
+    this.disposed = true;
+    this.worker.terminate();
+  }
+  receive(message) {
+    if (message.type === "frame") {
+      this.pcm = new Float32Array(message.pcm);
+      this.gate.finish();
+      if (message.generation !== this.generation || !this.loaded) {
+        message.bitmap.close();
+        return;
+      }
+      const started = performance.now();
+      if (this.canvas.width !== message.width || this.canvas.height !== message.height) {
+        this.canvas.width = message.width;
+        this.canvas.height = message.height;
+      }
+      this.context.drawImage(message.bitmap, 0, 0);
+      message.bitmap.close();
+      this.lastPresentMs = performance.now() - started;
+      this.lastRenderMs = message.renderMs;
+      this.emaMs = this.emaMs === 0 ? message.renderMs : this.emaMs * 0.85 + message.renderMs * 0.15;
+      this.unsupported = message.unsupported;
+      this.onFrame?.();
+      return;
+    }
+    if (message.generation !== this.generation) return;
+    if (message.type === "ready") {
+      this.loaded = true;
+      this.unsupported = message.unsupported;
+      this.loadResolve?.();
+      this.loadResolve = null;
+      this.loadReject = null;
+      return;
+    }
+    const error = new Error(message.message);
+    this.failLoad(error);
+    this.gate.finish();
+  }
+  failLoad(error) {
+    this.loadReject?.(error);
+    this.loadResolve = null;
+    this.loadReject = null;
+  }
+};
+
 // src/shaders/present.wgsl
 var present_default = "// Final pass: HDR accumulation -> swapchain.\n//\n// Everything upstream is rgba16float and freely exceeds 1.0. This is the only\n// place that becomes a displayable image, so it owns bloom, tone mapping and\n// the vignette, and it is the only place that should.\n\nstruct Post {\n  bloom    : f32,\n  exposure : f32,\n  vignette : f32,\n  aspect   : f32,\n  grain    : f32,\n  time     : f32,\n  pad0     : f32,\n  pad1     : f32,\n};\n\n@group(0) @binding(0) var src : texture_2d<f32>;\n@group(0) @binding(1) var samp : sampler;\n@group(0) @binding(2) var<uniform> P : Post;\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  let p = array<vec2<f32>, 3>(\n    vec2<f32>(-1.0, -1.0), vec2<f32>( 3.0, -1.0), vec2<f32>(-1.0,  3.0),\n  );\n  return vec4<f32>(p[vi], 0.0, 1.0);\n}\n\n// Narkowicz ACES. A *look*, not a correction \u2014 it rolls highlights off so\n// additive accumulation stops clipping to flat white.\nfn aces(x: vec3<f32>) -> vec3<f32> {\n  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;\n  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));\n}\n\nfn hash21(p: vec2<f32>) -> f32 {\n  var p3 = fract(vec3<f32>(p.xyx) * 0.1031);\n  p3 = p3 + dot(p3, p3.yzx + 33.33);\n  return fract((p3.x + p3.y) * p3.z);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let dims = vec2<f32>(textureDimensions(src));\n  let uv = frag.xy / dims;\n  let texel = 1.0 / dims;\n\n  var col = textureSampleLevel(src, samp, uv, 0.0).rgb;\n\n  // Cheap threshold bloom. A real mip chain belongs here (plan \xA74.11) \u2014 this is\n  // a fixed 12-tap ring, which is honest for a vertical slice and would be the\n  // wrong answer at 2K120.\n  if (P.bloom > 0.001) {\n    var sum = vec3<f32>(0.0);\n    let radius = 9.0;\n    for (var i = 0; i < 12; i = i + 1) {\n      let a = f32(i) * 0.5235988;           // 2pi/12\n      let o = vec2<f32>(cos(a), sin(a)) * radius * texel;\n      let s = textureSampleLevel(src, samp, uv + o, 0.0).rgb;\n      sum = sum + max(s - vec3<f32>(0.6), vec3<f32>(0.0));\n    }\n    col = col + sum * (P.bloom / 12.0);\n  }\n\n  col = col * P.exposure;\n\n  // Vignette. Multiplicative and gentle \u2014 art-direction \xA74.3 wants most of the\n  // frame near-black, and this helps without eating the subject.\n  let d = length((uv - 0.5) * vec2<f32>(P.aspect, 1.0));\n  col = col * mix(1.0, smoothstep(1.05, 0.25, d), P.vignette);\n\n  col = aces(col);\n\n  // Grain after tone mapping, so it lives in display space and does not get\n  // crushed by the curve.\n  if (P.grain > 0.001) {\n    let n = hash21(frag.xy + vec2<f32>(P.time * 60.0, P.time * 37.0)) - 0.5;\n    col = col + vec3<f32>(n * P.grain * 0.06);\n  }\n\n  return vec4<f32>(col, 1.0);\n}\n";
 
@@ -17634,6 +18482,7 @@ var transition = new Transition();
 var outgoingFrame = null;
 var captureOutgoing = false;
 function applyPreset(next, spec, now = 0, bpm = 120) {
+  avsWorkerRenderer?.clear();
   avsRuntime = null;
   avsPresetName = "";
   avsCanvas.style.display = "none";
@@ -17688,10 +18537,30 @@ var avsPresetName = "";
 var avsUnsupported = 0;
 var avsPcmLeft = new Float32Array(576);
 var avsPcmRight = new Float32Array(576);
-var avsGovernor = new AvsFrameGovernor();
+var avsGovernor = new AvsFrameGovernor({ initialTier: 0 });
 var avsImage = null;
 var avsImageWords = null;
 var avsLastRenderMs = 0;
+var avsWorkerFrameReady = false;
+var avsWorkerRenderer = createAvsWorkerRenderer();
+function createAvsWorkerRenderer() {
+  if (!AvsWorkerRenderer.supported() || !avsContext) return null;
+  try {
+    return new AvsWorkerRenderer({
+      canvas: avsCanvas,
+      context: avsContext,
+      onFrame() {
+        avsWorkerFrameReady = true;
+        if (!avsWorkerRenderer) return;
+        avsLastRenderMs = avsWorkerRenderer.lastRenderMs;
+        avsUnsupported = avsWorkerRenderer.unsupported;
+      }
+    });
+  } catch (error) {
+    console.warn("[aaavs] could not create AVS render worker, using main-thread fallback:", error);
+    return null;
+  }
+}
 function syncAvsSurface() {
   if (!avsRuntime) return;
   const { width, height } = avsGovernor.dimensions(gpu.width, gpu.height);
@@ -17708,6 +18577,25 @@ function syncAvsSurface() {
 async function loadAvsPreset(bytes, fileName) {
   avsGovernor.reset();
   const { width, height } = avsGovernor.dimensions(gpu.width, gpu.height);
+  avsRuntime = null;
+  avsWorkerFrameReady = false;
+  if (avsWorkerRenderer) {
+    try {
+      await avsWorkerRenderer.load(bytes, width, height);
+      avsUnsupported = avsWorkerRenderer.unsupported;
+      avsPresetName = fileName.replace(/\.avs$/i, "");
+      avsCanvas.width = width;
+      avsCanvas.height = height;
+      avsLastRenderMs = 0;
+      avsCanvas.style.display = "block";
+      director.enabled = false;
+      return;
+    } catch (error) {
+      console.warn("[aaavs] worker renderer unavailable, using main-thread fallback:", error);
+      avsWorkerRenderer.dispose();
+      avsWorkerRenderer = null;
+    }
+  }
   const bitmapResolver = await loadBundledAvsBitmapResolver();
   const registry = createAvsCompatibilityRegistry({}, { bitmapResolver });
   avsRuntime = new AvsCompatibilityRuntime(bytes, width, height, registry);
@@ -17722,7 +18610,13 @@ async function loadAvsPreset(bytes, fileName) {
   director.enabled = false;
 }
 function renderAvsPreset(audioFrame, nowMs) {
-  if (!avsRuntime || !avsContext || !avsGovernor.shouldRender(nowMs)) return false;
+  if (!avsContext) return false;
+  if (avsWorkerRenderer?.active) {
+    if (avsWorkerRenderer.busy || !avsGovernor.shouldRender(nowMs)) return false;
+    const { width, height } = avsGovernor.dimensions(gpu.width, gpu.height);
+    return avsWorkerRenderer.render(audioFrame, width, height);
+  }
+  if (!avsRuntime || !avsGovernor.shouldRender(nowMs)) return false;
   syncAvsSurface();
   const started = performance.now();
   const frames2 = Math.max(1, Math.trunc(audioFrame.waveform.length / 2));
@@ -17800,6 +18694,7 @@ var ui = new LayerUI({
     skipBar(direction);
   },
   onLoadPreset(next) {
+    avsWorkerRenderer?.clear();
     avsRuntime = null;
     avsPresetName = "";
     avsCanvas.style.display = "none";
@@ -17955,8 +18850,11 @@ function renderFrame(nowMs) {
   peakLevel = Math.max(a.level, peakLevel - dt * 0.9);
   const nowBeats = timeline.slotAt(t) / SLOTS_PER_BEAT;
   const transportBeats = tlBpm > 0 ? nowBeats : t * bpm / 60;
-  if (avsRuntime && !harness) {
-    const presented = !audio.isPaused && renderAvsPreset(a, nowMs);
+  if ((avsWorkerRenderer?.active || avsRuntime) && !harness) {
+    const workerPresented = avsWorkerFrameReady;
+    avsWorkerFrameReady = false;
+    const submitted = !audio.isPaused && renderAvsPreset(a, nowMs);
+    const presented = avsWorkerRenderer?.active ? workerPresented : submitted;
     if (presented) frameCount++;
     updateFrameReadout(a, t, bpm, transportBeats, wallDt, presented);
     requestAnimationFrame(frame);
@@ -18023,6 +18921,9 @@ function renderFrame(nowMs) {
   requestAnimationFrame(frame);
 }
 function updateHud(t, bpm) {
+  const avsActive = Boolean(avsWorkerRenderer?.active || avsRuntime);
+  const avsWidth = avsWorkerRenderer?.active ? avsCanvas.width : avsRuntime?.framebuffer.width;
+  const avsHeight = avsWorkerRenderer?.active ? avsCanvas.height : avsRuntime?.framebuffer.height;
   const lock = tempo.locked ? `${tempo.bpm.toFixed(1)} BPM \xB7 ${timeline.confidence * 100 | 0}%` : `listening\u2026 (assuming ${bpm})`;
   const det = detector.attached ? `worklet \xB7 ring ${ringAvailable()} \xB7 dropped ${detector.dropped}` : detectorError ? "rAF fallback (worklet failed)" : "rAF (worklet not attached)";
   const bold = (value) => {
@@ -18033,12 +18934,12 @@ function updateHud(t, bpm) {
   const lines = [
     [
       bold(`${fps.toFixed(0)} fps`),
-      ` \xB7 ${avsRuntime ? `${avsRuntime.framebuffer.width}\xD7${avsRuntime.framebuffer.height} AVS` : `${gpu.width}\xD7${gpu.height}`}`,
+      ` \xB7 ${avsActive ? `${avsWidth}\xD7${avsHeight} AVS` : `${gpu.width}\xD7${gpu.height}`}`,
       ...harness ? [" \xB7 ", bold("GOLDEN")] : []
     ],
-    ["preset ", bold(avsRuntime ? `${avsPresetName} (AVS compatibility)` : preset.name), ` \xB7 ${avsRuntime ? "legacy ordered graph" : `${stack.length} layers`} \xB7 auto `, bold(director.enabled ? "on" : "off"), ` (${director.dynamic ? `${director.minBars}\u2013${director.maxBars}bar responsive` : `${director.every}bar`})`],
-    ...avsRuntime ? [[
-      `AVS ${avsLastRenderMs.toFixed(1)}ms \xB7 quality ${avsGovernor.qualityIndex + 1}/${AVS_QUALITY_TIERS.length} \xB7 unsupported records `,
+    ["preset ", bold(avsActive ? `${avsPresetName} (AVS compatibility)` : preset.name), ` \xB7 ${avsActive ? "legacy ordered graph" : `${stack.length} layers`} \xB7 auto `, bold(director.enabled ? "on" : "off"), ` (${director.dynamic ? `${director.minBars}\u2013${director.maxBars}bar responsive` : `${director.every}bar`})`],
+    ...avsActive ? [[
+      `AVS ${avsLastRenderMs.toFixed(1)}ms \xB7 ${avsWorkerRenderer?.active ? `worker \xB7 present ${avsWorkerRenderer.lastPresentMs.toFixed(2)}ms \xB7 full quality` : `fallback quality ${avsGovernor.qualityIndex + 1}/${AVS_QUALITY_TIERS.length}`} \xB7 unsupported records `,
       bold(avsUnsupported)
     ]] : [],
     ["tempo ", bold(lock), ` \xB7 horizon ${timeline.horizonSec.toFixed(2)}s`],
@@ -18065,6 +18966,7 @@ function disposePage() {
   pageDisposed = true;
   detector.detach();
   audio.dispose();
+  avsWorkerRenderer?.dispose();
 }
 window.addEventListener("pagehide", disposePage, { once: true });
 window.addEventListener("beforeunload", disposePage, { once: true });
