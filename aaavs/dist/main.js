@@ -10708,8 +10708,8 @@ function pcmBytes(samples) {
   const out = new Uint8Array(AVS_AUDIO_SAMPLES);
   for (let i = 0; i < out.length; i++) {
     const value = clamp11(samples[i], -1, 1);
-    const pcm16 = value <= -1 ? -32768 : Math.round(value * 32767);
-    out[i] = pcm16 >> 8 & 255;
+    const pcm162 = value <= -1 ? -32768 : Math.round(value * 32767);
+    out[i] = pcm162 >> 8 & 255;
   }
   return out;
 }
@@ -18149,6 +18149,2089 @@ var AvsWorkerRenderer = class {
   }
 };
 
+// src/offline-render-client.ts
+async function directoryIsNonempty(directory) {
+  const iterable = directory;
+  for await (const _entry of iterable.values()) return true;
+  return false;
+}
+var OfflineRenderClient = class {
+  worker;
+  options;
+  activeJobId = "";
+  resolve = null;
+  reject = null;
+  disposed = false;
+  constructor(options = {}) {
+    this.options = options;
+    this.worker = options.createWorker?.() ?? new Worker(
+      new URL("./offline-render.worker.js", import.meta.url),
+      { type: "module", name: "aaavs-offline-renderer" }
+    );
+    this.worker.onmessage = (event) => this.receive(event.data);
+    this.worker.onerror = (event) => this.fail(new Error(event.message || "Offline render worker failed"));
+  }
+  get active() {
+    return this.activeJobId !== "" && this.resolve !== null;
+  }
+  async start(input) {
+    if (this.disposed) throw new Error("Offline render client has been disposed");
+    if (this.active) throw new Error("An offline render is already active");
+    if (await directoryIsNonempty(input.outputDirectory)) {
+      throw new Error("Output directory must be empty. AAAVS will not overwrite an existing package.");
+    }
+    const left = transferableBuffer(input.left);
+    const right = transferableBuffer(input.right);
+    const presetBank = input.presetBank.map((preset2) => ({
+      presetId: preset2.presetId,
+      presetSha256: preset2.presetSha256,
+      bytes: transferableBuffer(preset2.bytes)
+    }));
+    const presetCues = input.presetCues.map((cue) => ({
+      frame: cue.frame,
+      presetId: cue.presetId,
+      seed: cue.seed,
+      transitionFrames: cue.transitionFrames
+    }));
+    const message = {
+      type: "start",
+      jobId: input.jobId,
+      width: input.width,
+      height: input.height,
+      fpsNum: input.fpsNum,
+      fpsDen: input.fpsDen,
+      sampleRate: input.sampleRate,
+      totalSamples: input.totalSamples,
+      left,
+      right,
+      presetBank,
+      presetCues,
+      outputDirectory: input.outputDirectory
+    };
+    const transfer = [left, right, ...presetBank.map((preset2) => preset2.bytes)];
+    this.activeJobId = input.jobId;
+    return new Promise((resolve, reject) => {
+      this.resolve = resolve;
+      this.reject = reject;
+      this.worker.postMessage(message, transfer);
+    });
+  }
+  pause() {
+    this.control("pause");
+  }
+  resume() {
+    this.control("resume");
+  }
+  cancel() {
+    this.control("cancel");
+  }
+  dispose() {
+    if (this.disposed) return;
+    if (this.active) this.cancel();
+    this.disposed = true;
+    this.fail(new Error("Offline render client disposed"));
+    this.worker.terminate();
+  }
+  control(type) {
+    if (!this.active) return;
+    this.worker.postMessage({ type, jobId: this.activeJobId });
+  }
+  receive(message) {
+    if (message.jobId !== this.activeJobId) return;
+    if (message.type === "started") {
+      this.options.onStarted?.(message.frameCount);
+      return;
+    }
+    if (message.type === "progress") {
+      this.options.onProgress?.(message);
+      return;
+    }
+    if (message.type === "paused" || message.type === "resumed") {
+      this.options.onPaused?.(message.type === "paused");
+      return;
+    }
+    if (message.type === "complete") {
+      const resolve = this.resolve;
+      this.clearActive();
+      resolve?.(completeResult(message));
+      return;
+    }
+    if (message.type === "cancelled") {
+      this.fail(new DOMException("Offline render cancelled", "AbortError"));
+      return;
+    }
+    if (message.type === "error") this.fail(new Error(message.message));
+  }
+  fail(error) {
+    const reject = this.reject;
+    this.clearActive();
+    reject?.(error);
+  }
+  clearActive() {
+    this.activeJobId = "";
+    this.resolve = null;
+    this.reject = null;
+  }
+};
+function transferableBuffer(view) {
+  if (view.buffer instanceof ArrayBuffer && view.byteOffset === 0 && view.byteLength === view.buffer.byteLength) {
+    return view.buffer;
+  }
+  const copy = new Uint8Array(view.byteLength);
+  copy.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+  return copy.buffer;
+}
+function completeResult(message) {
+  return {
+    frameCount: message.frameCount,
+    elapsedMs: message.elapsedMs,
+    renderMs: message.renderMs,
+    encodeWriteMs: message.encodeWriteMs,
+    peakQueueDepth: message.peakQueueDepth,
+    artifacts: message.artifacts
+  };
+}
+
+// src/offline/timebase.ts
+var OFFLINE_SAMPLE_RATE = 48e3;
+var RationalTimebase = class {
+  sampleRate;
+  fpsNumerator;
+  fpsDenominator;
+  constructor(sampleRate, fpsNumerator, fpsDenominator = 1) {
+    assertPositiveInteger(sampleRate, "sampleRate");
+    assertPositiveInteger(fpsNumerator, "fpsNumerator");
+    assertPositiveInteger(fpsDenominator, "fpsDenominator");
+    this.sampleRate = sampleRate;
+    this.fpsNumerator = fpsNumerator;
+    this.fpsDenominator = fpsDenominator;
+    Object.freeze(this);
+  }
+  frameStartSample(frame2) {
+    assertNonNegativeInteger(frame2, "frame");
+    return safeNumber(BigInt(frame2) * BigInt(this.sampleRate) * BigInt(this.fpsDenominator) / BigInt(this.fpsNumerator));
+  }
+  frameEndSample(frame2, totalSamples) {
+    assertNonNegativeInteger(totalSamples, "totalSamples");
+    return Math.min(totalSamples, this.frameStartSample(frame2 + 1));
+  }
+  frameRange(frame2, totalSamples) {
+    const start = Math.min(totalSamples, this.frameStartSample(frame2));
+    return Object.freeze({ start, end: this.frameEndSample(frame2, totalSamples) });
+  }
+  frameCount(totalSamples) {
+    assertNonNegativeInteger(totalSamples, "totalSamples");
+    const numerator = BigInt(totalSamples) * BigInt(this.fpsNumerator);
+    const denominator = BigInt(this.sampleRate) * BigInt(this.fpsDenominator);
+    return safeNumber((numerator + denominator - 1n) / denominator);
+  }
+  timeSecondsAtFrame(frame2) {
+    assertNonNegativeInteger(frame2, "frame");
+    return frame2 * this.fpsDenominator / this.fpsNumerator;
+  }
+  frameAtSample(sample2, rounding = "floor") {
+    assertNonNegativeInteger(sample2, "sample");
+    const numerator = BigInt(sample2) * BigInt(this.fpsNumerator);
+    const denominator = BigInt(this.sampleRate) * BigInt(this.fpsDenominator);
+    if (rounding === "nearest") return safeNumber((numerator + denominator / 2n) / denominator);
+    const nextNumerator = BigInt(sample2 + 1) * BigInt(this.fpsNumerator);
+    return safeNumber((nextNumerator + denominator - 1n) / denominator - 1n);
+  }
+};
+function cumulativeBeatBoundarySample(globalBeat, bpm, sampleRate = OFFLINE_SAMPLE_RATE) {
+  if (!Number.isFinite(globalBeat) || globalBeat < 0) throw new RangeError("globalBeat must be finite and non-negative");
+  if (!Number.isFinite(bpm) || bpm <= 0) throw new RangeError("bpm must be finite and positive");
+  return Math.round(globalBeat * sampleRate * 60 / bpm);
+}
+function assertPositiveInteger(value, name) {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new RangeError(`${name} must be a positive safe integer`);
+}
+function assertNonNegativeInteger(value, name) {
+  if (!Number.isSafeInteger(value) || value < 0) throw new RangeError(`${name} must be a non-negative safe integer`);
+}
+function safeNumber(value) {
+  const result = Number(value);
+  if (!Number.isSafeInteger(result)) throw new RangeError("timebase result exceeds Number safe integer range");
+  return result;
+}
+
+// src/offline/audio-buffer.ts
+var StereoAnalysisBuffer = class {
+  sampleRate = OFFLINE_SAMPLE_RATE;
+  channels = 2;
+  totalSamplesPerChannel;
+  durationSeconds;
+  sourceSha256;
+  sourceSampleFormat;
+  sourcePath;
+  #samples;
+  constructor(interleavedStereo48k, metadata = {}) {
+    if ((interleavedStereo48k.length & 1) !== 0) throw new RangeError("stereo analysis PCM must contain complete L/R frames");
+    this.#samples = interleavedStereo48k.slice();
+    this.totalSamplesPerChannel = this.#samples.length / 2;
+    this.durationSeconds = this.totalSamplesPerChannel / OFFLINE_SAMPLE_RATE;
+    this.sourceSha256 = metadata.sourceSha256;
+    this.sourceSampleFormat = metadata.sourceSampleFormat ?? "float32_analysis";
+    this.sourcePath = metadata.sourcePath ?? "track.wav";
+    Object.freeze(this);
+  }
+  sample(channel, sampleIndex) {
+    if (!Number.isInteger(sampleIndex) || sampleIndex < 0 || sampleIndex >= this.totalSamplesPerChannel) return 0;
+    return this.#samples[sampleIndex * 2 + channel];
+  }
+  copyInterleaved() {
+    return this.#samples.slice();
+  }
+  copyRange(start, end) {
+    validateRange(start, end, this.totalSamplesPerChannel);
+    return this.#samples.slice(start * 2, end * 2);
+  }
+  readPlanar(start, sampleCount, left, right) {
+    if (!Number.isSafeInteger(start) || start < 0 || !Number.isSafeInteger(sampleCount) || sampleCount < 0) {
+      throw new RangeError("readPlanar range must use non-negative integers");
+    }
+    if (left.length < sampleCount || right.length < sampleCount) throw new RangeError("readPlanar targets are too small");
+    for (let i = 0; i < sampleCount; i++) {
+      const source3 = start + i;
+      left[i] = source3 < this.totalSamplesPerChannel ? this.#samples[source3 * 2] : 0;
+      right[i] = source3 < this.totalSamplesPerChannel ? this.#samples[source3 * 2 + 1] : 0;
+    }
+  }
+};
+function normalizeDecodedAudio(decoded, metadata = {}) {
+  if (!Number.isFinite(decoded.sampleRate) || decoded.sampleRate <= 0 || decoded.numberOfChannels < 1 || decoded.length < 0) {
+    throw new RangeError("invalid decoded audio contract");
+  }
+  const outputLength = Math.round(decoded.length * OFFLINE_SAMPLE_RATE / decoded.sampleRate);
+  const output = new Float32Array(outputLength * 2);
+  const left = decoded.getChannelData(0);
+  const right = decoded.numberOfChannels > 1 ? decoded.getChannelData(1) : left;
+  if (left.length < decoded.length || right.length < decoded.length) throw new RangeError("decoded channel is shorter than decoded.length");
+  if (decoded.sampleRate === OFFLINE_SAMPLE_RATE) {
+    for (let i = 0; i < outputLength; i++) {
+      output[i * 2] = finiteSample(left[i]);
+      output[i * 2 + 1] = finiteSample(right[i]);
+    }
+  } else {
+    const ratio = decoded.sampleRate / OFFLINE_SAMPLE_RATE;
+    for (let i = 0; i < outputLength; i++) {
+      const position = i * ratio;
+      const a = Math.min(decoded.length - 1, Math.floor(position));
+      const b = Math.min(decoded.length - 1, a + 1);
+      const mix = position - a;
+      output[i * 2] = lerp(finiteSample(left[a]), finiteSample(left[b]), mix);
+      output[i * 2 + 1] = lerp(finiteSample(right[a]), finiteSample(right[b]), mix);
+    }
+  }
+  return new StereoAnalysisBuffer(output, metadata);
+}
+function finiteSample(value) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(-1, Math.min(1, value));
+}
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+function validateRange(start, end, length) {
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || end > length) {
+    throw new RangeError(`invalid sample range [${start}, ${end}) for ${length} samples`);
+  }
+}
+
+// src/offline/schedule.ts
+function resolvePresetSchedule(options, timebase) {
+  validate2(options);
+  const seed = options.seed >>> 0;
+  if (options.mode === "preset") {
+    const presetId = options.presetId;
+    return freezeLedger("preset", seed, [{
+      index: 0,
+      sampleStart: 0,
+      sampleEnd: options.totalSamples,
+      frameStart: 0,
+      frameEnd: timebase.frameCount(options.totalSamples),
+      presetId,
+      seed,
+      transitionSamples: 0
+    }]);
+  }
+  const candidates = [...new Set(options.availablePresetIds)].sort();
+  const beatsPerEntry = options.beatsPerBar * (options.barsPerAutoPreset ?? 4);
+  const transitionSamples = Math.max(0, cumulativeBeatBoundarySample(options.transitionBeats ?? 2, options.bpm));
+  const entries = [];
+  let beat = 0;
+  let previous = -1;
+  while (true) {
+    const relativeStart = cumulativeBeatBoundarySample(beat, options.bpm);
+    const relativeEnd = cumulativeBeatBoundarySample(beat + beatsPerEntry, options.bpm);
+    const sampleStart = entries.length === 0 ? 0 : Math.max(0, options.downbeatSample + relativeStart);
+    if (sampleStart >= options.totalSamples && entries.length > 0) break;
+    const sampleEnd = Math.min(options.totalSamples, Math.max(sampleStart, options.downbeatSample + relativeEnd));
+    let candidate = deterministicIndex(seed, entries.length, candidates.length);
+    if (candidate === previous && candidates.length > 1) candidate = (candidate + 1) % candidates.length;
+    entries.push(Object.freeze({
+      index: entries.length,
+      sampleStart,
+      sampleEnd,
+      frameStart: timebase.frameAtSample(sampleStart, "nearest"),
+      frameEnd: sampleEnd === options.totalSamples ? timebase.frameCount(options.totalSamples) : timebase.frameAtSample(sampleEnd, "nearest"),
+      presetId: candidates[candidate],
+      seed: mixSeed(seed, entries.length),
+      transitionSamples: entries.length === 0 ? 0 : Math.min(transitionSamples, Math.max(0, sampleEnd - sampleStart))
+    }));
+    previous = candidate;
+    beat += beatsPerEntry;
+    if (sampleEnd >= options.totalSamples) break;
+  }
+  return freezeLedger("auto", seed, entries);
+}
+function scheduleEntryAtSample(ledger, sample2) {
+  let lo = 0;
+  let hi = ledger.entries.length - 1;
+  while (lo < hi) {
+    const mid = lo + hi + 1 >> 1;
+    if (ledger.entries[mid].sampleStart <= sample2) lo = mid;
+    else hi = mid - 1;
+  }
+  return ledger.entries[lo];
+}
+function freezeLedger(mode4, sourceSeed, entries) {
+  return Object.freeze({ mode: mode4, sourceSeed, entries: Object.freeze(entries.map((entry) => Object.freeze(entry))) });
+}
+function deterministicIndex(seed, index, length) {
+  return mixSeed(seed, index) % length;
+}
+function mixSeed(seed, index) {
+  let x = (seed ^ Math.imul(index + 1, 2654435769)) >>> 0;
+  x ^= x >>> 16;
+  x = Math.imul(x, 2146121005);
+  x ^= x >>> 15;
+  x = Math.imul(x, 2221713035);
+  x ^= x >>> 16;
+  return x >>> 0;
+}
+function validate2(options) {
+  if (!Number.isSafeInteger(options.totalSamples) || options.totalSamples < 0) throw new RangeError("totalSamples must be non-negative");
+  if (!Number.isFinite(options.bpm) || options.bpm <= 0) throw new RangeError("bpm must be positive");
+  if (!Number.isInteger(options.beatsPerBar) || options.beatsPerBar <= 0) throw new RangeError("beatsPerBar must be positive");
+  if (options.mode === "preset" && !options.presetId) throw new Error("preset mode requires presetId");
+  if (options.mode === "auto" && (!options.availablePresetIds || options.availablePresetIds.length === 0)) {
+    throw new Error("auto mode requires at least one available preset id");
+  }
+}
+
+// src/offline/analyzer.ts
+function analyzeOfflineTrack(buffer, options) {
+  const { tempo: tempo2, schedule, timebase } = options;
+  validateTempo(tempo2);
+  const frameCount2 = timebase.frameCount(buffer.totalSamplesPerChannel);
+  const frames2 = [];
+  const events = [];
+  const samplesPerBeat = OFFLINE_SAMPLE_RATE * 60 / tempo2.bpm;
+  const alphaLow = Math.exp(-2 * Math.PI * 180 / OFFLINE_SAMPLE_RATE);
+  const alphaMid = Math.exp(-2 * Math.PI * 2500 / OFFLINE_SAMPLE_RATE);
+  let lpLowL = 0, lpLowR = 0, lpMidL = 0, lpMidR = 0;
+  let previousMaster = 0, previousLow = 0, previousMid = 0, previousHigh = 0;
+  let onsetMean = 1e-6;
+  let nextBeat = Math.max(0, Math.ceil(-tempo2.downbeatSample / samplesPerBeat));
+  for (let frame2 = 0; frame2 < frameCount2; frame2++) {
+    const range = timebase.frameRange(frame2, buffer.totalSamplesPerChannel);
+    let sumL = 0, sumR = 0, peakL = 0, peakR = 0;
+    let lowSq = 0, midSq = 0, highSq = 0;
+    let transientSample = range.start, transientStrength = 0;
+    for (let sample2 = range.start; sample2 < range.end; sample2++) {
+      const left = buffer.sample(0, sample2);
+      const right = buffer.sample(1, sample2);
+      const master = (left + right) * 0.5;
+      sumL += left * left;
+      sumR += right * right;
+      peakL = Math.max(peakL, Math.abs(left));
+      peakR = Math.max(peakR, Math.abs(right));
+      lpLowL = (1 - alphaLow) * left + alphaLow * lpLowL;
+      lpLowR = (1 - alphaLow) * right + alphaLow * lpLowR;
+      lpMidL = (1 - alphaMid) * left + alphaMid * lpMidL;
+      lpMidR = (1 - alphaMid) * right + alphaMid * lpMidR;
+      const low2 = (lpLowL + lpLowR) * 0.5;
+      const mid2 = (lpMidL - lpLowL + (lpMidR - lpLowR)) * 0.5;
+      const high2 = (left - lpMidL + (right - lpMidR)) * 0.5;
+      lowSq += low2 * low2;
+      midSq += mid2 * mid2;
+      highSq += high2 * high2;
+      const delta = Math.abs(master - previousMaster);
+      if (delta > transientStrength) {
+        transientStrength = delta;
+        transientSample = sample2;
+      }
+      previousMaster = master;
+    }
+    const count = Math.max(1, range.end - range.start);
+    const rmsL = Math.sqrt(sumL / count), rmsR = Math.sqrt(sumR / count);
+    const low = Math.sqrt(lowSq / count), mid = Math.sqrt(midSq / count), high = Math.sqrt(highSq / count);
+    const totalEnergy = low + mid + high;
+    const centroid = totalEnergy > 1e-12 ? (low * 90 + mid * 1e3 + high * 7e3) / totalEnergy / 24e3 : 0;
+    const flux = Math.max(0, low - previousLow) + Math.max(0, mid - previousMid) + Math.max(0, high - previousHigh);
+    const onset = clamp019(flux / Math.max(1e-5, onsetMean * 3));
+    onsetMean = onsetMean * 0.97 + flux * 0.03;
+    previousLow = low;
+    previousMid = mid;
+    previousHigh = high;
+    const frameEvents = [];
+    if (onset > 0.34 && transientStrength > 0.015) {
+      const kind = low > mid * 1.15 && low > high * 1.5 ? "kick" : high > mid * 1.2 ? "hat" : "snare";
+      const confidence = clamp019(onset * 0.7 + transientStrength * 0.3);
+      pushEvent(events, frameEvents, kind, transientSample, frame2, confidence, onset);
+    }
+    while (true) {
+      const beatSample = tempo2.downbeatSample + cumulativeBeatBoundarySample(nextBeat, tempo2.bpm);
+      if (beatSample >= range.end || beatSample >= buffer.totalSamplesPerChannel) break;
+      if (beatSample >= range.start) {
+        const kind = nextBeat % tempo2.meterNumerator === 0 ? "bar" : "beat";
+        pushEvent(events, frameEvents, kind, beatSample, frame2, 1, 1);
+      }
+      nextBeat++;
+    }
+    const globalBeat = (range.start - tempo2.downbeatSample) / samplesPerBeat;
+    const beatPhase = positiveFract(globalBeat);
+    const barPosition = globalBeat / tempo2.meterNumerator;
+    const entry = scheduleEntryAtSample(schedule, range.start);
+    const previous = entry.index > 0 ? schedule.entries[entry.index - 1] : void 0;
+    const transitionProgress = entry.transitionSamples > 0 ? clamp019((range.start - entry.sampleStart) / entry.transitionSamples) : 1;
+    const transitionActive = previous !== void 0 && transitionProgress < 1;
+    frames2.push(Object.freeze({
+      frame: frame2,
+      sample_start: range.start,
+      sample_end: range.end,
+      time_seconds: timebase.timeSecondsAtFrame(frame2),
+      global_beat: globalBeat,
+      bar: Math.floor(barPosition),
+      slot_240: Math.floor(globalBeat * 240),
+      beat_phase: beatPhase,
+      bar_phase: positiveFract(barPosition),
+      bpm: tempo2.bpm,
+      rms: Object.freeze({ master: Math.sqrt((sumL + sumR) / (count * 2)), left: rmsL, right: rmsR }),
+      peak: Object.freeze({ master: Math.max(peakL, peakR), left: peakL, right: peakR }),
+      energy: Object.freeze({ low, mid, high }),
+      spectral_centroid: clamp019(centroid),
+      spectral_flux: flux,
+      onset_strength: onset,
+      events: Object.freeze(frameEvents),
+      active_preset: entry.presetId,
+      // Classic AVS exposes one ordered preset tree rather than AAAVS's native
+      // layer graph. Record that compatibility lane explicitly instead of
+      // pretending individual effect nodes are native layers.
+      active_layers: Object.freeze([`avs:${entry.presetId}`]),
+      deterministic_seed: entry.seed,
+      transition: Object.freeze(transitionActive ? { active: true, progress: transitionProgress, from: previous.presetId, to: entry.presetId } : { active: false, progress: 1 })
+    }));
+  }
+  const frozenEvents = Object.freeze(events.sort((a, b) => a.sample - b.sample || a.id.localeCompare(b.id)));
+  const anchors = selectAnchors(frames2, frozenEvents);
+  const segments = buildSegments(buffer.totalSamplesPerChannel, frameCount2, timebase, anchors, options.segmentSeconds ?? 6);
+  return Object.freeze({
+    analyzer: "aaavs_tier_a_three_band_v1",
+    tempo: Object.freeze({ ...tempo2 }),
+    frames: Object.freeze(frames2),
+    events: frozenEvents,
+    anchors: Object.freeze(anchors),
+    segments: Object.freeze(segments)
+  });
+}
+function pushEvent(events, frameEvents, kind, sample2, frame2, confidence, strength) {
+  const event = Object.freeze({ id: `event_${events.length.toString().padStart(6, "0")}`, kind, sample: sample2, frame: frame2, confidence, strength });
+  events.push(event);
+  frameEvents.push(Object.freeze({ kind, confidence, sample: sample2 }));
+}
+function selectAnchors(frames2, events) {
+  if (frames2.length === 0) return [];
+  const selected = /* @__PURE__ */ new Map();
+  selected.set(0, { role: "first", reason: "first authoritative frame" });
+  const last2 = frames2.length - 1;
+  selected.set(last2, { role: "last", reason: "last authoritative frame" });
+  const windowFrames = 6 * 24;
+  for (let start = 0; start < frames2.length; start += windowFrames) {
+    let best = frames2[start];
+    for (let i = start + 1; i < Math.min(frames2.length, start + windowFrames); i++) {
+      if (frames2[i].onset_strength > best.onset_strength) best = frames2[i];
+    }
+    const event = events.find((candidate) => candidate.frame === best.frame && candidate.kind !== "beat" && candidate.kind !== "bar");
+    if (!selected.has(best.frame)) selected.set(best.frame, {
+      role: "reference",
+      reason: event ? `strong ${event.kind} event` : "strongest onset in six-second segment",
+      sourceEventId: event?.id
+    });
+  }
+  return [...selected.entries()].sort((a, b) => a[0] - b[0]).map(([frame2, selection], index) => Object.freeze({
+    id: `anchor_${index.toString().padStart(4, "0")}`,
+    role: selection.role,
+    frame: frame2,
+    sample: frames2[frame2].sample_start,
+    reason: selection.reason,
+    ...selection.sourceEventId ? { sourceEventId: selection.sourceEventId } : {},
+    pngPath: `frames/frame_${frame2.toString().padStart(6, "0")}.png`
+  }));
+}
+function buildSegments(totalSamples, frameCount2, timebase, anchors, segmentSeconds) {
+  const span = Math.max(1, Math.round(segmentSeconds * OFFLINE_SAMPLE_RATE));
+  const segments = [];
+  for (let sampleStart = 0; sampleStart < totalSamples; sampleStart += span) {
+    const sampleEnd = Math.min(totalSamples, sampleStart + span);
+    const frameStart = timebase.frameAtSample(sampleStart, "nearest");
+    const frameEnd = sampleEnd === totalSamples ? frameCount2 : timebase.frameAtSample(sampleEnd, "nearest");
+    const inputs = anchors.filter((anchor) => anchor.sample >= sampleStart && anchor.sample < sampleEnd).map((anchor) => anchor.pngPath).slice(0, 3);
+    segments.push(Object.freeze({
+      id: `segment_${segments.length.toString().padStart(4, "0")}`,
+      sampleStart,
+      sampleEnd,
+      frameStart,
+      frameEnd,
+      editorialFrameCount: frameEnd - frameStart,
+      imageInputs: Object.freeze(inputs),
+      audioInputs: Object.freeze([`audio/segment_${segments.length.toString().padStart(4, "0")}.wav`]),
+      promptSlot: segments.length,
+      // The authoritative spec does not define MiniMax's legal frame grid. The
+      // adapter must resolve this against the installed H3 node instead of this
+      // core inventing a number that looks valid but is not.
+      h3GenerationFrameRequest: null,
+      h3FramePolicy: "unresolved_requires_minimax_adapter"
+    }));
+  }
+  return segments;
+}
+function validateTempo(tempo2) {
+  if (!Number.isFinite(tempo2.bpm) || tempo2.bpm <= 0) throw new RangeError("tempo bpm must be positive");
+  if (!Number.isInteger(tempo2.meterNumerator) || tempo2.meterNumerator <= 0) throw new RangeError("meter numerator must be positive");
+  if (!Number.isInteger(tempo2.meterDenominator) || tempo2.meterDenominator <= 0) throw new RangeError("meter denominator must be positive");
+  if (!Number.isSafeInteger(tempo2.downbeatSample)) throw new RangeError("downbeat sample must be an integer");
+}
+function clamp019(value) {
+  return Math.max(0, Math.min(1, value));
+}
+function positiveFract(value) {
+  return (value % 1 + 1) % 1;
+}
+
+// src/offline/profiles.ts
+var profiles = [
+  profile("minimax-anchor-736x416-24", "MiniMax anchor \xB7 736\xD7416 \xB7 24 fps", "authority", 736, 416, 24, "png-rgb24", 0.3, true),
+  profile("minimax-review-736x416-24", "MiniMax review \xB7 736\xD7416 \xB7 24 fps", "review", 736, 416, 24, "h264-yuv420p", 0.3),
+  profile("archive-lossless-736x416-24", "Lossless archive \xB7 736\xD7416 \xB7 24 fps", "archive", 736, 416, 24, "ffv1-rgb24", 0.3),
+  profile("minimax-selector-416x256-24", "MiniMax 0.1 MP \xB7 416\xD7256", "diagnostic", 416, 256, 24, "png-rgb24", 0.1),
+  profile("minimax-selector-608x352-24", "MiniMax 0.2 MP \xB7 608\xD7352", "diagnostic", 608, 352, 24, "png-rgb24", 0.2),
+  profile("minimax-selector-864x480-24", "MiniMax 0.4 MP \xB7 864\xD7480", "diagnostic", 864, 480, 24, "png-rgb24", 0.4),
+  profile("minimax-selector-960x544-24", "MiniMax 0.5 MP \xB7 960\xD7544", "diagnostic", 960, 544, 24, "png-rgb24", 0.5),
+  profile("minimax-selector-1056x608-24", "MiniMax 0.6 MP \xB7 1056\xD7608", "diagnostic", 1056, 608, 24, "png-rgb24", 0.6),
+  profile("minimax-selector-1216x672-24", "MiniMax 0.8 MP \xB7 1216\xD7672", "diagnostic", 1216, 672, 24, "png-rgb24", 0.8),
+  profile("minimax-selector-1376x768-24", "MiniMax 1.0 MP \xB7 1376\xD7768", "diagnostic", 1376, 768, 24, "png-rgb24", 1),
+  profile("true-16x9-compact", "True 16:9 \xB7 768\xD7432 \xB7 24 fps", "delivery", 768, 432, 24, "png-rgb24"),
+  profile("exact2x-review", "Exact 2\xD7 \xB7 1472\xD7832 \xB7 24 fps", "review", 1472, 832, 24, "h264-yuv420p"),
+  profile("hd-delivery", "HD delivery \xB7 1920\xD71080 \xB7 24 fps", "delivery", 1920, 1080, 24, "h264-yuv420p"),
+  profile("qhd-performance-60", "QHD performance \xB7 2560\xD71440 \xB7 60 fps", "performance", 2560, 1440, 60, "png-rgb24"),
+  profile("qhd-performance-120", "QHD performance \xB7 2560\xD71440 \xB7 120 fps", "performance", 2560, 1440, 120, "png-rgb24")
+];
+var OUTPUT_PROFILES = Object.freeze(profiles);
+function outputProfile(profileId) {
+  const found = OUTPUT_PROFILES.find((candidate) => candidate.id === profileId);
+  if (!found) throw new RangeError(`Unknown offline output profile: ${profileId}`);
+  return found;
+}
+function profile(id, label, kind, width, height, fpsNumerator, frameFormat, selectorMegapixels, canonicalMiniMaxAuthority = false) {
+  return Object.freeze({
+    id,
+    label,
+    kind,
+    width,
+    height,
+    fpsNumerator,
+    fpsDenominator: 1,
+    ...selectorMegapixels === void 0 ? {} : { selectorMegapixels },
+    frameFormat,
+    canonicalMiniMaxAuthority
+  });
+}
+
+// src/offline/engine.ts
+var OfflineRenderSession = class {
+  buffer;
+  plan;
+  timeline;
+  #pcmLeft = new Float32Array(576);
+  #pcmRight = new Float32Array(576);
+  #waveform = new Float32Array(576 * 2);
+  #spectrum = new Float32Array(256 * 2);
+  #bandPan = new Float32Array(256);
+  #spectrogram = new Float32Array(256);
+  #peaks = new Float32Array(256);
+  constructor(buffer, plan2) {
+    this.buffer = buffer;
+    this.plan = plan2;
+    const events = plan2.analysis.events.filter((event) => event.kind === "kick" || event.kind === "snare" || event.kind === "hat" || event.kind === "onset").map((event) => ({
+      time: event.sample / OFFLINE_SAMPLE_RATE,
+      slot: (event.sample - plan2.analysis.tempo.downbeatSample) / (OFFLINE_SAMPLE_RATE * 60 / plan2.analysis.tempo.bpm) * 240,
+      kind: "onset",
+      onsetClass: event.kind === "onset" ? "tonal" : event.kind,
+      strength: event.strength,
+      confidence: event.confidence
+    }));
+    this.timeline = StaticTimeline.fromTempo(
+      plan2.analysis.tempo.bpm,
+      plan2.analysis.tempo.downbeatSample / OFFLINE_SAMPLE_RATE,
+      buffer.durationSeconds,
+      { events }
+    );
+  }
+  /** Reuses backing arrays. Consumers must render/copy before asking for the next frame. */
+  frameAt(frameIndex) {
+    if (!Number.isSafeInteger(frameIndex) || frameIndex < 0 || frameIndex >= this.plan.frameCount) {
+      throw new RangeError(`frame ${frameIndex} outside [0, ${this.plan.frameCount})`);
+    }
+    const features = this.plan.analysis.frames[frameIndex];
+    const centre = features.sample_start;
+    this.buffer.readPlanar(centre, 576, this.#pcmLeft, this.#pcmRight);
+    for (let i = 0; i < 576; i++) {
+      this.#waveform[i * 2] = this.#pcmLeft[i];
+      this.#waveform[i * 2 + 1] = this.#pcmRight[i];
+    }
+    this.#spectrum.fill(0);
+    this.#bandPan.fill(0);
+    this.#spectrogram.fill(0);
+    this.#peaks.fill(0);
+    const total = features.energy.low + features.energy.mid + features.energy.high || 1;
+    const snapshot2 = {
+      time: features.time_seconds,
+      level: features.rms.master,
+      beat: features.onset_strength,
+      bands: {
+        sub: features.energy.low / total,
+        low: features.energy.low / total,
+        mid: features.energy.mid / total,
+        high: features.energy.high / total,
+        air: features.energy.high / total
+      },
+      pan: features.rms.left + features.rms.right > 0 ? (features.rms.right - features.rms.left) / (features.rms.right + features.rms.left) : 0,
+      width: 0,
+      crest: features.rms.master > 1e-9 ? features.peak.master / features.rms.master : 0,
+      centroid: features.spectral_centroid,
+      flatness: 0,
+      waveform: this.#waveform,
+      spectrum: this.#spectrum,
+      bandPan: this.#bandPan,
+      spectrogram: this.#spectrogram,
+      spectrogramRow: 0,
+      peaks: this.#peaks
+    };
+    return Object.freeze({
+      frameIndex,
+      features,
+      preset: scheduleEntryAtSample(this.plan.schedule, features.sample_start),
+      pcm: Object.freeze({ left: this.#pcmLeft, right: this.#pcmRight }),
+      audioSnapshot: snapshot2
+    });
+  }
+};
+function prepareOfflineRender(buffer, options) {
+  const profile2 = outputProfile(options.profileId);
+  const timebase = new RationalTimebase(OFFLINE_SAMPLE_RATE, profile2.fpsNumerator, profile2.fpsDenominator);
+  const { numerator, denominator } = parseMeter(options.meter ?? "4/4");
+  const tempo2 = Object.freeze({
+    bpm: options.bpm ?? 120,
+    meterNumerator: numerator,
+    meterDenominator: denominator,
+    downbeatSample: options.downbeatSample ?? 0,
+    authority: options.bpm === void 0 ? "assumed_unreviewed" : "provided"
+  });
+  const schedule = resolvePresetSchedule({
+    mode: options.mode,
+    presetId: options.presetId,
+    availablePresetIds: options.availablePresetIds,
+    seed: options.seed,
+    totalSamples: buffer.totalSamplesPerChannel,
+    bpm: tempo2.bpm,
+    beatsPerBar: tempo2.meterNumerator,
+    downbeatSample: tempo2.downbeatSample
+  }, timebase);
+  const analysis = analyzeOfflineTrack(buffer, { tempo: tempo2, schedule, timebase });
+  const plan2 = Object.freeze({
+    schema: "aaavs_offline_render_plan_v1",
+    profile: profile2,
+    totalSamplesPerChannel: buffer.totalSamplesPerChannel,
+    durationSeconds: buffer.durationSeconds,
+    frameCount: timebase.frameCount(buffer.totalSamplesPerChannel),
+    schedule,
+    analysis
+  });
+  return new OfflineRenderSession(buffer, plan2);
+}
+function parseMeter(value) {
+  const match = /^(\d+)\/(\d+)$/.exec(value);
+  if (!match) throw new Error(`invalid meter ${value}; expected numerator/denominator`);
+  const numerator = Number(match[1]), denominator = Number(match[2]);
+  if (numerator <= 0 || denominator <= 0) throw new Error(`invalid meter ${value}`);
+  return { numerator, denominator };
+}
+
+// src/offline/hash.ts
+async function sha256Hex(input) {
+  const bytes = await toBytes(input);
+  const copy = bytes.slice().buffer;
+  const digest = await crypto.subtle.digest("SHA-256", copy);
+  return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, "0")).join("");
+}
+function stableJson(value, space) {
+  return JSON.stringify(sortJson(value), void 0, space);
+}
+function sortJson(value) {
+  if (Array.isArray(value)) return value.map(sortJson);
+  if (value !== null && typeof value === "object") {
+    const source3 = value;
+    const result = {};
+    for (const key of Object.keys(source3).sort()) {
+      if (source3[key] !== void 0) result[key] = sortJson(source3[key]);
+    }
+    return result;
+  }
+  return value;
+}
+async function toBytes(input) {
+  if (typeof input === "string") return new TextEncoder().encode(input);
+  if (input instanceof Blob) return new Uint8Array(await input.arrayBuffer());
+  if (input instanceof Uint8Array) return input;
+  return new Uint8Array(input);
+}
+
+// src/offline/output.ts
+var OFFLINE_PACKAGE_NAMES = Object.freeze({
+  manifest: "manifest.json",
+  features: "features.frames.jsonl",
+  events: "events.json",
+  anchors: "anchors.json",
+  segments: "segments.json",
+  checksums: "sha256sums.txt",
+  audio: "audio/track.wav"
+});
+function serializeFeaturesJsonl(analysis) {
+  return analysis.frames.map((frame2) => stableJson(frame2)).join("\n") + (analysis.frames.length ? "\n" : "");
+}
+function serializeEvents(analysis) {
+  return stableJson(analysis.events, 2) + "\n";
+}
+function serializeAnchors(analysis) {
+  return stableJson(analysis.anchors, 2) + "\n";
+}
+function serializeSegments(analysis) {
+  return stableJson(analysis.segments, 2) + "\n";
+}
+function encodeStereoPcmS16leWav(buffer, start = 0, end = buffer.totalSamplesPerChannel) {
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || end > buffer.totalSamplesPerChannel) {
+    throw new RangeError("invalid WAV sample interval");
+  }
+  const frames2 = end - start;
+  const dataBytes = frames2 * 4;
+  const bytes = new Uint8Array(44 + dataBytes);
+  const view = new DataView(bytes.buffer);
+  ascii(bytes, 0, "RIFF");
+  view.setUint32(4, 36 + dataBytes, true);
+  ascii(bytes, 8, "WAVE");
+  ascii(bytes, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 2, true);
+  view.setUint32(24, 48e3, true);
+  view.setUint32(28, 192e3, true);
+  view.setUint16(32, 4, true);
+  view.setUint16(34, 16, true);
+  ascii(bytes, 36, "data");
+  view.setUint32(40, dataBytes, true);
+  let offset = 44;
+  for (let sample2 = start; sample2 < end; sample2++) {
+    view.setInt16(offset, pcm16(buffer.sample(0, sample2)), true);
+    view.setInt16(offset + 2, pcm16(buffer.sample(1, sample2)), true);
+    offset += 4;
+  }
+  return bytes;
+}
+function bindAnchorHashes(plan2, hashes) {
+  const anchors = plan2.analysis.anchors.map((anchor) => {
+    const pngSha256 = hashes[anchor.pngPath];
+    if (!pngSha256) throw new Error(`missing authoritative anchor hash: ${anchor.pngPath}`);
+    return Object.freeze({ ...anchor, pngSha256 });
+  });
+  return Object.freeze({
+    ...plan2,
+    analysis: Object.freeze({ ...plan2.analysis, anchors: Object.freeze(anchors) })
+  });
+}
+async function createOfflineManifest(plan2, buffer, renderer2, hashes) {
+  const sourceSha256 = hashes[OFFLINE_PACKAGE_NAMES.audio] ?? await sha256Hex(encodeStereoPcmS16leWav(buffer));
+  const scheduleSha256 = await sha256Hex(stableJson(plan2.schedule));
+  const eventSha256 = await sha256Hex(serializeEvents(plan2.analysis));
+  const exactSamplesPerFrame = plan2.profile.fpsDenominator === 1 && 48e3 % plan2.profile.fpsNumerator === 0 ? 48e3 / plan2.profile.fpsNumerator : null;
+  const firstPreset = plan2.schedule.entries[0];
+  if (!firstPreset) throw new Error("cannot create manifest for an empty schedule");
+  return Object.freeze({
+    schema: "aaavs_minimax_anchor_package_v1",
+    source_audio: Object.freeze({
+      path: OFFLINE_PACKAGE_NAMES.audio,
+      sha256: sourceSha256,
+      sample_rate: 48e3,
+      channels: 2,
+      sample_format: "pcm_s16le",
+      total_samples_per_channel: buffer.totalSamplesPerChannel
+    }),
+    ...buffer.sourceSha256 ? {
+      original_input: Object.freeze({
+        path: buffer.sourcePath,
+        sha256: buffer.sourceSha256,
+        note: "decoded_and_normalized_to_source_audio"
+      })
+    } : {},
+    video: Object.freeze({
+      width: plan2.profile.width,
+      height: plan2.profile.height,
+      fps_num: plan2.profile.fpsNumerator,
+      fps_den: plan2.profile.fpsDenominator,
+      samples_per_frame: exactSamplesPerFrame,
+      frame_count: plan2.frameCount,
+      color: "sRGB RGB24"
+    }),
+    tempo: plan2.analysis.tempo,
+    preset_authority: Object.freeze({
+      id: plan2.schedule.mode === "preset" ? firstPreset.presetId : "deterministic-auto-ledger",
+      seed: plan2.schedule.sourceSeed,
+      mode: plan2.schedule.mode
+    }),
+    renderer_authority: Object.freeze({
+      commit: renderer2.commit,
+      bundle_sha256: renderer2.bundleSha256,
+      ...renderer2.userAgent ? { user_agent: renderer2.userAgent } : {},
+      ...renderer2.gpuAdapter ? { gpu_adapter: renderer2.gpuAdapter } : {}
+    }),
+    sidecars: Object.freeze({ ...hashes }),
+    determinism: Object.freeze({
+      event_manifest_sha256: eventSha256,
+      schedule_sha256: scheduleSha256,
+      cross_adapter_pixels_guaranteed: false
+    })
+  });
+}
+var TransactionalPackageWriter = class {
+  #sink;
+  #hashes = /* @__PURE__ */ new Map();
+  #state = "open";
+  constructor(sink) {
+    this.#sink = sink;
+  }
+  get hashes() {
+    return Object.freeze(Object.fromEntries(this.#hashes));
+  }
+  async write(path, data) {
+    this.assertOpen();
+    validatePackagePath(path);
+    if (this.#hashes.has(path)) throw new Error(`package path already written: ${path}`);
+    const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+    const hash = await sha256Hex(bytes);
+    await this.#sink.write(path, bytes);
+    this.#hashes.set(path, hash);
+    return hash;
+  }
+  registerExisting(path, sha256) {
+    this.assertOpen();
+    validatePackagePath(path);
+    if (!/^[0-9a-f]{64}$/.test(sha256)) throw new Error(`invalid SHA-256 for ${path}`);
+    if (this.#hashes.has(path)) throw new Error(`package path already registered: ${path}`);
+    this.#hashes.set(path, sha256);
+  }
+  async writeStandardSidecars(plan2, buffer) {
+    await this.write(OFFLINE_PACKAGE_NAMES.features, serializeFeaturesJsonl(plan2.analysis));
+    await this.write(OFFLINE_PACKAGE_NAMES.events, serializeEvents(plan2.analysis));
+    await this.write(OFFLINE_PACKAGE_NAMES.anchors, serializeAnchors(plan2.analysis));
+    await this.write(OFFLINE_PACKAGE_NAMES.segments, serializeSegments(plan2.analysis));
+    await this.write(OFFLINE_PACKAGE_NAMES.audio, encodeStereoPcmS16leWav(buffer));
+    for (const segment of plan2.analysis.segments) {
+      await this.write(segment.audioInputs[0], encodeStereoPcmS16leWav(buffer, segment.sampleStart, segment.sampleEnd));
+    }
+  }
+  async finalize(manifest) {
+    const checksumText = [...this.#hashes].sort(([a], [b]) => a.localeCompare(b)).map(([path, hash]) => `${hash}  ${path}`).join("\n") + "\n";
+    const checksumHash = await this.write(OFFLINE_PACKAGE_NAMES.checksums, checksumText);
+    const boundManifest = Object.freeze({
+      ...manifest,
+      sidecars: Object.freeze({ ...manifest.sidecars, [OFFLINE_PACKAGE_NAMES.checksums]: checksumHash })
+    });
+    await this.write(OFFLINE_PACKAGE_NAMES.manifest, stableJson(boundManifest, 2) + "\n");
+    await this.#sink.commit();
+    this.#state = "committed";
+  }
+  async abort(reason) {
+    if (this.#state !== "open") return;
+    this.#state = "aborted";
+    await this.#sink.abort(reason);
+  }
+  assertOpen() {
+    if (this.#state !== "open") throw new Error(`package transaction is ${this.#state}`);
+  }
+};
+function pcm16(sample2) {
+  const clamped = Math.max(-1, Math.min(1, Number.isFinite(sample2) ? sample2 : 0));
+  return clamped <= -1 ? -32768 : Math.round(clamped * 32767);
+}
+function ascii(target, offset, text) {
+  for (let i = 0; i < text.length; i++) target[offset + i] = text.charCodeAt(i);
+}
+function validatePackagePath(path) {
+  if (!path || path.startsWith("/") || path.includes("\\") || path.split("/").includes("..")) throw new Error(`unsafe package path: ${path}`);
+}
+
+// src/offline-studio.ts
+var DEFAULT_STYLE_HREF2 = new URL("./offline-studio.css", import.meta.url).href;
+var OFFLINE_OUTPUT_PROFILES = [
+  { id: "minimax-anchor-736x416-24", label: "MiniMax anchor", width: 736, height: 416, fpsNum: 24, fpsDen: 1, purpose: "Authoritative PNG + WAV package", authority: true },
+  { id: "minimax-review-736x416-24", label: "MiniMax review", width: 736, height: 416, fpsNum: 24, fpsDen: 1, purpose: "H.264 review proxy \xB7 CLI post-render", availability: "post-render" },
+  { id: "archive-lossless-736x416-24", label: "Lossless archive", width: 736, height: 416, fpsNum: 24, fpsDen: 1, purpose: "FFV1 Matroska preservation \xB7 CLI post-render", availability: "post-render" },
+  { id: "minimax-selector-416x256-24", label: "MiniMax 0.1 MP", width: 416, height: 256, fpsNum: 24, fpsDen: 1, purpose: "Diagnostic selector canvas" },
+  { id: "minimax-selector-608x352-24", label: "MiniMax 0.2 MP", width: 608, height: 352, fpsNum: 24, fpsDen: 1, purpose: "Lightweight H3 canvas" },
+  { id: "minimax-selector-864x480-24", label: "MiniMax 0.4 MP", width: 864, height: 480, fpsNum: 24, fpsDen: 1, purpose: "Higher-pixel experiment" },
+  { id: "minimax-selector-960x544-24", label: "MiniMax 0.5 MP", width: 960, height: 544, fpsNum: 24, fpsDen: 1, purpose: "Experimental selector canvas" },
+  { id: "minimax-selector-1056x608-24", label: "MiniMax 0.6 MP", width: 1056, height: 608, fpsNum: 24, fpsDen: 1, purpose: "Experimental selector canvas" },
+  { id: "minimax-selector-1216x672-24", label: "MiniMax 0.8 MP", width: 1216, height: 672, fpsNum: 24, fpsDen: 1, purpose: "Experimental selector canvas" },
+  { id: "minimax-selector-1376x768-24", label: "MiniMax 1.0 MP", width: 1376, height: 768, fpsNum: 24, fpsDen: 1, purpose: "High-memory selector canvas" },
+  { id: "true-16x9-compact", label: "True 16:9 compact", width: 768, height: 432, fpsNum: 24, fpsDen: 1, purpose: "Exact 16:9 AAAVS export" },
+  { id: "exact2x-review", label: "Exact 2\xD7 review", width: 1472, height: 832, fpsNum: 24, fpsDen: 1, purpose: "Exact 2\xD7 canonical raster" },
+  { id: "hd-delivery", label: "HD delivery", width: 1920, height: 1080, fpsNum: 24, fpsDen: 1, purpose: "Presentation conform" },
+  { id: "qhd-performance-60", label: "QHD performance \xB7 60", width: 2560, height: 1440, fpsNum: 60, fpsDen: 1, purpose: "Performance qualification" },
+  { id: "qhd-performance-120", label: "QHD performance \xB7 120", width: 2560, height: 1440, fpsNum: 120, fpsDen: 1, purpose: "120 fps stress qualification" }
+];
+var EMPTY_PROGRESS = {
+  stage: "Awaiting source",
+  completedFrames: 0,
+  totalFrames: 0,
+  elapsedSeconds: 0
+};
+var DEFAULT_DRAFT = {
+  audioFile: null,
+  mode: "preset",
+  presetKind: "bundled",
+  presetId: null,
+  customPresetFile: null,
+  profileId: "minimax-anchor-736x416-24",
+  seed: 1,
+  bpm: null,
+  meter: "4/4",
+  downbeatSample: 0,
+  outputDirectoryHandle: null,
+  outputPath: "",
+  includePngSequence: true,
+  includeAudio: true,
+  generateProxy: false,
+  runProbe: false,
+  buildMinimaxSegments: true
+};
+var DEFAULT_STATE = {
+  status: "idle",
+  track: null,
+  progress: EMPTY_PROGRESS,
+  validation: [],
+  result: null,
+  error: null,
+  canResume: false
+};
+function ensureStylesheet2(href) {
+  if (document.querySelector(`link[data-aaavs-offline-studio="${CSS.escape(href)}"]`)) return;
+  const link = document.createElement("link");
+  link.rel = "stylesheet";
+  link.href = href;
+  link.dataset.aaavsOfflineStudio = href;
+  document.head.append(link);
+}
+function element(tag, className = "", text = "") {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text) node.textContent = text;
+  return node;
+}
+function cloneDraft(draft) {
+  return { ...draft };
+}
+function cloneState(state) {
+  return { ...state, progress: { ...state.progress }, validation: [...state.validation] };
+}
+function formatTime2(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "\u2014";
+  const whole = Math.floor(seconds);
+  const h = Math.floor(whole / 3600);
+  const m = Math.floor(whole % 3600 / 60);
+  const s = whole % 60;
+  return h > 0 ? `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB"];
+  let value = bytes / 1024;
+  let unit = units[0];
+  for (let index = 1; index < units.length && value >= 1024; index += 1) {
+    value /= 1024;
+    unit = units[index];
+  }
+  return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`;
+}
+var Studio = class {
+  root;
+  previewCanvas;
+  options;
+  profiles;
+  draft;
+  state;
+  waveform = new Float32Array(0);
+  timelineCanvas;
+  fileInput;
+  presetFileInput;
+  statusPill;
+  trackName;
+  trackMeta;
+  trackHash;
+  dropZone;
+  presetSelect;
+  customPresetName;
+  profileSelect;
+  profileRaster;
+  profileClock;
+  frameInterval;
+  frameCount;
+  outputName;
+  renderButton;
+  pauseButton;
+  cancelButton;
+  progressFill;
+  progressTrack;
+  progressLabel;
+  progressPct;
+  etaValue;
+  throughputValue;
+  queueValue;
+  gpuValue;
+  validationList;
+  resultPanel;
+  errorPanel;
+  logList;
+  previewSlate;
+  previewFrame;
+  resizeObserver = null;
+  lastFocus = null;
+  logSequence = 0;
+  constructor(options) {
+    this.options = options;
+    this.profiles = options.profiles?.length ? options.profiles : OFFLINE_OUTPUT_PROFILES;
+    this.draft = { ...DEFAULT_DRAFT, ...options.initialDraft };
+    this.state = {
+      ...DEFAULT_STATE,
+      ...options.initialState,
+      progress: { ...EMPTY_PROGRESS, ...options.initialState?.progress },
+      validation: options.initialState?.validation ? [...options.initialState.validation] : []
+    };
+    if (!this.profiles.some((profile2) => profile2.id === this.draft.profileId)) this.draft = { ...this.draft, profileId: this.profiles[0]?.id ?? "" };
+    ensureStylesheet2(options.styleHref ?? DEFAULT_STYLE_HREF2);
+    this.root = element("section", "offline-studio");
+    this.root.id = "aaavs-offline-studio";
+    this.root.hidden = true;
+    this.root.tabIndex = -1;
+    this.root.setAttribute("role", "dialog");
+    this.root.setAttribute("aria-modal", "true");
+    this.root.setAttribute("aria-labelledby", "offline-studio-title");
+    this.root.innerHTML = this.template();
+    document.body.append(this.root);
+    this.previewCanvas = this.need('canvas[data-role="preview"]');
+    this.timelineCanvas = this.need('canvas[data-role="timeline"]');
+    this.fileInput = this.need('input[data-role="audio-file"]');
+    this.presetFileInput = this.need('input[data-role="preset-file"]');
+    this.statusPill = this.need('[data-role="status"]');
+    this.trackName = this.need('[data-role="track-name"]');
+    this.trackMeta = this.need('[data-role="track-meta"]');
+    this.trackHash = this.need('[data-role="track-hash"]');
+    this.dropZone = this.need('[data-role="drop-zone"]');
+    this.presetSelect = this.need('select[data-role="preset"]');
+    this.customPresetName = this.need('[data-role="custom-preset-name"]');
+    this.profileSelect = this.need('select[data-role="profile"]');
+    this.profileRaster = this.need('[data-role="profile-raster"]');
+    this.profileClock = this.need('[data-role="profile-clock"]');
+    this.frameInterval = this.need('[data-role="frame-interval"]');
+    this.frameCount = this.need('[data-role="frame-count"]');
+    this.outputName = this.need('[data-role="output-name"]');
+    this.renderButton = this.need('button[data-action="render"]');
+    this.pauseButton = this.need('button[data-action="pause"]');
+    this.cancelButton = this.need('button[data-action="cancel"]');
+    this.progressFill = this.need('[data-role="progress-fill"]');
+    this.progressTrack = this.need('[data-role="progress-track"]');
+    this.progressLabel = this.need('[data-role="progress-label"]');
+    this.progressPct = this.need('[data-role="progress-pct"]');
+    this.etaValue = this.need('[data-role="eta"]');
+    this.throughputValue = this.need('[data-role="throughput"]');
+    this.queueValue = this.need('[data-role="queue"]');
+    this.gpuValue = this.need('[data-role="gpu"]');
+    this.validationList = this.need('[data-role="validation"]');
+    this.resultPanel = this.need('[data-role="result"]');
+    this.errorPanel = this.need('[data-role="error"]');
+    this.logList = this.need('[data-role="logs"]');
+    this.previewSlate = this.need('[data-role="preview-slate"]');
+    this.previewFrame = this.need('[data-role="preview-frame"]');
+    this.populatePresets();
+    this.populateProfiles();
+    this.bind();
+    this.resizeObserver = new ResizeObserver(() => this.drawTimeline());
+    this.resizeObserver.observe(this.timelineCanvas);
+    this.render();
+  }
+  open() {
+    if (!this.root.hidden) return;
+    this.lastFocus = document.activeElement;
+    this.root.hidden = false;
+    document.documentElement.classList.add("offline-studio-open");
+    requestAnimationFrame(() => {
+      this.root.focus();
+      this.drawTimeline();
+    });
+  }
+  close() {
+    if (this.root.hidden) return;
+    this.root.hidden = true;
+    document.documentElement.classList.remove("offline-studio-open");
+    if (this.lastFocus instanceof HTMLElement) this.lastFocus.focus();
+  }
+  toggle() {
+    this.root.hidden ? this.open() : this.close();
+  }
+  isOpen() {
+    return !this.root.hidden;
+  }
+  dispose() {
+    this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
+    document.documentElement.classList.remove("offline-studio-open");
+    this.root.remove();
+  }
+  getDraft() {
+    return cloneDraft(this.draft);
+  }
+  setDraft(patch) {
+    this.draft = { ...this.draft, ...patch };
+    this.options.onDraftChange?.(this.getDraft());
+    this.render();
+  }
+  getState() {
+    return cloneState(this.state);
+  }
+  setState(patch) {
+    this.state = {
+      ...this.state,
+      ...patch,
+      progress: patch.progress ? { ...patch.progress } : this.state.progress,
+      validation: patch.validation ? [...patch.validation] : this.state.validation
+    };
+    if (patch.track?.waveform) this.waveform = patch.track.waveform;
+    this.render();
+  }
+  updateProgress(patch) {
+    this.state = { ...this.state, progress: { ...this.state.progress, ...patch } };
+    this.renderProgress();
+    this.drawTimeline();
+  }
+  setWaveform(samples) {
+    this.waveform = samples;
+    this.drawTimeline();
+  }
+  appendLog(message, tone = "info") {
+    const row = element("li", `offline-log is-${tone}`);
+    const sequence = element("span", "offline-log-sequence", String(++this.logSequence).padStart(3, "0"));
+    const time = element("time", "offline-log-time", (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour12: false }));
+    row.append(sequence, time, element("span", "offline-log-message", message));
+    this.logList.append(row);
+    while (this.logList.childElementCount > 250) this.logList.firstElementChild?.remove();
+    this.logList.scrollTop = this.logList.scrollHeight;
+  }
+  clearLogs() {
+    this.logList.replaceChildren();
+    this.logSequence = 0;
+  }
+  need(selector) {
+    const found = this.root.querySelector(selector);
+    if (!found) throw new Error(`Offline studio is missing ${selector}`);
+    return found;
+  }
+  template() {
+    return `
+      <header class="offline-mast">
+        <div class="offline-wordmark">
+          <span class="offline-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+          <div><h1 id="offline-studio-title">AAAVS <em>transfer</em></h1><p>sample-clock offline render studio</p></div>
+        </div>
+        <div class="offline-master-clock" aria-label="Canonical clock"><span>MASTER CLOCK</span><b>48,000</b><small>samples / sec</small></div>
+        <span class="offline-status" data-role="status">Idle</span>
+        <button class="offline-icon-button" data-action="close" type="button" aria-label="Close offline render studio" title="Close (Escape)">\xD7</button>
+      </header>
+
+      <div class="offline-workbench">
+        <aside class="offline-rail offline-source-rail" aria-label="Source and preset setup">
+          <section class="offline-panel offline-source-panel">
+            <header><span class="offline-section-code">SOURCE / A</span><h2>Track authority</h2></header>
+            <button class="offline-drop" data-role="drop-zone" type="button">
+              <span class="offline-drop-icon" aria-hidden="true">\u21A7</span>
+              <strong>Load an audio track</strong>
+              <span>Drop WAV, FLAC, MP3, M4A, or OGG</span>
+              <small>Decoded once \xB7 normalized to 48 kHz</small>
+            </button>
+            <input data-role="audio-file" class="offline-visually-hidden" type="file" accept="audio/*,.wav,.flac,.mp3,.m4a,.ogg" />
+            <div class="offline-track-card" aria-live="polite">
+              <span class="offline-track-reel" aria-hidden="true"></span>
+              <div><strong data-role="track-name">No source loaded</strong><span data-role="track-meta">Awaiting immutable analysis buffer</span><code data-role="track-hash">SHA-256 \u2014</code></div>
+            </div>
+          </section>
+
+          <section class="offline-panel">
+            <header><span class="offline-section-code">PROGRAM / B</span><h2>Preset schedule</h2></header>
+            <div class="offline-segmented" role="group" aria-label="Preset schedule mode">
+              <button type="button" data-mode="preset">Fixed preset</button>
+              <button type="button" data-mode="auto">Auto director</button>
+            </div>
+            <label class="offline-field"><span>Preset bank</span><select data-role="preset"></select></label>
+            <div class="offline-file-row">
+              <button class="offline-secondary-button" data-action="load-preset" type="button">Load custom .avs</button>
+              <span data-role="custom-preset-name">No custom preset</span>
+            </div>
+            <input data-role="preset-file" class="offline-visually-hidden" type="file" accept=".avs,application/octet-stream" />
+            <div class="offline-grid-fields">
+              <label class="offline-field"><span>Seed</span><input data-field="seed" type="number" min="0" step="1" inputmode="numeric" /></label>
+              <label class="offline-field"><span>Reviewed BPM \xB7 required</span><input data-field="bpm" type="number" min="20" max="400" step=".01" placeholder="enter tempo" inputmode="decimal" required /></label>
+              <label class="offline-field"><span>Meter</span><select data-field="meter"><option>4/4</option><option>3/4</option><option>5/4</option><option>6/8</option><option>7/8</option></select></label>
+              <label class="offline-field"><span>Downbeat sample</span><input data-field="downbeat" type="number" min="0" step="1" inputmode="numeric" /></label>
+            </div>
+            <p class="offline-note"><span>LOCK</span> Schedule decisions resolve before frame 000000. No wall-clock timing or frame skipping.</p>
+          </section>
+        </aside>
+
+        <main class="offline-picture" aria-label="Offline render preview">
+          <section class="offline-monitor">
+            <header class="offline-monitor-head"><span>PROGRAM MONITOR</span><span data-role="preview-frame">F 000000 \xB7 S 000000000</span></header>
+            <div class="offline-monitor-stage">
+              <canvas data-role="preview" width="736" height="416" aria-label="Offline render preview"></canvas>
+              <div class="offline-safe-area" aria-hidden="true"></div>
+              <div class="offline-preview-slate" data-role="preview-slate"><b>NO TRACK</b><span>Load source to build frame ledger</span></div>
+              <span class="offline-monitor-badge">RGB24</span>
+            </div>
+            <footer><span data-role="profile-raster">736 \xD7 416</span><span>sRGB \xB7 progressive \xB7 square pixel</span><span>feedback reset at F0</span></footer>
+          </section>
+
+          <section class="offline-timeline" aria-label="Sample-accurate output frame ruler">
+            <header>
+              <div><span class="offline-section-code">FRAME LEDGER</span><h2>Every frame owns an exact audio interval</h2></div>
+              <div class="offline-ledger-readout"><span data-role="profile-clock">24 / 1 fps</span><b data-role="frame-interval">2,000 samples / frame</b></div>
+            </header>
+            <canvas data-role="timeline" height="176" tabindex="0" aria-label="Waveform and output frame filmstrip. Click to inspect a frame."></canvas>
+            <footer><span>audio authority <b>sample 0</b></span><span data-role="frame-count">0 frames resolved</span><span>end boundary <b>\u2014</b></span></footer>
+          </section>
+        </main>
+
+        <aside class="offline-rail offline-output-rail" aria-label="Output and validation setup">
+          <section class="offline-panel offline-profile-panel">
+            <header><span class="offline-section-code">OUTPUT / C</span><h2>Render profile</h2></header>
+            <label class="offline-field"><span>Profile</span><select data-role="profile"></select></label>
+            <dl class="offline-profile-spec">
+              <div><dt>Raster</dt><dd data-role="profile-raster">736 \xD7 416</dd></div>
+              <div><dt>Frame clock</dt><dd data-role="profile-clock">24 / 1 fps</dd></div>
+              <div><dt>Color</dt><dd>RGB24 / sRGB</dd></div>
+              <div><dt>Scan</dt><dd>Progressive</dd></div>
+            </dl>
+            <div class="offline-output-dir"><span>Output directory</span><button data-action="directory" type="button"><b data-role="output-name">Choose folder</b><small>package is never silently overwritten</small></button></div>
+            <div class="offline-checks">
+              <label class="is-required" title="Required for every transactional browser package"><input data-toggle="png" type="checkbox" disabled /> <span>RGB24 PNG frame sequence</span></label>
+              <label class="is-required" title="Required for every transactional browser package"><input data-toggle="audio" type="checkbox" disabled /> <span>48 kHz stereo PCM WAV</span></label>
+              <label class="is-required" title="Required for every transactional browser package"><input type="checkbox" checked disabled /> <span>Manifest + SHA-256 inventory</span></label>
+              <label class="is-required" title="Required for every transactional browser package"><input data-toggle="segments" type="checkbox" disabled /> <span>Features \xB7 events \xB7 anchors \xB7 segments</span></label>
+              <label class="is-unavailable" title="Available from the render:proxy CLI after the browser package completes"><input data-toggle="proxy" type="checkbox" disabled /> <span>H.264 proxy \xB7 CLI post-render</span></label>
+              <label class="is-unavailable" title="Planned for the render:probe CLI"><input data-toggle="probe" type="checkbox" disabled /> <span>ffprobe report \xB7 future CLI</span></label>
+            </div>
+          </section>
+
+          <section class="offline-panel offline-preflight-panel">
+            <header><span class="offline-section-code">PREFLIGHT / D</span><h2>Authority checks</h2></header>
+            <ul class="offline-validation" data-role="validation"></ul>
+            <div class="offline-error" data-role="error" hidden></div>
+            <button class="offline-render-button" data-action="render" type="button"><span>Render complete track</span><small>deterministic fixed-step pass</small></button>
+          </section>
+
+          <section class="offline-result" data-role="result" hidden>
+            <span class="offline-section-code">VALIDATED PACKAGE</span><strong>Render complete</strong><p></p><button data-action="reveal" type="button">Reveal output</button>
+          </section>
+        </aside>
+
+        <section class="offline-deck" aria-label="Render queue and diagnostics">
+          <div class="offline-job">
+            <header><span class="offline-live-dot" aria-hidden="true"></span><div><span>RENDER QUEUE / JOB 01</span><strong data-role="progress-label">Awaiting source</strong></div><b data-role="progress-pct">0.0%</b></header>
+            <div class="offline-progress-track" data-role="progress-track" role="progressbar" aria-label="Offline render progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i data-role="progress-fill"></i><span></span><span></span><span></span></div>
+            <div class="offline-job-controls">
+              <button data-action="pause" type="button" disabled>Pause</button>
+              <button data-action="cancel" type="button" disabled>Cancel render</button>
+            </div>
+          </div>
+          <dl class="offline-metrics">
+            <div><dt>ETA</dt><dd data-role="eta">\u2014</dd></div>
+            <div><dt>Render</dt><dd data-role="throughput">\u2014 fps</dd></div>
+            <div><dt>Queue</dt><dd data-role="queue">0 frames</dd></div>
+            <div><dt>GPU p50</dt><dd data-role="gpu">\u2014 ms</dd></div>
+          </dl>
+          <div class="offline-log-panel"><header><span>PROCESS LOG</span><button data-action="clear-log" type="button">Clear</button></header><ol data-role="logs"></ol></div>
+        </section>
+      </div>`;
+  }
+  populatePresets() {
+    this.presetSelect.replaceChildren();
+    const groups = /* @__PURE__ */ new Map();
+    for (const preset2 of this.options.presets ?? []) {
+      let group = groups.get(preset2.collection);
+      if (!group) {
+        group = document.createElement("optgroup");
+        group.label = preset2.collection;
+        groups.set(preset2.collection, group);
+        this.presetSelect.append(group);
+      }
+      const option = element("option");
+      option.value = `${preset2.kind ?? "bundled"}:${preset2.id}`;
+      option.textContent = preset2.name;
+      group.append(option);
+    }
+    if (!this.presetSelect.options.length) {
+      const option = element("option", "", "No preset catalog connected");
+      option.value = "";
+      this.presetSelect.append(option);
+    }
+  }
+  populateProfiles() {
+    this.profileSelect.replaceChildren();
+    for (const profile2 of this.profiles) {
+      const postRender = profile2.availability === "post-render" || profile2.id === "minimax-review-736x416-24" || profile2.id === "archive-lossless-736x416-24" || profile2.id === "exact2x-review" || profile2.id === "hd-delivery";
+      const option = element("option");
+      option.value = profile2.id;
+      option.disabled = postRender;
+      option.textContent = `${profile2.label} \u2014 ${profile2.width}\xD7${profile2.height} / ${profile2.fpsNum} fps${profile2.authority ? " \xB7 AUTHORITY" : ""}${postRender ? " \xB7 CLI ONLY" : ""}`;
+      this.profileSelect.append(option);
+    }
+  }
+  bind() {
+    this.need('button[data-action="close"]').addEventListener("click", () => this.close());
+    this.dropZone.addEventListener("click", () => this.fileInput.click());
+    this.fileInput.addEventListener("change", () => {
+      const file = this.fileInput.files?.[0];
+      if (file) void this.acceptTrack(file);
+    });
+    for (const type of ["dragenter", "dragover"]) this.dropZone.addEventListener(type, (event) => {
+      event.preventDefault();
+      this.dropZone.classList.add("is-dragging");
+    });
+    for (const type of ["dragleave", "drop"]) this.dropZone.addEventListener(type, (event) => {
+      event.preventDefault();
+      this.dropZone.classList.remove("is-dragging");
+    });
+    this.dropZone.addEventListener("drop", (event) => {
+      const file = event.dataTransfer?.files[0];
+      if (file) void this.acceptTrack(file);
+    });
+    this.need('button[data-action="load-preset"]').addEventListener("click", () => this.presetFileInput.click());
+    this.presetFileInput.addEventListener("change", () => {
+      const file = this.presetFileInput.files?.[0];
+      if (!file) return;
+      this.setDraft({ customPresetFile: file, presetKind: "custom", presetId: null, mode: "preset" });
+      this.appendLog(`Custom preset loaded: ${file.name}`, "success");
+    });
+    for (const button of this.root.querySelectorAll("[data-mode]")) button.addEventListener("click", () => this.setDraft({ mode: button.dataset.mode }));
+    this.presetSelect.addEventListener("change", () => {
+      const [kind, ...id] = this.presetSelect.value.split(":");
+      this.setDraft({ presetKind: kind === "aaavs" ? "aaavs" : "bundled", presetId: id.join(":") || null, customPresetFile: null });
+    });
+    this.profileSelect.addEventListener("change", () => this.setDraft({ profileId: this.profileSelect.value }));
+    this.bindNumber("seed", (value) => this.setDraft({ seed: Math.max(0, Math.floor(value ?? 1)) }));
+    this.bindNumber("bpm", (value) => this.setDraft({ bpm: value }));
+    this.bindNumber("downbeat", (value) => this.setDraft({ downbeatSample: Math.max(0, Math.floor(value ?? 0)) }));
+    this.need('select[data-field="meter"]').addEventListener("change", (event) => this.setDraft({ meter: event.currentTarget.value }));
+    for (const [name, key] of [["png", "includePngSequence"], ["audio", "includeAudio"], ["proxy", "generateProxy"], ["probe", "runProbe"], ["segments", "buildMinimaxSegments"]]) {
+      this.need(`input[data-toggle="${name}"]`).addEventListener("change", (event) => this.setDraft({ [key]: event.currentTarget.checked }));
+    }
+    this.need('button[data-action="directory"]').addEventListener("click", () => void this.chooseDirectory());
+    this.renderButton.addEventListener("click", () => void this.start());
+    this.pauseButton.addEventListener("click", () => void (this.state.status === "paused" ? this.resume() : this.pause()));
+    this.cancelButton.addEventListener("click", () => void this.cancel());
+    this.need('button[data-action="clear-log"]').addEventListener("click", () => this.clearLogs());
+    this.need('button[data-action="reveal"]').addEventListener("click", () => {
+      if (this.state.result) void this.options.onRevealOutput?.(this.state.result);
+    });
+    this.timelineCanvas.addEventListener("pointerdown", (event) => void this.seekFromPointer(event));
+    this.root.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.close();
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        event.preventDefault();
+        void this.start();
+      }
+      if (event.key === "Tab") this.trapFocus(event);
+    });
+  }
+  bindNumber(field, callback) {
+    this.need(`input[data-field="${field}"]`).addEventListener("change", (event) => {
+      const raw = event.currentTarget.value;
+      callback(raw === "" ? null : Number(raw));
+    });
+  }
+  async acceptTrack(file) {
+    if (!file.type.startsWith("audio/") && !/\.(wav|flac|mp3|m4a|ogg)$/i.test(file.name)) {
+      this.appendLog(`${file.name} is not a supported audio source`, "error");
+      return;
+    }
+    this.setDraft({ audioFile: file });
+    this.setState({ status: "analyzing", error: null, result: null, track: { name: file.name, durationSeconds: 0, sampleRate: 48e3, channels: 2, totalSamplesPerChannel: 0 } });
+    this.appendLog(`Analyzing ${file.name} (${formatBytes(file.size)})`);
+    try {
+      const analyzed = await this.options.onAnalyzeTrack?.(file);
+      if (analyzed) this.setState({ track: analyzed, status: "ready" });
+      else if (!this.options.onAnalyzeTrack) this.setState({ status: "ready" });
+      this.appendLog("Source analysis frozen to sample clock", "success");
+    } catch (error) {
+      this.setState({ status: "failed", track: null, error: error instanceof Error ? error.message : String(error) });
+      this.appendLog(`Analysis failed: ${String(error)}`, "error");
+    }
+  }
+  async chooseDirectory() {
+    try {
+      let handle = await this.options.onChooseOutputDirectory?.();
+      if (handle === void 0 && "showDirectoryPicker" in window) {
+        handle = await window.showDirectoryPicker();
+      }
+      if (handle !== void 0 && handle !== null) {
+        const name = typeof handle === "object" && "name" in handle ? String(handle.name) : "Selected output";
+        this.setDraft({ outputDirectoryHandle: handle, outputPath: name });
+        this.appendLog(`Output directory armed: ${name}`, "success");
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      this.setState({ error: error instanceof Error ? error.message : String(error) });
+      this.appendLog(`Could not select output: ${String(error)}`, "error");
+    }
+  }
+  async start() {
+    if (!this.draft.audioFile || !this.state.track) {
+      this.setState({ error: "Load and analyze an audio track before rendering." });
+      this.dropZone.focus();
+      return;
+    }
+    if (this.draft.mode === "preset" && !this.draft.presetId && !this.draft.customPresetFile) {
+      this.setState({ error: "Choose a bundled AVS preset or a custom .avs file." });
+      this.presetSelect.focus();
+      return;
+    }
+    if (this.draft.bpm === null || !(this.draft.bpm > 0)) {
+      this.setState({ error: "Enter the reviewed track BPM before rendering. AAAVS will not claim an unreviewed fallback tempo." });
+      this.need('input[data-field="bpm"]').focus();
+      return;
+    }
+    if (!this.draft.outputDirectoryHandle) {
+      this.setState({ error: "Choose an empty output directory before rendering the frame-complete package." });
+      this.need('button[data-action="directory"]').focus();
+      return;
+    }
+    this.setState({ status: "rendering", error: null, result: null, progress: { ...this.state.progress, stage: "Preparing deterministic ledger" } });
+    this.appendLog(`Render started \xB7 ${this.activeProfile()?.label ?? this.draft.profileId} \xB7 seed ${this.draft.seed}`);
+    try {
+      await this.options.onStart?.(this.getDraft());
+    } catch (error) {
+      if (this.state.status === "cancelled" || error instanceof DOMException && error.name === "AbortError") {
+        this.setState({ status: "cancelled", error: null, canResume: false });
+        return;
+      }
+      this.setState({ status: "failed", error: error instanceof Error ? error.message : String(error) });
+      this.appendLog(`Render failed: ${String(error)}`, "error");
+    }
+  }
+  async pause() {
+    if (this.state.status !== "rendering") return;
+    await this.options.onPause?.();
+    this.setState({ status: "paused", canResume: true });
+    this.appendLog("Render paused at validated checkpoint", "warning");
+  }
+  async resume() {
+    if (this.state.status !== "paused" || !this.state.canResume) return;
+    await this.options.onResume?.();
+    this.setState({ status: "rendering" });
+    this.appendLog("Render resumed from validated checkpoint");
+  }
+  async cancel() {
+    if (this.state.status !== "rendering" && this.state.status !== "paused") return;
+    await this.options.onCancel?.();
+    this.setState({ status: "cancelled", canResume: false });
+    this.appendLog("Render cancelled; incomplete transaction retained for inspection", "warning");
+  }
+  render() {
+    this.statusPill.textContent = this.state.status;
+    this.statusPill.dataset.status = this.state.status;
+    this.root.dataset.status = this.state.status;
+    this.renderTrack();
+    this.renderDraft();
+    this.renderProfile();
+    this.renderValidation();
+    this.renderProgress();
+    this.renderResult();
+    this.drawTimeline();
+  }
+  renderTrack() {
+    const track = this.state.track;
+    if (!track) {
+      this.trackName.textContent = "No source loaded";
+      this.trackMeta.textContent = "Awaiting immutable analysis buffer";
+      this.trackHash.textContent = "SHA-256 \u2014";
+      this.previewSlate.hidden = false;
+      return;
+    }
+    this.trackName.textContent = track.name;
+    const fileSize = this.draft.audioFile ? ` \xB7 ${formatBytes(this.draft.audioFile.size)}` : "";
+    this.trackMeta.textContent = `${formatTime2(track.durationSeconds)} \xB7 ${track.sampleRate.toLocaleString()} Hz \xB7 ${track.channels === 1 ? "mono" : `${track.channels} ch`}${fileSize}`;
+    this.trackHash.textContent = track.sha256 ? `SHA-256 ${track.sha256.slice(0, 16)}\u2026` : "SHA-256 analyzing\u2026";
+    this.previewSlate.hidden = this.state.status !== "analyzing";
+    this.previewSlate.querySelector("b").textContent = this.state.status === "analyzing" ? "ANALYZING" : "SOURCE READY";
+    this.previewSlate.querySelector("span").textContent = this.state.status === "analyzing" ? "Freezing waveform, tempo and event ledger" : "Frame 000000 ready to inspect";
+  }
+  renderDraft() {
+    for (const button of this.root.querySelectorAll("[data-mode]")) {
+      const active = button.dataset.mode === this.draft.mode;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-pressed", String(active));
+    }
+    this.presetSelect.disabled = this.draft.mode === "auto";
+    const selectedValue = this.draft.presetId ? `${this.draft.presetKind}:${this.draft.presetId}` : "";
+    if ([...this.presetSelect.options].some((option) => option.value === selectedValue)) this.presetSelect.value = selectedValue;
+    this.customPresetName.textContent = this.draft.customPresetFile?.name ?? "No custom preset";
+    this.customPresetName.classList.toggle("is-loaded", !!this.draft.customPresetFile);
+    this.need('input[data-field="seed"]').value = String(this.draft.seed);
+    this.need('input[data-field="bpm"]').value = this.draft.bpm === null ? "" : String(this.draft.bpm);
+    this.need('input[data-field="downbeat"]').value = String(this.draft.downbeatSample);
+    this.need('select[data-field="meter"]').value = this.draft.meter;
+    for (const [name, checked] of [["png", this.draft.includePngSequence], ["audio", this.draft.includeAudio], ["proxy", this.draft.generateProxy], ["probe", this.draft.runProbe], ["segments", this.draft.buildMinimaxSegments]]) this.need(`input[data-toggle="${name}"]`).checked = checked;
+    this.outputName.textContent = this.draft.outputPath || "Choose folder";
+  }
+  renderProfile() {
+    const profile2 = this.activeProfile();
+    if (!profile2) return;
+    this.profileSelect.value = profile2.id;
+    for (const node of this.root.querySelectorAll('[data-role="profile-raster"]')) node.textContent = `${profile2.width.toLocaleString()} \xD7 ${profile2.height.toLocaleString()}`;
+    for (const node of this.root.querySelectorAll('[data-role="profile-clock"]')) node.textContent = `${profile2.fpsNum} / ${profile2.fpsDen} fps`;
+    const samples = this.samplesPerFrame(profile2);
+    this.frameInterval.textContent = Number.isInteger(samples) ? `${samples.toLocaleString()} samples / frame` : `${samples.toFixed(3)} samples / frame`;
+    const count = this.totalFrames(profile2);
+    this.frameCount.textContent = count ? `${count.toLocaleString()} frames resolved` : "0 frames resolved";
+    const output = this.previewCanvas;
+    if (output.width !== profile2.width || output.height !== profile2.height) {
+      output.width = profile2.width;
+      output.height = profile2.height;
+    }
+  }
+  renderValidation() {
+    const checks = this.state.validation.length ? this.state.validation : this.defaultValidation();
+    this.validationList.replaceChildren();
+    for (const check of checks) {
+      const row = element("li", `is-${check.status}`);
+      const mark = element("span", "offline-validation-mark", check.status === "passed" ? "\u2713" : check.status === "failed" ? "\xD7" : check.status === "warning" ? "!" : check.status === "working" ? "\u21BB" : "\xB7");
+      const copy = element("div");
+      copy.append(element("strong", "", check.label));
+      if (check.detail) copy.append(element("small", "", check.detail));
+      row.append(mark, copy);
+      this.validationList.append(row);
+    }
+    this.errorPanel.hidden = !this.state.error;
+    this.errorPanel.textContent = this.state.error ?? "";
+    const running = this.state.status === "rendering" || this.state.status === "paused";
+    this.renderButton.disabled = running || this.state.status === "analyzing";
+    this.renderButton.querySelector("span").textContent = this.state.status === "completed" ? "Render again" : "Render complete track";
+  }
+  renderProgress() {
+    const { progress, status } = this.state;
+    const ratio = progress.totalFrames > 0 ? Math.min(1, progress.completedFrames / progress.totalFrames) : 0;
+    this.progressFill.style.width = `${(ratio * 100).toFixed(3)}%`;
+    this.progressTrack.setAttribute("aria-valuenow", (ratio * 100).toFixed(1));
+    this.progressTrack.setAttribute("aria-valuetext", `${progress.completedFrames.toLocaleString()} of ${progress.totalFrames.toLocaleString()} frames`);
+    this.progressLabel.textContent = progress.stage;
+    this.progressPct.textContent = `${(ratio * 100).toFixed(1)}%`;
+    this.etaValue.textContent = progress.etaSeconds === void 0 ? "\u2014" : formatTime2(progress.etaSeconds);
+    this.throughputValue.textContent = progress.throughputFps === void 0 ? "\u2014 fps" : `${progress.throughputFps.toFixed(1)} fps`;
+    this.queueValue.textContent = `${progress.queueDepth ?? 0} frames`;
+    this.gpuValue.textContent = progress.gpuMs === void 0 ? "\u2014 ms" : `${progress.gpuMs.toFixed(2)} ms`;
+    const running = status === "rendering" || status === "paused";
+    this.pauseButton.disabled = !running;
+    this.pauseButton.textContent = status === "paused" ? "Resume" : "Pause";
+    this.cancelButton.disabled = !running;
+    const frame2 = Math.min(progress.completedFrames, Math.max(0, progress.totalFrames - 1));
+    const sample2 = Math.floor(frame2 * this.samplesPerFrame(this.activeProfile()));
+    this.previewFrame.textContent = `F ${String(frame2).padStart(6, "0")} \xB7 S ${String(sample2).padStart(9, "0")}`;
+  }
+  renderResult() {
+    const result = this.state.result;
+    this.resultPanel.hidden = !result || this.state.status !== "completed";
+    if (result) this.resultPanel.querySelector("p").textContent = `${result.frameCount.toLocaleString()} frames \xB7 ${formatTime2(result.durationSeconds)}${result.manifestSha256 ? ` \xB7 manifest ${result.manifestSha256.slice(0, 12)}\u2026` : ""}`;
+  }
+  defaultValidation() {
+    const profile2 = this.activeProfile();
+    const presetReady = this.draft.mode === "auto" || !!this.draft.presetId || !!this.draft.customPresetFile;
+    const tempoReady = this.draft.bpm !== null && this.draft.bpm > 0;
+    return [
+      { id: "source", label: "Audio authority", detail: this.state.track ? `${this.state.track.sampleRate.toLocaleString()} Hz \xB7 ${this.state.track.totalSamplesPerChannel.toLocaleString()} samples` : "Load a track to begin", status: this.state.track ? "passed" : this.state.status === "analyzing" ? "working" : "pending" },
+      { id: "program", label: "Preset schedule", detail: this.draft.mode === "auto" ? "Auto ledger resolves before rendering" : presetReady ? "Fixed deterministic authority" : "Select a preset", status: presetReady ? "passed" : "pending" },
+      { id: "tempo", label: "Reviewed musical grid", detail: tempoReady ? `${this.draft.bpm.toFixed(2)} BPM \xB7 ${this.draft.meter} \xB7 downbeat S${this.draft.downbeatSample}` : "Enter a reviewed BPM; no fallback is labeled as analysis", status: tempoReady ? "passed" : "pending" },
+      { id: "clock", label: "Frame/sample clock", detail: profile2 ? `${profile2.fpsNum} fps \xB7 ${this.frameInterval.textContent}` : "Choose an output profile", status: this.state.track && profile2 ? "passed" : "pending" },
+      { id: "output", label: "Transactional output", detail: this.draft.outputPath || "Choose an empty directory \xB7 proxy/archive use CLI", status: this.draft.outputDirectoryHandle ? "passed" : "pending" },
+      { id: "gpu", label: "Renderer diagnostics", detail: "Fail-closed WebGPU checks before frame 0", status: "pending" }
+    ];
+  }
+  activeProfile() {
+    return this.profiles.find((profile2) => profile2.id === this.draft.profileId) ?? this.profiles[0];
+  }
+  samplesPerFrame(profile2 = this.activeProfile()) {
+    const rate = this.state.track?.sampleRate ?? 48e3;
+    return profile2 ? rate * profile2.fpsDen / profile2.fpsNum : 0;
+  }
+  totalFrames(profile2 = this.activeProfile()) {
+    const samples = this.state.track?.totalSamplesPerChannel ?? 0;
+    const perFrame = this.samplesPerFrame(profile2);
+    return perFrame > 0 ? Math.ceil(samples / perFrame) : 0;
+  }
+  drawTimeline() {
+    const canvas2 = this.timelineCanvas;
+    const rect = canvas2.getBoundingClientRect();
+    if (rect.width < 1) return;
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    const width = Math.round(rect.width * dpr);
+    const height = Math.round(176 * dpr);
+    if (canvas2.width !== width || canvas2.height !== height) {
+      canvas2.width = width;
+      canvas2.height = height;
+    }
+    const ctx = canvas2.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const w = rect.width;
+    const h = 176;
+    ctx.fillStyle = "#081018";
+    ctx.fillRect(0, 0, w, h);
+    const center = 53;
+    ctx.strokeStyle = "rgba(209,230,239,.11)";
+    ctx.beginPath();
+    ctx.moveTo(0, center + 0.5);
+    ctx.lineTo(w, center + 0.5);
+    ctx.stroke();
+    const source3 = this.waveform;
+    if (source3.length) {
+      ctx.strokeStyle = "#42d8ee";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let x = 0; x < Math.ceil(w); x += 1) {
+        const start = Math.floor(x / w * source3.length);
+        const end = Math.max(start + 1, Math.floor((x + 1) / w * source3.length));
+        let peak = 0;
+        for (let index = start; index < end; index += 1) peak = Math.max(peak, Math.abs(source3[index] ?? 0));
+        const y = peak * 42;
+        ctx.moveTo(x + 0.5, center - y);
+        ctx.lineTo(x + 0.5, center + y);
+      }
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = "rgba(66,216,238,.22)";
+      ctx.setLineDash([2, 5]);
+      ctx.beginPath();
+      ctx.moveTo(0, center);
+      ctx.lineTo(w, center);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    const profile2 = this.activeProfile();
+    const total = Math.max(this.totalFrames(profile2), this.state.progress.totalFrames);
+    const current = Math.min(Math.max(0, this.state.progress.completedFrames), Math.max(0, total - 1));
+    const stripY = 108;
+    const stripH = 42;
+    const visible = Math.min(24, Math.max(1, total || 24));
+    const startFrame = Math.max(0, Math.min(Math.max(0, total - visible), current - Math.floor(visible / 2)));
+    const cellW = w / visible;
+    ctx.font = '9px "Cascadia Mono", Consolas, monospace';
+    ctx.textBaseline = "middle";
+    for (let slot2 = 0; slot2 < visible; slot2 += 1) {
+      const frame2 = startFrame + slot2;
+      const x = slot2 * cellW;
+      const selected = frame2 === current && total > 0;
+      ctx.fillStyle = selected ? "rgba(66,216,238,.18)" : slot2 % 2 ? "rgba(255,255,255,.018)" : "rgba(255,255,255,.035)";
+      ctx.fillRect(x, stripY, Math.max(0, cellW - 1), stripH);
+      ctx.strokeStyle = selected ? "#42d8ee" : "rgba(209,230,239,.18)";
+      ctx.strokeRect(x + 0.5, stripY + 0.5, Math.max(0, cellW - 1), stripH - 1);
+      if (cellW > 34) {
+        ctx.fillStyle = selected ? "#f4fbff" : "#8195a3";
+        ctx.fillText(`F${String(frame2).padStart(4, "0")}`, x + 5, stripY + 13);
+        const sample2 = Math.floor(frame2 * this.samplesPerFrame(profile2));
+        ctx.fillStyle = selected ? "#42d8ee" : "#526875";
+        ctx.fillText(`S${sample2}`, x + 5, stripY + 29);
+      }
+    }
+    ctx.fillStyle = "#68808d";
+    ctx.font = '9px "Cascadia Mono", Consolas, monospace';
+    ctx.fillText("TRACK OVERVIEW / SAMPLE DOMAIN", 10, 93);
+    ctx.textAlign = "right";
+    ctx.fillText(`FRAME WINDOW ${startFrame}\u2014${startFrame + visible - 1}`, w - 10, 93);
+    ctx.textAlign = "left";
+    const progressX = total > 0 ? current / Math.max(1, total - 1) * w : 0;
+    ctx.fillStyle = "#ff6f61";
+    ctx.fillRect(Math.max(0, progressX - 1), 6, 2, 88);
+  }
+  async seekFromPointer(event) {
+    const profile2 = this.activeProfile();
+    const total = this.totalFrames(profile2);
+    if (!profile2 || total <= 0) return;
+    const rect = this.timelineCanvas.getBoundingClientRect();
+    const frame2 = Math.min(total - 1, Math.max(0, Math.floor((event.clientX - rect.left) / rect.width * total)));
+    const sample2 = Math.floor(frame2 * this.samplesPerFrame(profile2));
+    this.previewFrame.textContent = `F ${String(frame2).padStart(6, "0")} \xB7 S ${String(sample2).padStart(9, "0")}`;
+    await this.options.onSeekPreview?.(frame2, sample2);
+  }
+  trapFocus(event) {
+    const focusable = [...this.root.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex="0"]')].filter((node) => node.offsetParent !== null);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last2 = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last2.focus();
+    } else if (!event.shiftKey && document.activeElement === last2) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+};
+function createOfflineStudio(options = {}) {
+  return new Studio(options);
+}
+
+// src/offline-browser.ts
+function createBrowserOfflineStudio() {
+  let analysisBuffer = null;
+  let session = null;
+  let client = null;
+  let previewAt = 0;
+  let outputDirectory = null;
+  const studio = createOfflineStudio({
+    presets: BUNDLED_AVS_PRESETS.map((preset2) => ({
+      id: preset2.id,
+      name: preset2.name,
+      collection: preset2.collection,
+      kind: "bundled"
+    })),
+    profiles: OUTPUT_PROFILES.map((profile2) => ({
+      id: profile2.id,
+      label: profile2.label,
+      width: profile2.width,
+      height: profile2.height,
+      fpsNum: profile2.fpsNumerator,
+      fpsDen: profile2.fpsDenominator,
+      purpose: profilePurpose(profile2.kind),
+      authority: profile2.canonicalMiniMaxAuthority,
+      availability: profile2.frameFormat === "png-rgb24" ? "browser" : "post-render"
+    })),
+    async onAnalyzeTrack(file) {
+      studio.setState({ status: "analyzing", error: null });
+      const sourceSha256 = await sha256Hex(file);
+      const context = new AudioContext({ sampleRate: 48e3 });
+      try {
+        const decoded = await context.decodeAudioData(await file.arrayBuffer());
+        analysisBuffer = normalizeDecodedAudio(decoded, {
+          sourceSha256,
+          sourceSampleFormat: file.type || "decoded_audio",
+          sourcePath: file.name
+        });
+      } finally {
+        await context.close();
+      }
+      const waveform = overviewWaveform(analysisBuffer);
+      const summary = {
+        name: file.name,
+        durationSeconds: analysisBuffer.durationSeconds,
+        sampleRate: analysisBuffer.sampleRate,
+        channels: analysisBuffer.channels,
+        totalSamplesPerChannel: analysisBuffer.totalSamplesPerChannel,
+        sha256: sourceSha256,
+        waveform
+      };
+      studio.setWaveform(waveform);
+      return summary;
+    },
+    async onStart(draft) {
+      if (!analysisBuffer) throw new Error("Analyze an audio track before rendering.");
+      if (draft.bpm === null || !(draft.bpm > 0)) {
+        throw new Error("Confirm a positive BPM before rendering; AAAVS will not label a 120 BPM fallback as analyzed.");
+      }
+      if (!isDirectoryHandle(draft.outputDirectoryHandle)) {
+        throw new Error("Choose an empty output directory. Full track packages require the File System Access API.");
+      }
+      outputDirectory = draft.outputDirectoryHandle;
+      studio.appendLog("Freezing timeline, events, anchors and preset schedule");
+      session = prepareOfflineRender(analysisBuffer, {
+        profileId: draft.profileId,
+        mode: draft.mode,
+        ...draft.mode === "preset" ? { presetId: selectedPresetId(draft) } : {},
+        ...draft.mode === "auto" ? { availablePresetIds: BUNDLED_AVS_PRESETS.map((preset2) => preset2.id) } : {},
+        seed: draft.seed,
+        bpm: draft.bpm,
+        meter: draft.meter,
+        downbeatSample: draft.downbeatSample
+      });
+      const prepared = await preparePresets(session, draft);
+      const pcm = planarCopy(analysisBuffer);
+      const profile2 = session.plan.profile;
+      const workerInput = {
+        jobId: crypto.randomUUID(),
+        width: profile2.width,
+        height: profile2.height,
+        fpsNum: profile2.fpsNumerator,
+        fpsDen: profile2.fpsDenominator,
+        sampleRate: 48e3,
+        totalSamples: analysisBuffer.totalSamplesPerChannel,
+        left: pcm.left,
+        right: pcm.right,
+        presetBank: prepared.bank,
+        presetCues: prepared.cues,
+        outputDirectory
+      };
+      const startedAt = performance.now();
+      client = new OfflineRenderClient({
+        onStarted(frameCount2) {
+          studio.appendLog(`Worker armed for ${frameCount2.toLocaleString()} frame-complete renders`);
+          studio.updateProgress({ stage: "Rendering RGB24 frames", totalFrames: frameCount2 });
+        },
+        onProgress(progress) {
+          const elapsedSeconds = progress.elapsedMs / 1e3;
+          const throughput = elapsedSeconds > 0 ? progress.writtenFrames / elapsedSeconds : 0;
+          const remaining = progress.frameCount - progress.writtenFrames;
+          studio.updateProgress({
+            stage: "Rendering \xB7 encoding \xB7 hashing \xB7 writing",
+            completedFrames: progress.writtenFrames,
+            totalFrames: progress.frameCount,
+            elapsedSeconds,
+            etaSeconds: throughput > 0 ? remaining / throughput : void 0,
+            throughputFps: throughput,
+            encodeFps: progress.encodeWriteMs > 0 ? progress.writtenFrames / (progress.encodeWriteMs / 1e3) : void 0,
+            queueDepth: progress.queueDepth
+          });
+          if (performance.now() - previewAt > 700 && progress.writtenFrames > 0) {
+            previewAt = performance.now();
+            void showPreview(outputDirectory, progress.writtenFrames - 1, studio.previewCanvas);
+          }
+        }
+      });
+      try {
+        const rendered = await client.start(workerInput);
+        studio.setState({ validation: [
+          { id: "frames", label: "Frame sequence complete", detail: `${rendered.frameCount.toLocaleString()} RGB24 PNGs`, status: "passed" },
+          { id: "package", label: "Finalizing authority package", detail: "WAV, ledgers, hashes and manifest", status: "working" }
+        ] });
+        studio.appendLog("All frames written; building WAV and machine-readable sidecars");
+        const writer = new TransactionalPackageWriter(new DirectoryPackageSink(outputDirectory));
+        for (const artifact of rendered.artifacts) writer.registerExisting(artifact.path, artifact.sha256);
+        const boundPlan = bindAnchorHashes(session.plan, writer.hashes);
+        await writer.writeStandardSidecars(boundPlan, analysisBuffer);
+        const bundleSha256 = await currentOfflineWorkerSha256();
+        const manifest = await createOfflineManifest(boundPlan, analysisBuffer, {
+          commit: "browser-build",
+          bundleSha256,
+          userAgent: navigator.userAgent
+        }, writer.hashes);
+        const presetAuthoritySha256 = draft.mode === "preset" ? prepared.bank.find((entry) => entry.presetId === boundPlan.schedule.entries[0].presetId).presetSha256 : await sha256Hex(JSON.stringify(boundPlan.schedule));
+        await writer.finalize(Object.freeze({
+          ...manifest,
+          preset_authority: Object.freeze({ ...manifest.preset_authority, sha256: presetAuthoritySha256 })
+        }));
+        const manifestFile = await outputDirectory.getFileHandle(OFFLINE_PACKAGE_NAMES.manifest).then((handle) => handle.getFile());
+        const manifestSha256 = await sha256Hex(manifestFile);
+        const elapsedSeconds = (performance.now() - startedAt) / 1e3;
+        studio.updateProgress({
+          stage: "Validated package complete",
+          completedFrames: rendered.frameCount,
+          totalFrames: rendered.frameCount,
+          elapsedSeconds,
+          throughputFps: rendered.frameCount / Math.max(1e-3, elapsedSeconds),
+          queueDepth: 0
+        });
+        studio.setState({
+          status: "completed",
+          canResume: false,
+          validation: [
+            { id: "frames", label: "Frame sequence complete", detail: `${rendered.frameCount.toLocaleString()} RGB24 PNGs`, status: "passed" },
+            { id: "clock", label: "Sample clock verified", detail: `${session.plan.totalSamplesPerChannel.toLocaleString()} source samples`, status: "passed" },
+            { id: "hashes", label: "Package hashes committed", detail: "sha256sums.txt + final manifest", status: "passed" }
+          ],
+          result: {
+            outputPath: outputDirectory.name,
+            frameCount: rendered.frameCount,
+            durationSeconds: session.plan.durationSeconds,
+            manifestSha256
+          }
+        });
+        studio.appendLog(`Package committed \xB7 manifest ${manifestSha256.slice(0, 16)}\u2026`, "success");
+        await showPreview(outputDirectory, rendered.frameCount - 1, studio.previewCanvas);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          studio.setState({ status: "cancelled", canResume: false, error: null });
+          return;
+        }
+        throw error;
+      } finally {
+        client?.dispose();
+        client = null;
+      }
+    },
+    onPause() {
+      client?.pause();
+    },
+    onResume() {
+      client?.resume();
+    },
+    onCancel() {
+      client?.cancel();
+    },
+    async onChooseOutputDirectory() {
+      if (!("showDirectoryPicker" in window)) {
+        throw new Error("Directory export needs Chrome or Edge with the File System Access API.");
+      }
+      return window.showDirectoryPicker();
+    },
+    async onSeekPreview(frame2) {
+      if (outputDirectory) await showPreview(outputDirectory, frame2, studio.previewCanvas);
+    }
+  });
+  return {
+    studio,
+    dispose() {
+      client?.dispose();
+      studio.dispose();
+    }
+  };
+}
+function isDirectoryHandle(value) {
+  return typeof value === "object" && value !== null && "kind" in value && value.kind === "directory" && "getDirectoryHandle" in value && typeof value.getDirectoryHandle === "function" && "getFileHandle" in value && typeof value.getFileHandle === "function";
+}
+async function preparePresets(session, draft) {
+  const customId = draft.customPresetFile ? `custom:${draft.customPresetFile.name}` : "";
+  const ids = [...new Set(session.plan.schedule.entries.map((entry) => entry.presetId))];
+  const bank = [];
+  for (const id of ids) {
+    let bytes;
+    if (draft.customPresetFile && id === customId) bytes = new Uint8Array(await draft.customPresetFile.arrayBuffer());
+    else {
+      const preset2 = BUNDLED_AVS_PRESETS.find((candidate) => candidate.id === id);
+      if (!preset2) throw new Error(`Offline schedule references unknown AVS preset ${id}`);
+      bytes = await fetchBundledAvsPreset(preset2);
+    }
+    bank.push({ presetId: id, presetSha256: await sha256Hex(bytes), bytes });
+  }
+  const fps2 = session.plan.profile.fpsNumerator / session.plan.profile.fpsDenominator;
+  const cues = session.plan.schedule.entries.map((entry, index) => ({
+    frame: index === 0 ? 0 : entry.frameStart,
+    presetId: entry.presetId,
+    seed: entry.seed,
+    transitionFrames: Math.round(entry.transitionSamples / 48e3 * fps2)
+  }));
+  return { bank, cues };
+}
+function selectedPresetId(draft) {
+  if (draft.customPresetFile) return `custom:${draft.customPresetFile.name}`;
+  if (!draft.presetId) throw new Error("Choose an AVS preset for fixed mode.");
+  return draft.presetId;
+}
+function planarCopy(buffer) {
+  const left = new Float32Array(buffer.totalSamplesPerChannel);
+  const right = new Float32Array(buffer.totalSamplesPerChannel);
+  buffer.readPlanar(0, buffer.totalSamplesPerChannel, left, right);
+  return { left, right };
+}
+function overviewWaveform(buffer, points = 2048) {
+  const output = new Float32Array(Math.min(points, Math.max(1, buffer.totalSamplesPerChannel)));
+  const span = buffer.totalSamplesPerChannel / output.length;
+  for (let i = 0; i < output.length; i++) {
+    const start = Math.floor(i * span);
+    const end = Math.max(start + 1, Math.floor((i + 1) * span));
+    let peak = 0;
+    for (let sample2 = start; sample2 < end; sample2++) {
+      peak = Math.max(peak, Math.abs(buffer.sample(0, sample2)), Math.abs(buffer.sample(1, sample2)));
+    }
+    output[i] = peak;
+  }
+  return output;
+}
+async function showPreview(directory, frame2, canvas2) {
+  try {
+    const frames2 = await directory.getDirectoryHandle("frames");
+    const handle = await frames2.getFileHandle(`frame_${String(frame2).padStart(6, "0")}.png`);
+    const bitmap = await createImageBitmap(await handle.getFile());
+    const context = canvas2.getContext("2d", { alpha: false });
+    context?.drawImage(bitmap, 0, 0, canvas2.width, canvas2.height);
+    bitmap.close();
+  } catch {
+  }
+}
+async function currentOfflineWorkerSha256() {
+  const response = await fetch(new URL("./offline-render.worker.js", import.meta.url));
+  if (!response.ok) throw new Error(`Could not hash offline renderer bundle: HTTP ${response.status}`);
+  return sha256Hex(await response.blob());
+}
+function profilePurpose(kind) {
+  switch (kind) {
+    case "authority":
+      return "Authoritative RGB24 PNG + WAV package";
+    case "performance":
+      return "Frame-complete performance qualification";
+    case "delivery":
+      return "Delivery-resolution RGB24 frame package";
+    case "diagnostic":
+      return "Diagnostic RGB24 frame package";
+    case "review":
+      return "Review-resolution source frame package";
+    case "archive":
+      return "Lossless source frame package";
+    default:
+      return "Deterministic RGB24 frame package";
+  }
+}
+var DirectoryPackageSink = class {
+  constructor(root) {
+    this.root = root;
+  }
+  async write(path, data) {
+    const parts = path.split("/");
+    const name = parts.pop();
+    if (!name) throw new Error(`Invalid output path ${path}`);
+    let directory = this.root;
+    for (const part of parts) directory = await directory.getDirectoryHandle(part, { create: true });
+    try {
+      await directory.getFileHandle(name);
+      throw new Error(`Refusing to overwrite package file ${path}`);
+    } catch (error) {
+      if (!(error instanceof DOMException) || error.name !== "NotFoundError") throw error;
+    }
+    const handle = await directory.getFileHandle(name, { create: true });
+    const writable = await handle.createWritable();
+    try {
+      await writable.write(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+      await writable.close();
+    } catch (error) {
+      try {
+        await writable.abort();
+      } catch {
+      }
+      throw error;
+    }
+  }
+  async commit() {
+  }
+  async abort() {
+  }
+};
+
 // src/shaders/present.wgsl
 var present_default = "// Final pass: HDR accumulation -> swapchain.\n//\n// Everything upstream is rgba16float and freely exceeds 1.0. This is the only\n// place that becomes a displayable image, so it owns bloom, tone mapping and\n// the vignette, and it is the only place that should.\n\nstruct Post {\n  bloom    : f32,\n  exposure : f32,\n  vignette : f32,\n  aspect   : f32,\n  grain    : f32,\n  time     : f32,\n  pad0     : f32,\n  pad1     : f32,\n};\n\n@group(0) @binding(0) var src : texture_2d<f32>;\n@group(0) @binding(1) var samp : sampler;\n@group(0) @binding(2) var<uniform> P : Post;\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  let p = array<vec2<f32>, 3>(\n    vec2<f32>(-1.0, -1.0), vec2<f32>( 3.0, -1.0), vec2<f32>(-1.0,  3.0),\n  );\n  return vec4<f32>(p[vi], 0.0, 1.0);\n}\n\n// Narkowicz ACES. A *look*, not a correction \u2014 it rolls highlights off so\n// additive accumulation stops clipping to flat white.\nfn aces(x: vec3<f32>) -> vec3<f32> {\n  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;\n  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));\n}\n\nfn hash21(p: vec2<f32>) -> f32 {\n  var p3 = fract(vec3<f32>(p.xyx) * 0.1031);\n  p3 = p3 + dot(p3, p3.yzx + 33.33);\n  return fract((p3.x + p3.y) * p3.z);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let dims = vec2<f32>(textureDimensions(src));\n  let uv = frag.xy / dims;\n  let texel = 1.0 / dims;\n\n  var col = textureSampleLevel(src, samp, uv, 0.0).rgb;\n\n  // Cheap threshold bloom. A real mip chain belongs here (plan \xA74.11) \u2014 this is\n  // a fixed 12-tap ring, which is honest for a vertical slice and would be the\n  // wrong answer at 2K120.\n  if (P.bloom > 0.001) {\n    var sum = vec3<f32>(0.0);\n    let radius = 9.0;\n    for (var i = 0; i < 12; i = i + 1) {\n      let a = f32(i) * 0.5235988;           // 2pi/12\n      let o = vec2<f32>(cos(a), sin(a)) * radius * texel;\n      let s = textureSampleLevel(src, samp, uv + o, 0.0).rgb;\n      sum = sum + max(s - vec3<f32>(0.6), vec3<f32>(0.0));\n    }\n    col = col + sum * (P.bloom / 12.0);\n  }\n\n  col = col * P.exposure;\n\n  // Vignette. Multiplicative and gentle \u2014 art-direction \xA74.3 wants most of the\n  // frame near-black, and this helps without eating the subject.\n  let d = length((uv - 0.5) * vec2<f32>(P.aspect, 1.0));\n  col = col * mix(1.0, smoothstep(1.05, 0.25, d), P.vignette);\n\n  col = aces(col);\n\n  // Grain after tone mapping, so it lives in display space and does not get\n  // crushed by the curve.\n  if (P.grain > 0.001) {\n    let n = hash21(frag.xy + vec2<f32>(P.time * 60.0, P.time * 37.0)) - 0.5;\n    col = col + vec3<f32>(n * P.grain * 0.06);\n  }\n\n  return vec4<f32>(col, 1.0);\n}\n";
 
@@ -18729,6 +20812,31 @@ var ui = new LayerUI({
   // UI test, which needs the production layout visibly open for page capture.
   open: !golden || uiTest
 });
+var offline = golden ? null : createBrowserOfflineStudio();
+var offlineLauncher = offline ? document.createElement("button") : null;
+if (offlineLauncher && offline) {
+  offlineLauncher.type = "button";
+  offlineLauncher.textContent = "OFFLINE RENDER";
+  offlineLauncher.title = "Open sample-clock offline render studio (O)";
+  offlineLauncher.setAttribute("aria-label", "Open offline render studio");
+  offlineLauncher.style.cssText = [
+    "position:fixed",
+    "right:1rem",
+    "bottom:1rem",
+    "z-index:20",
+    "padding:.65rem .85rem",
+    "border:1px solid rgba(66,216,238,.55)",
+    "border-radius:3px",
+    "background:rgba(5,10,16,.88)",
+    "color:#42d8ee",
+    'font:700 10px/1 ui-monospace,"Cascadia Mono",Consolas,monospace',
+    "letter-spacing:.12em",
+    "cursor:pointer",
+    "backdrop-filter:blur(10px)"
+  ].join(";");
+  offlineLauncher.addEventListener("click", () => offline.studio.open());
+  document.body.append(offlineLauncher);
+}
 var f322 = new Float32Array(8);
 var last = performance.now();
 var frames = 0;
@@ -18967,6 +21075,7 @@ function disposePage() {
   detector.detach();
   audio.dispose();
   avsWorkerRenderer?.dispose();
+  offline?.dispose();
 }
 window.addEventListener("pagehide", disposePage, { once: true });
 window.addEventListener("beforeunload", disposePage, { once: true });
@@ -18982,6 +21091,7 @@ globalThis.__aaavs = {
   overlay,
   renderer,
   ui,
+  offline,
   post,
   gpu
 };
@@ -19002,8 +21112,12 @@ function readParam(type, key, fallback) {
   }
   return fallback;
 }
-document.addEventListener("dragover", (e) => e.preventDefault());
+document.addEventListener("dragover", (e) => {
+  if (offline?.studio.isOpen()) return;
+  e.preventDefault();
+});
 document.addEventListener("drop", async (e) => {
+  if (offline?.studio.isOpen()) return;
   e.preventDefault();
   const file = e.dataTransfer?.files?.[0];
   if (!file) return;
@@ -19055,6 +21169,7 @@ window.addEventListener("keydown", (e) => {
     if (e.key === "Escape" || e.key === "?" || e.key === "Enter") closeGuide();
     return;
   }
+  if (offline?.studio.isOpen()) return;
   if (e.key >= "2" && e.key <= "9") patchParams("kaleidoscope", { segments: Number(e.key) });
   if (e.key === "1") patchParams("kaleidoscope", { segments: 0 });
   if (e.key === "k") {
@@ -19085,6 +21200,7 @@ window.addEventListener("keydown", (e) => {
     applyPreset(c.preset, c.transition, audio.currentTime, timeline.bpm(audio.currentTime) || 120);
   }
   if (e.key === "d") overlay.toggle();
+  if (e.key === "o") offline?.studio.open();
   if (e.key === "t") {
     resetTransport(0);
     audio.startTestSignal(128);
