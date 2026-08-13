@@ -2967,6 +2967,27 @@ var cathodeOrbit = scene("cathode-orbit", 2162689, V2_LAB, [
     "primary",
     { scale: 1.1, detail: 1.25, spread: 0.75, rate: 0.125, focusX: -0.24, focusY: 0.07, thickness: 0.75 },
     { resolutionScale: 1, ...sustain("2bar", 8.5) }
+  ),
+  source(
+    "beam-trace",
+    "scope",
+    "accent",
+    { mode: "dots", gain: 1.85, thickness: 4e-3 },
+    { blend: "max", opacity: 0.7, resolutionScale: 1, ...accentPulse("beat", 0.02, 0.12, 0.55) }
+  ),
+  memory(
+    "tube-burn",
+    "feedback",
+    "primary",
+    { tauBeats: 1.8, gain: 0.78, zoomPerBeat: 1.018, rotTurnsPerBar: -0.018, centreX: 0.42, centreY: 0.54, clipKnee: 0.72, clipCeiling: 1.12 },
+    { opacity: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  effect(
+    "split-phosphor",
+    "diffraction",
+    "secondary",
+    { amount: 0.36, strength: 0.68, radius: 1.1, detail: 0.85, threshold: 0.38, angle: 0.08 },
+    { opacity: 0.48, resolutionScale: 1, ...sustain("bar", 4.5) }
   )
 ]);
 var fluxCartography = scene("flux-cartography", 2162690, V2_LAB, [
@@ -2976,6 +2997,27 @@ var fluxCartography = scene("flux-cartography", 2162690, V2_LAB, [
     "primary",
     { scale: 1.05, density: 1.18, spread: 1.15, rate: 0.125, focusX: 0.18, focusY: 0.02, thickness: 0.72 },
     { resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  source(
+    "stereo-current",
+    "stereofield",
+    "accent",
+    { gain: 1.1, gamma: 0.62, spread: 0.86 },
+    { blend: "subtract", opacity: 0.55, resolutionScale: 1, ...sustain("bar", 4.5) }
+  ),
+  memory(
+    "field-memory",
+    "feedback",
+    "secondary",
+    { tauBeats: 2.6, gain: 0.66, zoomPerBeat: 0.994, rotTurnsPerBar: 0.028, driftX: 0.025, centreX: 0.62, centreY: 0.46, clipKnee: 0.7, clipCeiling: 1.04 },
+    { opacity: 0.46, ...sustain("2bar", 8.5) }
+  ),
+  effect(
+    "current-edges",
+    "edgeflow",
+    "primary",
+    { amount: 0.48, strength: 0.76, radius: 1.1, detail: 1.2, rate: 0.25, angle: -0.12 },
+    { opacity: 0.58, resolutionScale: 1, ...sustain("bar", 4.5) }
   )
 ]);
 var harmonicSpecimen = scene("harmonic-specimen", 2162691, V2_LAB, [
@@ -2985,6 +3027,27 @@ var harmonicSpecimen = scene("harmonic-specimen", 2162691, V2_LAB, [
     "primary",
     { scale: 1.18, detail: 1.2, spread: 0.7, rate: 0.125, focusX: -0.12, focusY: 0.02, thickness: 0.8 },
     { resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  source(
+    "radial-harmonics",
+    "radialbars",
+    "accent",
+    { bars: 48, gain: 0.92, gamma: 0.64, innerRadius: 0.16, reach: 0.36, spinBars: -12 },
+    { blend: "max", opacity: 0.56, resolutionScale: 1, ...sustain("bar", 4.5) }
+  ),
+  memory(
+    "harmonic-afterimage",
+    "feedback",
+    "primary",
+    { tauBeats: 1.35, gain: 0.82, zoomPerBeat: 1.026, rotTurnsPerBar: 0.04, centreX: 0.47, centreY: 0.48, clipKnee: 0.74, clipCeiling: 1.1 },
+    { opacity: 0.52, ...sustain("2bar", 8.5) }
+  ),
+  effect(
+    "glass-harmonics",
+    "foldglass",
+    "secondary",
+    { amount: 0.46, strength: 0.76, radius: 1.05, detail: 0.9, rate: 0.25, focusX: -0.16, focusY: 0.04, angle: 0.1 },
+    { opacity: 0.52, resolutionScale: 1, ...sustain("bar", 4.5) }
   )
 ]);
 var quasicrystalScan = scene("quasicrystal-scan", 2162692, V2_LAB, [
@@ -2994,6 +3057,27 @@ var quasicrystalScan = scene("quasicrystal-scan", 2162692, V2_LAB, [
     "secondary",
     { scale: 1.18, density: 0.78, detail: 0.8, rate: 0.0625, focusX: 0.24, focusY: -0.04, thickness: 0.65, bias: 0.42 },
     { opacity: 0.78, resolutionScale: 0.5, ...sustain("4bar", 16.5) }
+  ),
+  source(
+    "crystal-scope",
+    "scope",
+    "accent",
+    { mode: "line", gain: 2.1, thickness: 35e-4 },
+    { blend: "xor", opacity: 0.38, resolutionScale: 1, ...accentPulse("half", 0.02, 0.14, 0.28) }
+  ),
+  memory(
+    "crystal-recursion",
+    "feedback",
+    "secondary",
+    { tauBeats: 3.4, gain: 0.58, zoomPerBeat: 1.008, rotTurnsPerBar: -0.012, driftY: 0.018, centreX: 0.58, centreY: 0.4, clipKnee: 0.68, clipCeiling: 0.98 },
+    { opacity: 0.42, ...sustain("2bar", 8.5) }
+  ),
+  effect(
+    "crystal-ranks",
+    "rank-stretch",
+    "primary",
+    { amount: 0.42, strength: 0.62, radius: 1, detail: 1.4, rate: 0.125, angle: 0.25 },
+    { opacity: 0.46, resolutionScale: 1, ...sustain("2bar", 8.5) }
   )
 ]);
 var cathedralDrive = scene("cathedral-drive", 2228225, V2_GRID, [
@@ -3003,6 +3087,20 @@ var cathedralDrive = scene("cathedral-drive", 2228225, V2_GRID, [
     "primary",
     { scale: 1.1, density: 1, detail: 1.25, rate: 0.5, focusX: 0, focusY: -0.03, thickness: 0.8 },
     { resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  source(
+    "cathedral-meter",
+    "spectrum",
+    "accent",
+    { bars: 72, gain: 1.08, gamma: 0.58, height: 0.44 },
+    { blend: "max", opacity: 0.5, resolutionScale: 1, ...accentPulse("beat", 0.02, 0.14, 0.55) }
+  ),
+  memory(
+    "nave-feedback",
+    "feedback",
+    "primary",
+    { tauBeats: 1.55, gain: 0.8, zoomPerBeat: 1.022, driftY: -0.02, centreX: 0.5, centreY: 0.66, clipKnee: 0.74, clipCeiling: 1.12 },
+    { opacity: 0.52, ...sustain("2bar", 8.5) }
   ),
   effect(
     "horizon-diffraction",
@@ -3027,6 +3125,20 @@ var eclipseTransit = scene("eclipse-transit", 2228226, V2_GRID, [
     { scale: 0.92, density: 0.6, detail: 0.7, rate: 0.25, focusX: 0, focusY: -0.12, thickness: 0.58 },
     { opacity: 0.3, resolutionScale: 0.5, ...sustain("4bar", 16.5) }
   ),
+  source(
+    "eclipse-dial",
+    "radialbars",
+    "primary",
+    { bars: 40, gain: 1, gamma: 0.6, innerRadius: 0.2, reach: 0.3, centreX: 0.34, centreY: 0.18, spinBars: 16 },
+    { blend: "subtract", opacity: 0.46, resolutionScale: 1, ...sustain("bar", 4.5) }
+  ),
+  memory(
+    "umbra-trail",
+    "feedback",
+    "secondary",
+    { tauBeats: 2.1, gain: 0.7, zoomPerBeat: 1.014, rotTurnsPerBar: 0.022, centreX: 0.34, centreY: 0.18, clipKnee: 0.7, clipCeiling: 1.04 },
+    { opacity: 0.44, ...sustain("2bar", 8.5) }
+  ),
   effect(
     "optic",
     "lensfield",
@@ -3049,6 +3161,27 @@ var moireTerminal = scene("moire-terminal", 2228227, V2_GRID, [
     "secondary",
     { scale: 1.08, density: 0.52, detail: 0.62, rate: 0.125, focusX: 0, focusY: -0.16, thickness: 0.5 },
     { opacity: 0.16, resolutionScale: 0.5, ...sustain("4bar", 16.5) }
+  ),
+  source(
+    "terminal-bars",
+    "spectrum",
+    "accent",
+    { bars: 96, gain: 1.2, gamma: 0.54, height: 0.34 },
+    { blend: "xor", opacity: 0.34, resolutionScale: 1, ...accentPulse("half", 0.015, 0.12, 0.3) }
+  ),
+  memory(
+    "moire-burn",
+    "feedback",
+    "primary",
+    { tauBeats: 1.9, gain: 0.74, zoomPerBeat: 0.991, rotTurnsPerBar: -0.032, driftX: -0.018, centreX: 0.36, centreY: 0.54, clipKnee: 0.69, clipCeiling: 1.02 },
+    { opacity: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  effect(
+    "etched-terminal",
+    "engrave",
+    "secondary",
+    { amount: 0.5, strength: 0.74, radius: 1.1, detail: 1.25, rate: 0.25, angle: -0.08 },
+    { opacity: 0.56, resolutionScale: 1, ...sustain("bar", 4.5) }
   )
 ]);
 var signalArchitecture = scene("signal-architecture", 2228228, V2_GRID, [
@@ -3065,6 +3198,27 @@ var signalArchitecture = scene("signal-architecture", 2228228, V2_GRID, [
     "secondary",
     { scale: 1.12, density: 0.46, detail: 0.56, rate: 0.125, focusX: 0, focusY: -0.18, thickness: 0.46 },
     { opacity: 0.14, resolutionScale: 0.5, ...sustain("4bar", 16.5) }
+  ),
+  source(
+    "facade-scope",
+    "scope",
+    "accent",
+    { mode: "line", gain: 2.35, thickness: 45e-4 },
+    { blend: "max", opacity: 0.62, resolutionScale: 1, ...accentPulse("beat", 0.015, 0.12, 0.58) }
+  ),
+  memory(
+    "facade-echo",
+    "feedback",
+    "secondary",
+    { tauBeats: 1.45, gain: 0.84, zoomPerBeat: 1.028, driftY: 0.025, centreX: 0.64, centreY: 0.58, clipKnee: 0.76, clipCeiling: 1.14 },
+    { opacity: 0.48, ...sustain("2bar", 8.5) }
+  ),
+  effect(
+    "architectural-split",
+    "diffraction",
+    "primary",
+    { amount: 0.32, strength: 0.64, radius: 1.2, detail: 1.1, threshold: 0.46, angle: 0.22 },
+    { opacity: 0.44, resolutionScale: 1, ...sustain("bar", 4.5) }
   )
 ]);
 var vortexManuscript = scene("vortex-manuscript", 2293761, V2_INK, [
@@ -3081,6 +3235,27 @@ var vortexManuscript = scene("vortex-manuscript", 2293761, V2_INK, [
     "secondary",
     { tauBeats: 7.2, gain: 0.18, driftY: 0.012, splitPx: 0.7, rate: 0.03125, detail: 0.3, clipKnee: 0.56, clipCeiling: 0.84 },
     { opacity: 0.13, resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  source(
+    "ink-oscilloscope",
+    "scope",
+    "accent",
+    { mode: "dots", gain: 1.7, thickness: 3e-3 },
+    { blend: "multiply", opacity: 0.52, resolutionScale: 1, ...accentPulse("beat", 0.02, 0.1, 0.52) }
+  ),
+  memory(
+    "vortex-recursion",
+    "feedback",
+    "primary",
+    { tauBeats: 3.8, gain: 0.5, zoomPerBeat: 1.006, rotTurnsPerBar: 0.024, driftX: 0.014, centreX: 0.34, centreY: 0.46, clipKnee: 0.6, clipCeiling: 0.88 },
+    { opacity: 0.36, ...sustain("2bar", 8.5) }
+  ),
+  effect(
+    "paper-negative",
+    "negative-space",
+    "primary",
+    { amount: 0.32, strength: 0.62, radius: 1.1, detail: 0.8, threshold: 0.54 },
+    { opacity: 0.38, resolutionScale: 1, ...sustain("2bar", 8.5) }
   )
 ]);
 var botanicalSignal = scene("botanical-signal", 2293762, V2_INK, [
@@ -3097,6 +3272,27 @@ var botanicalSignal = scene("botanical-signal", 2293762, V2_INK, [
     "secondary",
     { tauBeats: 5.6, gain: 0.2, driftX: 0.01, splitPx: 0.65, rate: 0.03125, detail: 0.28, clipKnee: 0.58, clipCeiling: 0.86 },
     { opacity: 0.12, resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  source(
+    "spore-cloud",
+    "particles",
+    "accent",
+    { density: 1.1, scale: 0.8, spread: 1.25, speed: 0.58 },
+    { blend: "max", opacity: 0.44, resolutionScale: 0.5, ...accentPulse("beat", 0.02, 0.12, 0.54) }
+  ),
+  memory(
+    "root-afterimage",
+    "feedback",
+    "secondary",
+    { tauBeats: 2.9, gain: 0.58, zoomPerBeat: 1.012, rotTurnsPerBar: -0.018, driftY: 0.012, centreX: 0.58, centreY: 0.44, clipKnee: 0.62, clipCeiling: 0.92 },
+    { opacity: 0.4, ...sustain("2bar", 8.5) }
+  ),
+  effect(
+    "vein-flow",
+    "edgeflow",
+    "primary",
+    { amount: 0.38, strength: 0.66, radius: 0.95, detail: 1.3, rate: 0.125, angle: 0.16 },
+    { opacity: 0.44, resolutionScale: 1, ...sustain("bar", 4.5) }
   )
 ]);
 var paperAttractor = scene("paper-attractor", 2293763, V2_INK, [
@@ -3123,6 +3319,27 @@ var paperAttractor = scene("paper-attractor", 2293763, V2_INK, [
     "secondary",
     { tauBeats: 6.4, gain: 0.22, splitPx: 0.8, rate: 0.03125, detail: 0.35, clipKnee: 0.58, clipCeiling: 0.88 },
     { opacity: 0.16, resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  source(
+    "paper-trace",
+    "scope",
+    "accent",
+    { mode: "line", gain: 1.45, thickness: 28e-4 },
+    { blend: "subtract", opacity: 0.42, resolutionScale: 1, ...accentPulse("beat", 0.02, 0.12, 0.55) }
+  ),
+  memory(
+    "map-recursion",
+    "feedback",
+    "primary",
+    { tauBeats: 4.2, gain: 0.46, zoomPerBeat: 0.997, rotTurnsPerBar: 0.014, driftX: -0.01, centreX: 0.44, centreY: 0.52, clipKnee: 0.58, clipCeiling: 0.86 },
+    { opacity: 0.34, ...sustain("2bar", 8.5) }
+  ),
+  effect(
+    "attractor-engraving",
+    "engrave",
+    "primary",
+    { amount: 0.58, strength: 0.82, radius: 0.9, detail: 1.45, rate: 0.0625, angle: -0.18 },
+    { opacity: 0.6, resolutionScale: 1, ...sustain("2bar", 8.5) }
   )
 ]);
 var blackWaterLoom = scene("black-water-loom", 2293764, V2_INK, [
@@ -3139,6 +3356,27 @@ var blackWaterLoom = scene("black-water-loom", 2293764, V2_INK, [
     "secondary",
     { tauBeats: 3.2, gain: 0.3, splitPx: 1.4, rate: 0.0625, detail: 0.5, clipKnee: 0.62, clipCeiling: 0.94 },
     { opacity: 0.22, resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  source(
+    "loom-spectrum",
+    "spectrum",
+    "accent",
+    { bars: 80, gain: 0.9, gamma: 0.68, height: 0.38 },
+    { blend: "xor", opacity: 0.28, resolutionScale: 1, ...accentPulse("half", 0.02, 0.12, 0.3) }
+  ),
+  memory(
+    "black-water-feedback",
+    "feedback",
+    "primary",
+    { tauBeats: 3.25, gain: 0.56, zoomPerBeat: 1.01, rotTurnsPerBar: -0.02, driftY: -0.012, centreX: 0.38, centreY: 0.56, clipKnee: 0.61, clipCeiling: 0.9 },
+    { opacity: 0.38, ...sustain("2bar", 8.5) }
+  ),
+  effect(
+    "two-ink-print",
+    "riso",
+    "accent",
+    { amount: 0.42, strength: 0.7, radius: 1, detail: 1.15, rate: 0.125, angle: 0.12 },
+    { opacity: 0.48, resolutionScale: 1, ...sustain("bar", 4.5) }
   )
 ]);
 var prismOverload = scene("prism-overload", 2359297, V2_RAVE, [
@@ -3156,6 +3394,20 @@ var prismOverload = scene("prism-overload", 2359297, V2_RAVE, [
     { tauBeats: 1, gain: 0.62, driftX: 0.02, splitPx: 3.2, rate: 0.5, detail: 1, focusX: -0.24, focusY: 0.08 },
     { opacity: 0.46, resolutionScale: 0.5, ...sustain("2bar", 8.5) }
   ),
+  source(
+    "prism-meter",
+    "spectrum",
+    "accent",
+    { bars: 96, gain: 1.28, gamma: 0.5, height: 0.5 },
+    { blend: "xor", opacity: 0.46, resolutionScale: 1, ...accentPulse("half", 0.015, 0.11, 0.3) }
+  ),
+  effect(
+    "prism-split",
+    "diffraction",
+    "secondary",
+    { amount: 0.62, strength: 0.92, radius: 1.4, detail: 1.3, threshold: 0.32, angle: 0.16 },
+    { opacity: 0.68, resolutionScale: 1, ...accentPulse("beat", 0.015, 0.12, 0.58) }
+  ),
   effect(
     "phrase-rest",
     "drop-rest",
@@ -3171,6 +3423,20 @@ var foldEngine = scene("fold-engine", 2359298, V2_RAVE, [
     "primary",
     { bars: 56, gain: 1.15, gamma: 0.58, gap: 0.24, innerRadius: 0.18, reach: 0.42, centreX: 0.2, centreY: -0.06, bodyLevel: 0.48, capLevel: 1.25, sweep: 0.86, spinBars: 8 },
     { resolutionScale: 1, ...sustain("4bar", 16.5) }
+  ),
+  source(
+    "fold-scope",
+    "scope",
+    "accent",
+    { mode: "dots", gain: 2.4, thickness: 45e-4 },
+    { blend: "max", opacity: 0.72, resolutionScale: 1, ...accentPulse("beat", 0.015, 0.1, 0.55) }
+  ),
+  memory(
+    "fold-feedback",
+    "feedback",
+    "secondary",
+    { tauBeats: 1.05, gain: 0.88, zoomPerBeat: 1.035, rotTurnsPerBar: 0.06, driftX: 0.02, centreX: 0.35, centreY: 0.46, clipKnee: 0.78, clipCeiling: 1.18 },
+    { opacity: 0.56, ...sustain("2bar", 8.5) }
   ),
   effect(
     "fold",
@@ -3202,6 +3468,20 @@ var temporalArray = scene("temporal-array", 2359299, V2_RAVE, [
     { tauBeats: 1.15, gain: 0.72, driftY: 0.025, splitPx: 3.5, rate: 0.5, detail: 1.3, clipKnee: 0.78, clipCeiling: 1.18 },
     { opacity: 0.52, resolutionScale: 0.5, ...sustain("2bar", 8.5) }
   ),
+  source(
+    "array-spectrum",
+    "spectrum",
+    "accent",
+    { bars: 64, gain: 1.18, gamma: 0.55, height: 0.46 },
+    { blend: "subtract", opacity: 0.48, resolutionScale: 1, ...accentPulse("beat", 0.015, 0.12, 0.58) }
+  ),
+  effect(
+    "array-diffraction",
+    "diffraction",
+    "secondary",
+    { amount: 0.5, strength: 0.84, radius: 1.25, detail: 1.5, threshold: 0.38, angle: -0.22 },
+    { opacity: 0.58, resolutionScale: 1, ...accentPulse("half", 0.02, 0.14, 0.3) }
+  ),
   effect(
     "phrase-rest",
     "drop-rest",
@@ -3224,6 +3504,27 @@ var eclipseDrop = scene("eclipse-drop", 2359300, V2_RAVE, [
     "secondary",
     { tauBeats: 0.85, gain: 0.58, driftX: 0.03, splitPx: 4, rate: 1, detail: 1.2, focusX: -0.32, focusY: 0.12 },
     { opacity: 0.42, resolutionScale: 0.5, ...sustain("2bar", 8.5) }
+  ),
+  source(
+    "corona-dial",
+    "radialbars",
+    "primary",
+    { bars: 60, gain: 1.25, gamma: 0.52, innerRadius: 0.14, reach: 0.46, centreX: -0.32, centreY: 0.12, spinBars: -8 },
+    { blend: "max", opacity: 0.54, resolutionScale: 1, ...accentPulse("beat", 0.015, 0.12, 0.58) }
+  ),
+  memory(
+    "black-sun-feedback",
+    "feedback",
+    "primary",
+    { tauBeats: 0.9, gain: 0.9, zoomPerBeat: 1.04, rotTurnsPerBar: -0.075, driftY: 0.018, centreX: 0.34, centreY: 0.58, clipKnee: 0.8, clipCeiling: 1.2 },
+    { opacity: 0.58, ...sustain("2bar", 8.5) }
+  ),
+  effect(
+    "corona-lens",
+    "lensfield",
+    "accent",
+    { amount: 0.44, strength: 0.82, radius: 0.9, detail: 1.25, focusX: -0.32, focusY: 0.12, mix: 0.78 },
+    { opacity: 0.54, resolutionScale: 1, ...accentPulse("half", 0.02, 0.14, 0.3) }
   ),
   effect(
     "phrase-rest",
@@ -9232,6 +9533,7 @@ var LayerUI = class {
   root;
   /** Present only when a preset bank was supplied. */
   presetSelect = null;
+  avsPresetSelect = null;
   autoBox = null;
   opts;
   stack;
@@ -9322,11 +9624,12 @@ var LayerUI = class {
     transportControls.append(this.previousBarButton, this.playButton, this.nextBarButton);
     transport.append(transportLegend, stats2, transportControls);
     const presetSection = el("div", "ui-section ui-preset-section");
+    const presetLegend = el("span", "ui-legend", "preset library");
+    presetSection.append(presetLegend);
     if (opts.presets && opts.presets.length > 0) {
-      const presetLegend = el("span", "ui-legend", "look");
       const row = el("div", "ui-preset-row");
       const pid = this.nextId("preset");
-      const plabel = el("label", "ui-sr-only", "Preset bank");
+      const plabel = el("label", "ui-preset-label", "AAAVS remixes");
       plabel.htmlFor = pid;
       this.presetSelect = el("select");
       this.presetSelect.id = pid;
@@ -9339,6 +9642,7 @@ var LayerUI = class {
       }
       this.presetSelect.value = opts.preset.name;
       this.presetSelect.addEventListener("change", () => {
+        if (this.avsPresetSelect) this.avsPresetSelect.value = "";
         opts.onPickPreset?.(this.presetSelect.value);
       });
       const autoId = this.nextId("auto");
@@ -9351,7 +9655,47 @@ var LayerUI = class {
       });
       autoWrap.append(this.autoBox, document.createTextNode("auto / responsive 2\u201312 bars"));
       row.append(plabel, this.presetSelect);
-      presetSection.append(presetLegend, row, autoWrap);
+      presetSection.append(row, autoWrap);
+    }
+    if (opts.avsPresets && opts.avsPresets.length > 0) {
+      const row = el("div", "ui-preset-row");
+      const pid = this.nextId("avs-preset");
+      const plabel = el("label", "ui-preset-label", "Original AVS");
+      plabel.htmlFor = pid;
+      this.avsPresetSelect = el("select");
+      this.avsPresetSelect.id = pid;
+      this.avsPresetSelect.className = "ui-preset-select";
+      const prompt = el("option");
+      prompt.value = "";
+      prompt.textContent = `choose from ${opts.avsPresets.length} presets\u2026`;
+      this.avsPresetSelect.append(prompt);
+      const groups = /* @__PURE__ */ new Map();
+      for (const preset3 of opts.avsPresets) {
+        let group = groups.get(preset3.collection);
+        if (!group) {
+          group = document.createElement("optgroup");
+          group.label = preset3.collection;
+          groups.set(preset3.collection, group);
+          this.avsPresetSelect.append(group);
+        }
+        const option = el("option");
+        option.value = preset3.id;
+        option.textContent = preset3.name;
+        group.append(option);
+      }
+      this.avsPresetSelect.addEventListener("change", () => {
+        const id = this.avsPresetSelect.value;
+        if (!id || !opts.onPickAvsPreset) return;
+        if (this.presetSelect) this.presetSelect.selectedIndex = -1;
+        const selected = opts.avsPresets?.find((preset3) => preset3.id === id);
+        this.status(`loading ${selected?.name ?? "AVS preset"}\u2026`);
+        void Promise.resolve(opts.onPickAvsPreset(id)).then(
+          () => this.status(`loaded ${selected?.name ?? "AVS preset"}`),
+          (error) => this.status(String(error), true)
+        );
+      });
+      row.append(plabel, this.avsPresetSelect);
+      presetSection.append(row);
     }
     const layers = el("div", "ui-section ui-layers-section");
     const layersLegend = el(
@@ -16086,11 +16430,519 @@ var BUNDLED = {
 var bundledResolver;
 function loadBundledAvsBitmapResolver() {
   bundledResolver ??= Promise.all(Object.entries(BUNDLED).map(async ([name, url]) => {
-    const response = await fetch(url);
+    const response = await fetch(new URL(url, import.meta.url));
     if (!response.ok) throw new Error(`Could not load AVS bitmap ${name}: HTTP ${response.status}`);
     return [name, new Uint8Array(await response.arrayBuffer())];
   })).then((entries) => createAvsBitmapResolver(new Map(entries)));
   return bundledResolver;
+}
+
+// assets/avs-presets/community-picks/Acid - Twitchy liquid shit (mixing plastics mix by tuggummi).avs
+var Acid_Twitchy_liquid_shit_mixing_plastics_mix_by_tuggummi_default = "./avs/Acid - Twitchy liquid shit (mixing plastics mix by tuggummi)-2BU75KXX.avs";
+
+// assets/avs-presets/community-picks/amphirion - Ex Deux Mechanica.avs
+var amphirion_Ex_Deux_Mechanica_default = "./avs/amphirion - Ex Deux Mechanica-M4A36G3O.avs";
+
+// assets/avs-presets/community-picks/Amphirion - Geometric Sustinance.avs
+var Amphirion_Geometric_Sustinance_default = "./avs/Amphirion - Geometric Sustinance-3VJG5RZM.avs";
+
+// assets/avs-presets/community-picks/Degnic - Data flow.avs
+var Degnic_Data_flow_default = "./avs/Degnic - Data flow-F5T65HEF.avs";
+
+// assets/avs-presets/community-picks/Degnic - Fractal (slo-mo metallic) (u).avs
+var Degnic_Fractal_slo_mo_metallic_u_default = "./avs/Degnic - Fractal (slo-mo metallic) (u)-2K2AQE53.avs";
+
+// assets/avs-presets/community-picks/Degnic - Fury (extreme remix) by fsk.avs
+var Degnic_Fury_extreme_remix_by_fsk_default = "./avs/Degnic - Fury (extreme remix) by fsk-RZVFWVNY.avs";
+
+// assets/avs-presets/community-picks/Degnic - Helium.avs
+var Degnic_Helium_default = "./avs/Degnic - Helium-FU34WOKI.avs";
+
+// assets/avs-presets/community-picks/degnic - spirit realm (plasmoid rmx).avs
+var degnic_spirit_realm_plasmoid_rmx_default = "./avs/degnic - spirit realm (plasmoid rmx)-YU4GO6EN.avs";
+
+// assets/avs-presets/community-picks/duo - alien intercourse 4.avs
+var duo_alien_intercourse_4_default = "./avs/duo - alien intercourse 4-O7BB7RQ6.avs";
+
+// assets/avs-presets/community-picks/duo - Alienated (evilrice trinity tron remix).avs
+var duo_Alienated_evilrice_trinity_tron_remix_default = "./avs/duo - Alienated (evilrice trinity tron remix)-GN7UWBBV.avs";
+
+// assets/avs-presets/community-picks/Duo - Hash the Planet.avs
+var Duo_Hash_the_Planet_default = "./avs/Duo - Hash the Planet-DCHSGXL3.avs";
+
+// assets/avs-presets/community-picks/duo - warm freeform.avs
+var duo_warm_freeform_default = "./avs/duo - warm freeform-OGRX5LG3.avs";
+
+// assets/avs-presets/community-picks/el-vis - golden.avs
+var el_vis_golden_default = "./avs/el-vis - golden-YMOJVOIO.avs";
+
+// assets/avs-presets/community-picks/el-vis - hubble002.avs
+var el_vis_hubble002_default = "./avs/el-vis - hubble002-GTYYMKZY.avs";
+
+// assets/avs-presets/community-picks/el-vis - rittaufdemfeuerstrahl.avs
+var el_vis_rittaufdemfeuerstrahl_default = "./avs/el-vis - rittaufdemfeuerstrahl-AJDN55ZB.avs";
+
+// assets/avs-presets/community-picks/el-vis - spindle.avs
+var el_vis_spindle_default = "./avs/el-vis - spindle-IJFLPSN6.avs";
+
+// assets/avs-presets/community-picks/fUk - afterburner remix.avs
+var fUk_afterburner_remix_default = "./avs/fUk - afterburner remix-HHMB77ZT.avs";
+
+// assets/avs-presets/community-picks/fUk - cube.avs
+var fUk_cube_default = "./avs/fUk - cube-Z5AC3MFL.avs";
+
+// assets/avs-presets/community-picks/fUk - ice cube.avs
+var fUk_ice_cube_default = "./avs/fUk - ice cube-OWD75W6Y.avs";
+
+// assets/avs-presets/community-picks/Jay-Fatboy - Pieces of a Dead world.avs
+var Jay_Fatboy_Pieces_of_a_Dead_world_default = "./avs/Jay-Fatboy - Pieces of a Dead world-ZOKY6XJK.avs";
+
+// assets/avs-presets/community-picks/Jheriko - Alien Device (Gallery Remix by Zamuz).avs
+var Jheriko_Alien_Device_Gallery_Remix_by_Zamuz_default = "./avs/Jheriko - Alien Device (Gallery Remix by Zamuz)-UD4KFMM2.avs";
+
+// assets/avs-presets/community-picks/NemoOrange - Building Blocks.avs
+var NemoOrange_Building_Blocks_default = "./avs/NemoOrange - Building Blocks-FSIYJBGC.avs";
+
+// assets/avs-presets/community-picks/NemoOrange - Clockwork.avs
+var NemoOrange_Clockwork_default = "./avs/NemoOrange - Clockwork-YFWJLP3B.avs";
+
+// assets/avs-presets/community-picks/NemoOrange - the Light of Speed.avs
+var NemoOrange_the_Light_of_Speed_default = "./avs/NemoOrange - the Light of Speed-G6CGCQK4.avs";
+
+// assets/avs-presets/community-picks/NemoOrange vs el-vis - dreamtime2.avs
+var NemoOrange_vs_el_vis_dreamtime2_default = "./avs/NemoOrange vs el-vis - dreamtime2-YY5JELFR.avs";
+
+// assets/avs-presets/community-picks/S_KuPeRS - Curvism 002 (Tuggummi's Paprika Mix).avs
+var S_KuPeRS_Curvism_002_Tuggummi_s_Paprika_Mix_default = "./avs/S_KuPeRS - Curvism 002 (Tuggummi's Paprika Mix)-MGHCEGJB.avs";
+
+// assets/avs-presets/community-picks/s_kupers - gace.avs
+var s_kupers_gace_default = "./avs/s_kupers - gace-AFBDE3PS.avs";
+
+// assets/avs-presets/community-picks/s_kupers - the revenge of mt. doom.avs
+var s_kupers_the_revenge_of_mt_doom_default = "./avs/s_kupers - the revenge of mt. doom-BYBCQFHQ.avs";
+
+// assets/avs-presets/community-picks/Shock Value - Architectural Design (v.1.01).avs
+var Shock_Value_Architectural_Design_v_1_01_default = "./avs/Shock Value - Architectural Design (v.1.01)-RE2X4NWZ.avs";
+
+// assets/avs-presets/community-picks/shock value - source of power.avs
+var shock_value_source_of_power_default = "./avs/shock value - source of power-WMAWFDMD.avs";
+
+// assets/avs-presets/community-picks/Tonic - One More (BW Contest).avs
+var Tonic_One_More_BW_Contest_default = "./avs/Tonic - One More (BW Contest)-PN2AAWRP.avs";
+
+// assets/avs-presets/community-picks/Tonic - Zoomed Picture from One Insect.avs
+var Tonic_Zoomed_Picture_from_One_Insect_default = "./avs/Tonic - Zoomed Picture from One Insect-P5HLJBOD.avs";
+
+// assets/avs-presets/community-picks/Tuggummi - Let me out!.avs
+var Tuggummi_Let_me_out_default = "./avs/Tuggummi - Let me out!-KVZJ6WJX.avs";
+
+// assets/avs-presets/community-picks/Tuggummi - Shiny metal curves.avs
+var Tuggummi_Shiny_metal_curves_default = "./avs/Tuggummi - Shiny metal curves-NK3QZEZM.avs";
+
+// assets/avs-presets/community-picks/UnConeD - Butterfly Caught.avs
+var UnConeD_Butterfly_Caught_default = "./avs/UnConeD - Butterfly Caught-YSHV7QUA.avs";
+
+// assets/avs-presets/community-picks/UnConeD - Daedalus.avs
+var UnConeD_Daedalus_default = "./avs/UnConeD - Daedalus-RDSGMVMW.avs";
+
+// assets/avs-presets/community-picks/UnConeD - Don't Trip and Drive.avs
+var UnConeD_Don_t_Trip_and_Drive_default = "./avs/UnConeD - Don't Trip and Drive-3XZHKYEG.avs";
+
+// assets/avs-presets/community-picks/UnConeD - Goldie.avs
+var UnConeD_Goldie_default = "./avs/UnConeD - Goldie-VD2EQSWN.avs";
+
+// assets/avs-presets/community-picks/UnConeD - Mister Santa.avs
+var UnConeD_Mister_Santa_default = "./avs/UnConeD - Mister Santa-2TWXLXIF.avs";
+
+// assets/avs-presets/community-picks/UnConeD - Seismogrid.avs
+var UnConeD_Seismogrid_default = "./avs/UnConeD - Seismogrid-25SCQEFW.avs";
+
+// assets/avs-presets/community-picks/UnConeD - Silk Strings.avs
+var UnConeD_Silk_Strings_default = "./avs/UnConeD - Silk Strings-KAWIG63V.avs";
+
+// assets/avs-presets/community-picks/UnConeD - Tokyo Bullet.avs
+var UnConeD_Tokyo_Bullet_default = "./avs/UnConeD - Tokyo Bullet-4MB4CMEB.avs";
+
+// assets/avs-presets/community-picks/yathosho - interlaced.avs
+var yathosho_interlaced_default = "./avs/yathosho - interlaced-X6FKAZQK.avs";
+
+// assets/avs-presets/community-picks/yathosho - sakura.avs
+var yathosho_sakura_default = "./avs/yathosho - sakura-URHQ3ML5.avs";
+
+// assets/avs-presets/community-picks/Yathosho - SKOGSKLOCKA(TM).avs
+var Yathosho_SKOGSKLOCKA_TM_default = "./avs/Yathosho - SKOGSKLOCKA(TM)-EBTYSJGJ.avs";
+
+// assets/avs-presets/community-picks/zamuz - big bang.avs
+var zamuz_big_bang_default = "./avs/zamuz - big bang-5VWDYFM5.avs";
+
+// assets/avs-presets/community-picks/Zamuz - Explosive Virus.avs
+var Zamuz_Explosive_Virus_default = "./avs/Zamuz - Explosive Virus-SZMROWQ3.avs";
+
+// assets/avs-presets/community-picks/zamuz - spiritual.avs
+var zamuz_spiritual_default = "./avs/zamuz - spiritual-HTXVMEQN.avs";
+
+// assets/avs-presets/community-picks/zamuz meets tuggummi - fat balls (wallpaper wannabe candy theme).avs
+var zamuz_meets_tuggummi_fat_balls_wallpaper_wannabe_candy_theme_default = "./avs/zamuz meets tuggummi - fat balls (wallpaper wannabe candy theme)-JTAEYIVI.avs";
+
+// assets/avs-presets/community-picks/Zevensoft - Ocean4.avs
+var Zevensoft_Ocean4_default = "./avs/Zevensoft - Ocean4-LD5BP2Z2.avs";
+
+// assets/avs-presets/winamp-5-picks/amphirion - nebulous (skupers remix).avs
+var amphirion_nebulous_skupers_remix_default = "./avs/amphirion - nebulous (skupers remix)-KYAJHMHT.avs";
+
+// assets/avs-presets/winamp-5-picks/D&L - Life Is Violated.avs
+var D_L_Life_Is_Violated_default = "./avs/D&L - Life Is Violated-FQ5CH62J.avs";
+
+// assets/avs-presets/winamp-5-picks/Degnic - Retrowall (Yathosho's Supermicrocosm).avs
+var Degnic_Retrowall_Yathosho_s_Supermicrocosm_default = "./avs/Degnic - Retrowall (Yathosho's Supermicrocosm)-W3S6XQSN.avs";
+
+// assets/avs-presets/winamp-5-picks/Degnic-Adrealine rush.avs
+var Degnic_Adrealine_rush_default = "./avs/Degnic-Adrealine rush-65K5YGHV.avs";
+
+// assets/avs-presets/winamp-5-picks/Duo - Alien Heart.avs
+var Duo_Alien_Heart_default = "./avs/Duo - Alien Heart-7Z25L6EP.avs";
+
+// assets/avs-presets/winamp-5-picks/Duo - Brainstorm.avs
+var Duo_Brainstorm_default = "./avs/Duo - Brainstorm-WKI545S3.avs";
+
+// assets/avs-presets/winamp-5-picks/EL-VIS - Molecules (S_KuPeRS Remix).avs
+var EL_VIS_Molecules_S_KuPeRS_Remix_default = "./avs/EL-VIS - Molecules (S_KuPeRS Remix)-LJ4P7XK7.avs";
+
+// assets/avs-presets/winamp-5-picks/el-vis - soundscape III (skupers remix).avs
+var el_vis_soundscape_III_skupers_remix_default = "./avs/el-vis - soundscape III (skupers remix)-BYGEKNFI.avs";
+
+// assets/avs-presets/winamp-5-picks/fck - checkers with metaballs (skupers remix).avs
+var fck_checkers_with_metaballs_skupers_remix_default = "./avs/fck - checkers with metaballs (skupers remix)-PCDLYJ2E.avs";
+
+// assets/avs-presets/winamp-5-picks/horse-fly - jinx (skupers remix).avs
+var horse_fly_jinx_skupers_remix_default = "./avs/horse-fly - jinx (skupers remix)-CZLSS6GW.avs";
+
+// assets/avs-presets/winamp-5-picks/jheriko - not quite a bendy tunnel (skupers remix).avs
+var jheriko_not_quite_a_bendy_tunnel_skupers_remix_default = "./avs/jheriko - not quite a bendy tunnel (skupers remix)-AN4CJYGH.avs";
+
+// assets/avs-presets/winamp-5-picks/justin - newpoop (for wa5).avs
+var justin_newpoop_for_wa5_default = "./avs/justin - newpoop (for wa5)-TSPFZOZK.avs";
+
+// assets/avs-presets/winamp-5-picks/justin - the landscape is killing me (wa5remix).avs
+var justin_the_landscape_is_killing_me_wa5remix_default = "./avs/justin - the landscape is killing me (wa5remix)-XZWKPOZI.avs";
+
+// assets/avs-presets/winamp-5-picks/L1quid - Take the Veil.avs
+var L1quid_Take_the_Veil_default = "./avs/L1quid - Take the Veil-AFARQDTO.avs";
+
+// assets/avs-presets/winamp-5-picks/mig - Dragonscales.avs
+var mig_Dragonscales_default = "./avs/mig - Dragonscales-ZWT5KPSJ.avs";
+
+// assets/avs-presets/winamp-5-picks/mig - Encapsulade.avs
+var mig_Encapsulade_default = "./avs/mig - Encapsulade-6EQ5EKRD.avs";
+
+// assets/avs-presets/winamp-5-picks/mig - Freekwyrms.avs
+var mig_Freekwyrms_default = "./avs/mig - Freekwyrms-UTBLQVIZ.avs";
+
+// assets/avs-presets/winamp-5-picks/mig - Lilypod.avs
+var mig_Lilypod_default = "./avs/mig - Lilypod-O3A2PSRH.avs";
+
+// assets/avs-presets/winamp-5-picks/mig - Mist Wisps.avs
+var mig_Mist_Wisps_default = "./avs/mig - Mist Wisps-2ZHOV5NP.avs";
+
+// assets/avs-presets/winamp-5-picks/mig - Nebulating - Hypercolorspace.avs
+var mig_Nebulating_Hypercolorspace_default = "./avs/mig - Nebulating - Hypercolorspace-D6XLFIX3.avs";
+
+// assets/avs-presets/winamp-5-picks/mig - Reverb - Deep Net.avs
+var mig_Reverb_Deep_Net_default = "./avs/mig - Reverb - Deep Net-XREYQYCS.avs";
+
+// assets/avs-presets/winamp-5-picks/mig - Slyde - Tri.avs
+var mig_Slyde_Tri_default = "./avs/mig - Slyde - Tri-GZLBKVWM.avs";
+
+// assets/avs-presets/winamp-5-picks/mig - Solar Flaire.avs
+var mig_Solar_Flaire_default = "./avs/mig - Solar Flaire-NK6SNDSH.avs";
+
+// assets/avs-presets/winamp-5-picks/mig - Spintronics - Backspin.avs
+var mig_Spintronics_Backspin_default = "./avs/mig - Spintronics - Backspin-EQGIDQEF.avs";
+
+// assets/avs-presets/winamp-5-picks/mig - Starslappin.avs
+var mig_Starslappin_default = "./avs/mig - Starslappin-JHGIIIQJ.avs";
+
+// assets/avs-presets/winamp-5-picks/mig - Street Art - Fire Inside.avs
+var mig_Street_Art_Fire_Inside_default = "./avs/mig - Street Art - Fire Inside-U7SFJKMC.avs";
+
+// assets/avs-presets/winamp-5-picks/mig - Swoo - Slow.avs
+var mig_Swoo_Slow_default = "./avs/mig - Swoo - Slow-ERY6RIDU.avs";
+
+// assets/avs-presets/winamp-5-picks/Nic01 - Rototronik.avs
+var Nic01_Rototronik_default = "./avs/Nic01 - Rototronik-T7HD6IF6.avs";
+
+// assets/avs-presets/winamp-5-picks/nixa - smell of music (skupers remix).avs
+var nixa_smell_of_music_skupers_remix_default = "./avs/nixa - smell of music (skupers remix)-7VSDMWNA.avs";
+
+// assets/avs-presets/winamp-5-picks/p-k - bumpy.avs
+var p_k_bumpy_default = "./avs/p-k - bumpy-AL34BSD7.avs";
+
+// assets/avs-presets/winamp-5-picks/S_KuPeRS - ...hidden track....avs
+var S_KuPeRS_hidden_track_default = "./avs/S_KuPeRS - ...hidden track...-JANARMMT.avs";
+
+// assets/avs-presets/winamp-5-picks/S_KuPeRS - A Tribute To Degnic.avs
+var S_KuPeRS_A_Tribute_To_Degnic_default = "./avs/S_KuPeRS - A Tribute To Degnic-KBCUGLZO.avs";
+
+// assets/avs-presets/winamp-5-picks/S_KuPeRS - Arctic Rainbow.avs
+var S_KuPeRS_Arctic_Rainbow_default = "./avs/S_KuPeRS - Arctic Rainbow-VCND63JG.avs";
+
+// assets/avs-presets/winamp-5-picks/S_KuPeRS - Chinook.avs
+var S_KuPeRS_Chinook_default = "./avs/S_KuPeRS - Chinook-6WYHBFOM.avs";
+
+// assets/avs-presets/winamp-5-picks/S_KuPeRS - female demands.avs
+var S_KuPeRS_female_demands_default = "./avs/S_KuPeRS - female demands-XA5RKLQK.avs";
+
+// assets/avs-presets/winamp-5-picks/S_KuPeRS - Hexual Healing.avs
+var S_KuPeRS_Hexual_Healing_default = "./avs/S_KuPeRS - Hexual Healing-QNKESGAJ.avs";
+
+// assets/avs-presets/winamp-5-picks/S_KuPeRS - Inverse Kinetics.avs
+var S_KuPeRS_Inverse_Kinetics_default = "./avs/S_KuPeRS - Inverse Kinetics-W7ACU7DW.avs";
+
+// assets/avs-presets/winamp-5-picks/S_KuPeRS - Kingish.avs
+var S_KuPeRS_Kingish_default = "./avs/S_KuPeRS - Kingish-XXXZCDHB.avs";
+
+// assets/avs-presets/winamp-5-picks/S_KuPeRS - Spirit Realm (Degnic's Plasmoid RMX).avs
+var S_KuPeRS_Spirit_Realm_Degnic_s_Plasmoid_RMX_default = "./avs/S_KuPeRS - Spirit Realm (Degnic's Plasmoid RMX)-VVIJRUC6.avs";
+
+// assets/avs-presets/winamp-5-picks/S_KuPeRS - Texering 002.avs
+var S_KuPeRS_Texering_002_default = "./avs/S_KuPeRS - Texering 002-WVFLOKJA.avs";
+
+// assets/avs-presets/winamp-5-picks/S_KuPeRS - Upward Current.avs
+var S_KuPeRS_Upward_Current_default = "./avs/S_KuPeRS - Upward Current-2NXBGEQM.avs";
+
+// assets/avs-presets/winamp-5-picks/skupers - chinook (exclusive version).avs
+var skupers_chinook_exclusive_version_default = "./avs/skupers - chinook (exclusive version)-PGOE4LOC.avs";
+
+// assets/avs-presets/winamp-5-picks/splendora.avs
+var splendora_default = "./avs/splendora-UBPYPULR.avs";
+
+// assets/avs-presets/winamp-5-picks/Tuggummi - Aqua-fumes.avs
+var Tuggummi_Aqua_fumes_default = "./avs/Tuggummi - Aqua-fumes-RSTIXWMB.avs";
+
+// assets/avs-presets/winamp-5-picks/Tuggummi - Club Seizure (color enhanced mix).avs
+var Tuggummi_Club_Seizure_color_enhanced_mix_default = "./avs/Tuggummi - Club Seizure (color enhanced mix)-GPFBI22G.avs";
+
+// assets/avs-presets/winamp-5-picks/Tuggummi - Different Load.avs
+var Tuggummi_Different_Load_default = "./avs/Tuggummi - Different Load-GPYFTEOZ.avs";
+
+// assets/avs-presets/winamp-5-picks/Tuggummi - Electro blobs.avs
+var Tuggummi_Electro_blobs_default = "./avs/Tuggummi - Electro blobs-VOIRMM63.avs";
+
+// assets/avs-presets/winamp-5-picks/Tuggummi - Kaleidofied.avs
+var Tuggummi_Kaleidofied_default = "./avs/Tuggummi - Kaleidofied-WSNSI6HR.avs";
+
+// assets/avs-presets/winamp-5-picks/Tuggummi - Magma Flow II.avs
+var Tuggummi_Magma_Flow_II_default = "./avs/Tuggummi - Magma Flow II-P4QU4HUH.avs";
+
+// assets/avs-presets/winamp-5-picks/Tuggummi - Multiple Orgasms.avs
+var Tuggummi_Multiple_Orgasms_default = "./avs/Tuggummi - Multiple Orgasms-TWKONITT.avs";
+
+// assets/avs-presets/winamp-5-picks/Tuggummi - Odour Control.avs
+var Tuggummi_Odour_Control_default = "./avs/Tuggummi - Odour Control-QQ52LLUP.avs";
+
+// assets/avs-presets/winamp-5-picks/Tuggummi - Pina Colada.avs
+var Tuggummi_Pina_Colada_default = "./avs/Tuggummi - Pina Colada-VAOMYOLT.avs";
+
+// assets/avs-presets/winamp-5-picks/Tuggummi - Scope in Spotlight II.avs
+var Tuggummi_Scope_in_Spotlight_II_default = "./avs/Tuggummi - Scope in Spotlight II-XAYSJC7U.avs";
+
+// assets/avs-presets/winamp-5-picks/Tuggummi - Solero Shots.avs
+var Tuggummi_Solero_Shots_default = "./avs/Tuggummi - Solero Shots-UBIK5XPD.avs";
+
+// assets/avs-presets/winamp-5-picks/Tuggummi - Square Minded.avs
+var Tuggummi_Square_Minded_default = "./avs/Tuggummi - Square Minded-PYDKXGLH.avs";
+
+// assets/avs-presets/winamp-5-picks/Tuggummi - Worm-O-Rama (Raz Remix).avs
+var Tuggummi_Worm_O_Rama_Raz_Remix_default = "./avs/Tuggummi - Worm-O-Rama (Raz Remix)-BW22IMPX.avs";
+
+// assets/avs-presets/winamp-5-picks/UnConeD -  Zero-G Maze.avs
+var UnConeD_Zero_G_Maze_default = "./avs/UnConeD -  Zero-G Maze-SLVKLXYR.avs";
+
+// assets/avs-presets/winamp-5-picks/UnConeD - Cartoon Trip.avs
+var UnConeD_Cartoon_Trip_default = "./avs/UnConeD - Cartoon Trip-XGLFGK5W.avs";
+
+// assets/avs-presets/winamp-5-picks/UnConeD - Containment.avs
+var UnConeD_Containment_default = "./avs/UnConeD - Containment-DIJPGHAQ.avs";
+
+// assets/avs-presets/winamp-5-picks/UnConeD - Cubic Flower.avs
+var UnConeD_Cubic_Flower_default = "./avs/UnConeD - Cubic Flower-XPMWGYCQ.avs";
+
+// assets/avs-presets/winamp-5-picks/UnConeD - Jello Cube.avs
+var UnConeD_Jello_Cube_default = "./avs/UnConeD - Jello Cube-I6T22TCM.avs";
+
+// assets/avs-presets/winamp-5-picks/UnConeD - Mercury.avs
+var UnConeD_Mercury_default = "./avs/UnConeD - Mercury-DROXKXRY.avs";
+
+// assets/avs-presets/winamp-5-picks/UnConeD - Neon Coaster.avs
+var UnConeD_Neon_Coaster_default = "./avs/UnConeD - Neon Coaster-LHMCQLZL.avs";
+
+// assets/avs-presets/winamp-5-picks/UnConeD - Plankton.avs
+var UnConeD_Plankton_default = "./avs/UnConeD - Plankton-K4PR6JYO.avs";
+
+// assets/avs-presets/winamp-5-picks/UnConeD - Reflectocube.avs
+var UnConeD_Reflectocube_default = "./avs/UnConeD - Reflectocube-WHXVUIYM.avs";
+
+// assets/avs-presets/winamp-5-picks/UnConeD - Speeder 3K.avs
+var UnConeD_Speeder_3K_default = "./avs/UnConeD - Speeder 3K-6S5DGD4V.avs";
+
+// assets/avs-presets/winamp-5-picks/UnConeD - TC Plasma.avs
+var UnConeD_TC_Plasma_default = "./avs/UnConeD - TC Plasma-KPKCLKYP.avs";
+
+// assets/avs-presets/winamp-5-picks/UnConeD - Tie Tunnel SSC.avs
+var UnConeD_Tie_Tunnel_SSC_default = "./avs/UnConeD - Tie Tunnel SSC-TRIBCBWU.avs";
+
+// assets/avs-presets/winamp-5-picks/UnConeD - Zero-G Maze II.avs
+var UnConeD_Zero_G_Maze_II_default = "./avs/UnConeD - Zero-G Maze II-ZYID7UO6.avs";
+
+// assets/avs-presets/winamp-5-picks/UnConeD -Retrosquares.avs
+var UnConeD_Retrosquares_default = "./avs/UnConeD -Retrosquares-NAO3O4QQ.avs";
+
+// assets/avs-presets/winamp-5-picks/UnConeD -Zero-G Maze III.avs
+var UnConeD_Zero_G_Maze_III_default = "./avs/UnConeD -Zero-G Maze III-SH7CKGHJ.avs";
+
+// assets/avs-presets/winamp-5-picks/yathosho - fabric (skupers remix).avs
+var yathosho_fabric_skupers_remix_default = "./avs/yathosho - fabric (skupers remix)-UC73BFRY.avs";
+
+// assets/avs-presets/winamp-5-picks/Yathosho - microcosm 02.avs
+var Yathosho_microcosm_02_default = "./avs/Yathosho - microcosm 02-OSHUGQJZ.avs";
+
+// assets/avs-presets/winamp-5-picks/zxe-Urantia.avs
+var zxe_Urantia_default = "./avs/zxe-Urantia-HHYUJVXN.avs";
+
+// src/avs/bundled-presets.generated.ts
+var BUNDLED_AVS_PRESET_CATALOG = [
+  { id: "community-picks/Acid - Twitchy liquid shit (mixing plastics mix by tuggummi)", name: "Acid - Twitchy liquid shit (mixing plastics mix by tuggummi)", fileName: "Acid - Twitchy liquid shit (mixing plastics mix by tuggummi).avs", collection: "Community Picks", url: Acid_Twitchy_liquid_shit_mixing_plastics_mix_by_tuggummi_default },
+  { id: "community-picks/amphirion - Ex Deux Mechanica", name: "amphirion - Ex Deux Mechanica", fileName: "amphirion - Ex Deux Mechanica.avs", collection: "Community Picks", url: amphirion_Ex_Deux_Mechanica_default },
+  { id: "community-picks/Amphirion - Geometric Sustinance", name: "Amphirion - Geometric Sustinance", fileName: "Amphirion - Geometric Sustinance.avs", collection: "Community Picks", url: Amphirion_Geometric_Sustinance_default },
+  { id: "community-picks/Degnic - Data flow", name: "Degnic - Data flow", fileName: "Degnic - Data flow.avs", collection: "Community Picks", url: Degnic_Data_flow_default },
+  { id: "community-picks/Degnic - Fractal (slo-mo metallic) (u)", name: "Degnic - Fractal (slo-mo metallic) (u)", fileName: "Degnic - Fractal (slo-mo metallic) (u).avs", collection: "Community Picks", url: Degnic_Fractal_slo_mo_metallic_u_default },
+  { id: "community-picks/Degnic - Fury (extreme remix) by fsk", name: "Degnic - Fury (extreme remix) by fsk", fileName: "Degnic - Fury (extreme remix) by fsk.avs", collection: "Community Picks", url: Degnic_Fury_extreme_remix_by_fsk_default },
+  { id: "community-picks/Degnic - Helium", name: "Degnic - Helium", fileName: "Degnic - Helium.avs", collection: "Community Picks", url: Degnic_Helium_default },
+  { id: "community-picks/degnic - spirit realm (plasmoid rmx)", name: "degnic - spirit realm (plasmoid rmx)", fileName: "degnic - spirit realm (plasmoid rmx).avs", collection: "Community Picks", url: degnic_spirit_realm_plasmoid_rmx_default },
+  { id: "community-picks/duo - alien intercourse 4", name: "duo - alien intercourse 4", fileName: "duo - alien intercourse 4.avs", collection: "Community Picks", url: duo_alien_intercourse_4_default },
+  { id: "community-picks/duo - Alienated (evilrice trinity tron remix)", name: "duo - Alienated (evilrice trinity tron remix)", fileName: "duo - Alienated (evilrice trinity tron remix).avs", collection: "Community Picks", url: duo_Alienated_evilrice_trinity_tron_remix_default },
+  { id: "community-picks/Duo - Hash the Planet", name: "Duo - Hash the Planet", fileName: "Duo - Hash the Planet.avs", collection: "Community Picks", url: Duo_Hash_the_Planet_default },
+  { id: "community-picks/duo - warm freeform", name: "duo - warm freeform", fileName: "duo - warm freeform.avs", collection: "Community Picks", url: duo_warm_freeform_default },
+  { id: "community-picks/el-vis - golden", name: "el-vis - golden", fileName: "el-vis - golden.avs", collection: "Community Picks", url: el_vis_golden_default },
+  { id: "community-picks/el-vis - hubble002", name: "el-vis - hubble002", fileName: "el-vis - hubble002.avs", collection: "Community Picks", url: el_vis_hubble002_default },
+  { id: "community-picks/el-vis - rittaufdemfeuerstrahl", name: "el-vis - rittaufdemfeuerstrahl", fileName: "el-vis - rittaufdemfeuerstrahl.avs", collection: "Community Picks", url: el_vis_rittaufdemfeuerstrahl_default },
+  { id: "community-picks/el-vis - spindle", name: "el-vis - spindle", fileName: "el-vis - spindle.avs", collection: "Community Picks", url: el_vis_spindle_default },
+  { id: "community-picks/fUk - afterburner remix", name: "fUk - afterburner remix", fileName: "fUk - afterburner remix.avs", collection: "Community Picks", url: fUk_afterburner_remix_default },
+  { id: "community-picks/fUk - cube", name: "fUk - cube", fileName: "fUk - cube.avs", collection: "Community Picks", url: fUk_cube_default },
+  { id: "community-picks/fUk - ice cube", name: "fUk - ice cube", fileName: "fUk - ice cube.avs", collection: "Community Picks", url: fUk_ice_cube_default },
+  { id: "community-picks/Jay-Fatboy - Pieces of a Dead world", name: "Jay-Fatboy - Pieces of a Dead world", fileName: "Jay-Fatboy - Pieces of a Dead world.avs", collection: "Community Picks", url: Jay_Fatboy_Pieces_of_a_Dead_world_default },
+  { id: "community-picks/Jheriko - Alien Device (Gallery Remix by Zamuz)", name: "Jheriko - Alien Device (Gallery Remix by Zamuz)", fileName: "Jheriko - Alien Device (Gallery Remix by Zamuz).avs", collection: "Community Picks", url: Jheriko_Alien_Device_Gallery_Remix_by_Zamuz_default },
+  { id: "community-picks/NemoOrange - Building Blocks", name: "NemoOrange - Building Blocks", fileName: "NemoOrange - Building Blocks.avs", collection: "Community Picks", url: NemoOrange_Building_Blocks_default },
+  { id: "community-picks/NemoOrange - Clockwork", name: "NemoOrange - Clockwork", fileName: "NemoOrange - Clockwork.avs", collection: "Community Picks", url: NemoOrange_Clockwork_default },
+  { id: "community-picks/NemoOrange - the Light of Speed", name: "NemoOrange - the Light of Speed", fileName: "NemoOrange - the Light of Speed.avs", collection: "Community Picks", url: NemoOrange_the_Light_of_Speed_default },
+  { id: "community-picks/NemoOrange vs el-vis - dreamtime2", name: "NemoOrange vs el-vis - dreamtime2", fileName: "NemoOrange vs el-vis - dreamtime2.avs", collection: "Community Picks", url: NemoOrange_vs_el_vis_dreamtime2_default },
+  { id: "community-picks/S_KuPeRS - Curvism 002 (Tuggummi's Paprika Mix)", name: "S_KuPeRS - Curvism 002 (Tuggummi's Paprika Mix)", fileName: "S_KuPeRS - Curvism 002 (Tuggummi's Paprika Mix).avs", collection: "Community Picks", url: S_KuPeRS_Curvism_002_Tuggummi_s_Paprika_Mix_default },
+  { id: "community-picks/s_kupers - gace", name: "s_kupers - gace", fileName: "s_kupers - gace.avs", collection: "Community Picks", url: s_kupers_gace_default },
+  { id: "community-picks/s_kupers - the revenge of mt. doom", name: "s_kupers - the revenge of mt. doom", fileName: "s_kupers - the revenge of mt. doom.avs", collection: "Community Picks", url: s_kupers_the_revenge_of_mt_doom_default },
+  { id: "community-picks/Shock Value - Architectural Design (v.1.01)", name: "Shock Value - Architectural Design (v.1.01)", fileName: "Shock Value - Architectural Design (v.1.01).avs", collection: "Community Picks", url: Shock_Value_Architectural_Design_v_1_01_default },
+  { id: "community-picks/shock value - source of power", name: "shock value - source of power", fileName: "shock value - source of power.avs", collection: "Community Picks", url: shock_value_source_of_power_default },
+  { id: "community-picks/Tonic - One More (BW Contest)", name: "Tonic - One More (BW Contest)", fileName: "Tonic - One More (BW Contest).avs", collection: "Community Picks", url: Tonic_One_More_BW_Contest_default },
+  { id: "community-picks/Tonic - Zoomed Picture from One Insect", name: "Tonic - Zoomed Picture from One Insect", fileName: "Tonic - Zoomed Picture from One Insect.avs", collection: "Community Picks", url: Tonic_Zoomed_Picture_from_One_Insect_default },
+  { id: "community-picks/Tuggummi - Let me out!", name: "Tuggummi - Let me out!", fileName: "Tuggummi - Let me out!.avs", collection: "Community Picks", url: Tuggummi_Let_me_out_default },
+  { id: "community-picks/Tuggummi - Shiny metal curves", name: "Tuggummi - Shiny metal curves", fileName: "Tuggummi - Shiny metal curves.avs", collection: "Community Picks", url: Tuggummi_Shiny_metal_curves_default },
+  { id: "community-picks/UnConeD - Butterfly Caught", name: "UnConeD - Butterfly Caught", fileName: "UnConeD - Butterfly Caught.avs", collection: "Community Picks", url: UnConeD_Butterfly_Caught_default },
+  { id: "community-picks/UnConeD - Daedalus", name: "UnConeD - Daedalus", fileName: "UnConeD - Daedalus.avs", collection: "Community Picks", url: UnConeD_Daedalus_default },
+  { id: "community-picks/UnConeD - Don't Trip and Drive", name: "UnConeD - Don't Trip and Drive", fileName: "UnConeD - Don't Trip and Drive.avs", collection: "Community Picks", url: UnConeD_Don_t_Trip_and_Drive_default },
+  { id: "community-picks/UnConeD - Goldie", name: "UnConeD - Goldie", fileName: "UnConeD - Goldie.avs", collection: "Community Picks", url: UnConeD_Goldie_default },
+  { id: "community-picks/UnConeD - Mister Santa", name: "UnConeD - Mister Santa", fileName: "UnConeD - Mister Santa.avs", collection: "Community Picks", url: UnConeD_Mister_Santa_default },
+  { id: "community-picks/UnConeD - Seismogrid", name: "UnConeD - Seismogrid", fileName: "UnConeD - Seismogrid.avs", collection: "Community Picks", url: UnConeD_Seismogrid_default },
+  { id: "community-picks/UnConeD - Silk Strings", name: "UnConeD - Silk Strings", fileName: "UnConeD - Silk Strings.avs", collection: "Community Picks", url: UnConeD_Silk_Strings_default },
+  { id: "community-picks/UnConeD - Tokyo Bullet", name: "UnConeD - Tokyo Bullet", fileName: "UnConeD - Tokyo Bullet.avs", collection: "Community Picks", url: UnConeD_Tokyo_Bullet_default },
+  { id: "community-picks/yathosho - interlaced", name: "yathosho - interlaced", fileName: "yathosho - interlaced.avs", collection: "Community Picks", url: yathosho_interlaced_default },
+  { id: "community-picks/yathosho - sakura", name: "yathosho - sakura", fileName: "yathosho - sakura.avs", collection: "Community Picks", url: yathosho_sakura_default },
+  { id: "community-picks/Yathosho - SKOGSKLOCKA(TM)", name: "Yathosho - SKOGSKLOCKA(TM)", fileName: "Yathosho - SKOGSKLOCKA(TM).avs", collection: "Community Picks", url: Yathosho_SKOGSKLOCKA_TM_default },
+  { id: "community-picks/zamuz - big bang", name: "zamuz - big bang", fileName: "zamuz - big bang.avs", collection: "Community Picks", url: zamuz_big_bang_default },
+  { id: "community-picks/Zamuz - Explosive Virus", name: "Zamuz - Explosive Virus", fileName: "Zamuz - Explosive Virus.avs", collection: "Community Picks", url: Zamuz_Explosive_Virus_default },
+  { id: "community-picks/zamuz - spiritual", name: "zamuz - spiritual", fileName: "zamuz - spiritual.avs", collection: "Community Picks", url: zamuz_spiritual_default },
+  { id: "community-picks/zamuz meets tuggummi - fat balls (wallpaper wannabe candy theme)", name: "zamuz meets tuggummi - fat balls (wallpaper wannabe candy theme)", fileName: "zamuz meets tuggummi - fat balls (wallpaper wannabe candy theme).avs", collection: "Community Picks", url: zamuz_meets_tuggummi_fat_balls_wallpaper_wannabe_candy_theme_default },
+  { id: "community-picks/Zevensoft - Ocean4", name: "Zevensoft - Ocean4", fileName: "Zevensoft - Ocean4.avs", collection: "Community Picks", url: Zevensoft_Ocean4_default },
+  { id: "winamp-5-picks/amphirion - nebulous (skupers remix)", name: "amphirion - nebulous (skupers remix)", fileName: "amphirion - nebulous (skupers remix).avs", collection: "Winamp 5 Picks", url: amphirion_nebulous_skupers_remix_default },
+  { id: "winamp-5-picks/D&L - Life Is Violated", name: "D&L - Life Is Violated", fileName: "D&L - Life Is Violated.avs", collection: "Winamp 5 Picks", url: D_L_Life_Is_Violated_default },
+  { id: "winamp-5-picks/Degnic - Retrowall (Yathosho's Supermicrocosm)", name: "Degnic - Retrowall (Yathosho's Supermicrocosm)", fileName: "Degnic - Retrowall (Yathosho's Supermicrocosm).avs", collection: "Winamp 5 Picks", url: Degnic_Retrowall_Yathosho_s_Supermicrocosm_default },
+  { id: "winamp-5-picks/Degnic-Adrealine rush", name: "Degnic-Adrealine rush", fileName: "Degnic-Adrealine rush.avs", collection: "Winamp 5 Picks", url: Degnic_Adrealine_rush_default },
+  { id: "winamp-5-picks/Duo - Alien Heart", name: "Duo - Alien Heart", fileName: "Duo - Alien Heart.avs", collection: "Winamp 5 Picks", url: Duo_Alien_Heart_default },
+  { id: "winamp-5-picks/Duo - Brainstorm", name: "Duo - Brainstorm", fileName: "Duo - Brainstorm.avs", collection: "Winamp 5 Picks", url: Duo_Brainstorm_default },
+  { id: "winamp-5-picks/EL-VIS - Molecules (S_KuPeRS Remix)", name: "EL-VIS - Molecules (S_KuPeRS Remix)", fileName: "EL-VIS - Molecules (S_KuPeRS Remix).avs", collection: "Winamp 5 Picks", url: EL_VIS_Molecules_S_KuPeRS_Remix_default },
+  { id: "winamp-5-picks/el-vis - soundscape III (skupers remix)", name: "el-vis - soundscape III (skupers remix)", fileName: "el-vis - soundscape III (skupers remix).avs", collection: "Winamp 5 Picks", url: el_vis_soundscape_III_skupers_remix_default },
+  { id: "winamp-5-picks/fck - checkers with metaballs (skupers remix)", name: "fck - checkers with metaballs (skupers remix)", fileName: "fck - checkers with metaballs (skupers remix).avs", collection: "Winamp 5 Picks", url: fck_checkers_with_metaballs_skupers_remix_default },
+  { id: "winamp-5-picks/horse-fly - jinx (skupers remix)", name: "horse-fly - jinx (skupers remix)", fileName: "horse-fly - jinx (skupers remix).avs", collection: "Winamp 5 Picks", url: horse_fly_jinx_skupers_remix_default },
+  { id: "winamp-5-picks/jheriko - not quite a bendy tunnel (skupers remix)", name: "jheriko - not quite a bendy tunnel (skupers remix)", fileName: "jheriko - not quite a bendy tunnel (skupers remix).avs", collection: "Winamp 5 Picks", url: jheriko_not_quite_a_bendy_tunnel_skupers_remix_default },
+  { id: "winamp-5-picks/justin - newpoop (for wa5)", name: "justin - newpoop (for wa5)", fileName: "justin - newpoop (for wa5).avs", collection: "Winamp 5 Picks", url: justin_newpoop_for_wa5_default },
+  { id: "winamp-5-picks/justin - the landscape is killing me (wa5remix)", name: "justin - the landscape is killing me (wa5remix)", fileName: "justin - the landscape is killing me (wa5remix).avs", collection: "Winamp 5 Picks", url: justin_the_landscape_is_killing_me_wa5remix_default },
+  { id: "winamp-5-picks/L1quid - Take the Veil", name: "L1quid - Take the Veil", fileName: "L1quid - Take the Veil.avs", collection: "Winamp 5 Picks", url: L1quid_Take_the_Veil_default },
+  { id: "winamp-5-picks/mig - Dragonscales", name: "mig - Dragonscales", fileName: "mig - Dragonscales.avs", collection: "Winamp 5 Picks", url: mig_Dragonscales_default },
+  { id: "winamp-5-picks/mig - Encapsulade", name: "mig - Encapsulade", fileName: "mig - Encapsulade.avs", collection: "Winamp 5 Picks", url: mig_Encapsulade_default },
+  { id: "winamp-5-picks/mig - Freekwyrms", name: "mig - Freekwyrms", fileName: "mig - Freekwyrms.avs", collection: "Winamp 5 Picks", url: mig_Freekwyrms_default },
+  { id: "winamp-5-picks/mig - Lilypod", name: "mig - Lilypod", fileName: "mig - Lilypod.avs", collection: "Winamp 5 Picks", url: mig_Lilypod_default },
+  { id: "winamp-5-picks/mig - Mist Wisps", name: "mig - Mist Wisps", fileName: "mig - Mist Wisps.avs", collection: "Winamp 5 Picks", url: mig_Mist_Wisps_default },
+  { id: "winamp-5-picks/mig - Nebulating - Hypercolorspace", name: "mig - Nebulating - Hypercolorspace", fileName: "mig - Nebulating - Hypercolorspace.avs", collection: "Winamp 5 Picks", url: mig_Nebulating_Hypercolorspace_default },
+  { id: "winamp-5-picks/mig - Reverb - Deep Net", name: "mig - Reverb - Deep Net", fileName: "mig - Reverb - Deep Net.avs", collection: "Winamp 5 Picks", url: mig_Reverb_Deep_Net_default },
+  { id: "winamp-5-picks/mig - Slyde - Tri", name: "mig - Slyde - Tri", fileName: "mig - Slyde - Tri.avs", collection: "Winamp 5 Picks", url: mig_Slyde_Tri_default },
+  { id: "winamp-5-picks/mig - Solar Flaire", name: "mig - Solar Flaire", fileName: "mig - Solar Flaire.avs", collection: "Winamp 5 Picks", url: mig_Solar_Flaire_default },
+  { id: "winamp-5-picks/mig - Spintronics - Backspin", name: "mig - Spintronics - Backspin", fileName: "mig - Spintronics - Backspin.avs", collection: "Winamp 5 Picks", url: mig_Spintronics_Backspin_default },
+  { id: "winamp-5-picks/mig - Starslappin", name: "mig - Starslappin", fileName: "mig - Starslappin.avs", collection: "Winamp 5 Picks", url: mig_Starslappin_default },
+  { id: "winamp-5-picks/mig - Street Art - Fire Inside", name: "mig - Street Art - Fire Inside", fileName: "mig - Street Art - Fire Inside.avs", collection: "Winamp 5 Picks", url: mig_Street_Art_Fire_Inside_default },
+  { id: "winamp-5-picks/mig - Swoo - Slow", name: "mig - Swoo - Slow", fileName: "mig - Swoo - Slow.avs", collection: "Winamp 5 Picks", url: mig_Swoo_Slow_default },
+  { id: "winamp-5-picks/Nic01 - Rototronik", name: "Nic01 - Rototronik", fileName: "Nic01 - Rototronik.avs", collection: "Winamp 5 Picks", url: Nic01_Rototronik_default },
+  { id: "winamp-5-picks/nixa - smell of music (skupers remix)", name: "nixa - smell of music (skupers remix)", fileName: "nixa - smell of music (skupers remix).avs", collection: "Winamp 5 Picks", url: nixa_smell_of_music_skupers_remix_default },
+  { id: "winamp-5-picks/p-k - bumpy", name: "p-k - bumpy", fileName: "p-k - bumpy.avs", collection: "Winamp 5 Picks", url: p_k_bumpy_default },
+  { id: "winamp-5-picks/S_KuPeRS - ...hidden track...", name: "S_KuPeRS - ...hidden track...", fileName: "S_KuPeRS - ...hidden track....avs", collection: "Winamp 5 Picks", url: S_KuPeRS_hidden_track_default },
+  { id: "winamp-5-picks/S_KuPeRS - A Tribute To Degnic", name: "S_KuPeRS - A Tribute To Degnic", fileName: "S_KuPeRS - A Tribute To Degnic.avs", collection: "Winamp 5 Picks", url: S_KuPeRS_A_Tribute_To_Degnic_default },
+  { id: "winamp-5-picks/S_KuPeRS - Arctic Rainbow", name: "S_KuPeRS - Arctic Rainbow", fileName: "S_KuPeRS - Arctic Rainbow.avs", collection: "Winamp 5 Picks", url: S_KuPeRS_Arctic_Rainbow_default },
+  { id: "winamp-5-picks/S_KuPeRS - Chinook", name: "S_KuPeRS - Chinook", fileName: "S_KuPeRS - Chinook.avs", collection: "Winamp 5 Picks", url: S_KuPeRS_Chinook_default },
+  { id: "winamp-5-picks/S_KuPeRS - female demands", name: "S_KuPeRS - female demands", fileName: "S_KuPeRS - female demands.avs", collection: "Winamp 5 Picks", url: S_KuPeRS_female_demands_default },
+  { id: "winamp-5-picks/S_KuPeRS - Hexual Healing", name: "S_KuPeRS - Hexual Healing", fileName: "S_KuPeRS - Hexual Healing.avs", collection: "Winamp 5 Picks", url: S_KuPeRS_Hexual_Healing_default },
+  { id: "winamp-5-picks/S_KuPeRS - Inverse Kinetics", name: "S_KuPeRS - Inverse Kinetics", fileName: "S_KuPeRS - Inverse Kinetics.avs", collection: "Winamp 5 Picks", url: S_KuPeRS_Inverse_Kinetics_default },
+  { id: "winamp-5-picks/S_KuPeRS - Kingish", name: "S_KuPeRS - Kingish", fileName: "S_KuPeRS - Kingish.avs", collection: "Winamp 5 Picks", url: S_KuPeRS_Kingish_default },
+  { id: "winamp-5-picks/S_KuPeRS - Spirit Realm (Degnic's Plasmoid RMX)", name: "S_KuPeRS - Spirit Realm (Degnic's Plasmoid RMX)", fileName: "S_KuPeRS - Spirit Realm (Degnic's Plasmoid RMX).avs", collection: "Winamp 5 Picks", url: S_KuPeRS_Spirit_Realm_Degnic_s_Plasmoid_RMX_default },
+  { id: "winamp-5-picks/S_KuPeRS - Texering 002", name: "S_KuPeRS - Texering 002", fileName: "S_KuPeRS - Texering 002.avs", collection: "Winamp 5 Picks", url: S_KuPeRS_Texering_002_default },
+  { id: "winamp-5-picks/S_KuPeRS - Upward Current", name: "S_KuPeRS - Upward Current", fileName: "S_KuPeRS - Upward Current.avs", collection: "Winamp 5 Picks", url: S_KuPeRS_Upward_Current_default },
+  { id: "winamp-5-picks/skupers - chinook (exclusive version)", name: "skupers - chinook (exclusive version)", fileName: "skupers - chinook (exclusive version).avs", collection: "Winamp 5 Picks", url: skupers_chinook_exclusive_version_default },
+  { id: "winamp-5-picks/splendora", name: "splendora", fileName: "splendora.avs", collection: "Winamp 5 Picks", url: splendora_default },
+  { id: "winamp-5-picks/Tuggummi - Aqua-fumes", name: "Tuggummi - Aqua-fumes", fileName: "Tuggummi - Aqua-fumes.avs", collection: "Winamp 5 Picks", url: Tuggummi_Aqua_fumes_default },
+  { id: "winamp-5-picks/Tuggummi - Club Seizure (color enhanced mix)", name: "Tuggummi - Club Seizure (color enhanced mix)", fileName: "Tuggummi - Club Seizure (color enhanced mix).avs", collection: "Winamp 5 Picks", url: Tuggummi_Club_Seizure_color_enhanced_mix_default },
+  { id: "winamp-5-picks/Tuggummi - Different Load", name: "Tuggummi - Different Load", fileName: "Tuggummi - Different Load.avs", collection: "Winamp 5 Picks", url: Tuggummi_Different_Load_default },
+  { id: "winamp-5-picks/Tuggummi - Electro blobs", name: "Tuggummi - Electro blobs", fileName: "Tuggummi - Electro blobs.avs", collection: "Winamp 5 Picks", url: Tuggummi_Electro_blobs_default },
+  { id: "winamp-5-picks/Tuggummi - Kaleidofied", name: "Tuggummi - Kaleidofied", fileName: "Tuggummi - Kaleidofied.avs", collection: "Winamp 5 Picks", url: Tuggummi_Kaleidofied_default },
+  { id: "winamp-5-picks/Tuggummi - Magma Flow II", name: "Tuggummi - Magma Flow II", fileName: "Tuggummi - Magma Flow II.avs", collection: "Winamp 5 Picks", url: Tuggummi_Magma_Flow_II_default },
+  { id: "winamp-5-picks/Tuggummi - Multiple Orgasms", name: "Tuggummi - Multiple Orgasms", fileName: "Tuggummi - Multiple Orgasms.avs", collection: "Winamp 5 Picks", url: Tuggummi_Multiple_Orgasms_default },
+  { id: "winamp-5-picks/Tuggummi - Odour Control", name: "Tuggummi - Odour Control", fileName: "Tuggummi - Odour Control.avs", collection: "Winamp 5 Picks", url: Tuggummi_Odour_Control_default },
+  { id: "winamp-5-picks/Tuggummi - Pina Colada", name: "Tuggummi - Pina Colada", fileName: "Tuggummi - Pina Colada.avs", collection: "Winamp 5 Picks", url: Tuggummi_Pina_Colada_default },
+  { id: "winamp-5-picks/Tuggummi - Scope in Spotlight II", name: "Tuggummi - Scope in Spotlight II", fileName: "Tuggummi - Scope in Spotlight II.avs", collection: "Winamp 5 Picks", url: Tuggummi_Scope_in_Spotlight_II_default },
+  { id: "winamp-5-picks/Tuggummi - Solero Shots", name: "Tuggummi - Solero Shots", fileName: "Tuggummi - Solero Shots.avs", collection: "Winamp 5 Picks", url: Tuggummi_Solero_Shots_default },
+  { id: "winamp-5-picks/Tuggummi - Square Minded", name: "Tuggummi - Square Minded", fileName: "Tuggummi - Square Minded.avs", collection: "Winamp 5 Picks", url: Tuggummi_Square_Minded_default },
+  { id: "winamp-5-picks/Tuggummi - Worm-O-Rama (Raz Remix)", name: "Tuggummi - Worm-O-Rama (Raz Remix)", fileName: "Tuggummi - Worm-O-Rama (Raz Remix).avs", collection: "Winamp 5 Picks", url: Tuggummi_Worm_O_Rama_Raz_Remix_default },
+  { id: "winamp-5-picks/UnConeD -  Zero-G Maze", name: "UnConeD -  Zero-G Maze", fileName: "UnConeD -  Zero-G Maze.avs", collection: "Winamp 5 Picks", url: UnConeD_Zero_G_Maze_default },
+  { id: "winamp-5-picks/UnConeD - Cartoon Trip", name: "UnConeD - Cartoon Trip", fileName: "UnConeD - Cartoon Trip.avs", collection: "Winamp 5 Picks", url: UnConeD_Cartoon_Trip_default },
+  { id: "winamp-5-picks/UnConeD - Containment", name: "UnConeD - Containment", fileName: "UnConeD - Containment.avs", collection: "Winamp 5 Picks", url: UnConeD_Containment_default },
+  { id: "winamp-5-picks/UnConeD - Cubic Flower", name: "UnConeD - Cubic Flower", fileName: "UnConeD - Cubic Flower.avs", collection: "Winamp 5 Picks", url: UnConeD_Cubic_Flower_default },
+  { id: "winamp-5-picks/UnConeD - Jello Cube", name: "UnConeD - Jello Cube", fileName: "UnConeD - Jello Cube.avs", collection: "Winamp 5 Picks", url: UnConeD_Jello_Cube_default },
+  { id: "winamp-5-picks/UnConeD - Mercury", name: "UnConeD - Mercury", fileName: "UnConeD - Mercury.avs", collection: "Winamp 5 Picks", url: UnConeD_Mercury_default },
+  { id: "winamp-5-picks/UnConeD - Neon Coaster", name: "UnConeD - Neon Coaster", fileName: "UnConeD - Neon Coaster.avs", collection: "Winamp 5 Picks", url: UnConeD_Neon_Coaster_default },
+  { id: "winamp-5-picks/UnConeD - Plankton", name: "UnConeD - Plankton", fileName: "UnConeD - Plankton.avs", collection: "Winamp 5 Picks", url: UnConeD_Plankton_default },
+  { id: "winamp-5-picks/UnConeD - Reflectocube", name: "UnConeD - Reflectocube", fileName: "UnConeD - Reflectocube.avs", collection: "Winamp 5 Picks", url: UnConeD_Reflectocube_default },
+  { id: "winamp-5-picks/UnConeD - Speeder 3K", name: "UnConeD - Speeder 3K", fileName: "UnConeD - Speeder 3K.avs", collection: "Winamp 5 Picks", url: UnConeD_Speeder_3K_default },
+  { id: "winamp-5-picks/UnConeD - TC Plasma", name: "UnConeD - TC Plasma", fileName: "UnConeD - TC Plasma.avs", collection: "Winamp 5 Picks", url: UnConeD_TC_Plasma_default },
+  { id: "winamp-5-picks/UnConeD - Tie Tunnel SSC", name: "UnConeD - Tie Tunnel SSC", fileName: "UnConeD - Tie Tunnel SSC.avs", collection: "Winamp 5 Picks", url: UnConeD_Tie_Tunnel_SSC_default },
+  { id: "winamp-5-picks/UnConeD - Zero-G Maze II", name: "UnConeD - Zero-G Maze II", fileName: "UnConeD - Zero-G Maze II.avs", collection: "Winamp 5 Picks", url: UnConeD_Zero_G_Maze_II_default },
+  { id: "winamp-5-picks/UnConeD -Retrosquares", name: "UnConeD -Retrosquares", fileName: "UnConeD -Retrosquares.avs", collection: "Winamp 5 Picks", url: UnConeD_Retrosquares_default },
+  { id: "winamp-5-picks/UnConeD -Zero-G Maze III", name: "UnConeD -Zero-G Maze III", fileName: "UnConeD -Zero-G Maze III.avs", collection: "Winamp 5 Picks", url: UnConeD_Zero_G_Maze_III_default },
+  { id: "winamp-5-picks/yathosho - fabric (skupers remix)", name: "yathosho - fabric (skupers remix)", fileName: "yathosho - fabric (skupers remix).avs", collection: "Winamp 5 Picks", url: yathosho_fabric_skupers_remix_default },
+  { id: "winamp-5-picks/Yathosho - microcosm 02", name: "Yathosho - microcosm 02", fileName: "Yathosho - microcosm 02.avs", collection: "Winamp 5 Picks", url: Yathosho_microcosm_02_default },
+  { id: "winamp-5-picks/zxe-Urantia", name: "zxe-Urantia", fileName: "zxe-Urantia.avs", collection: "Winamp 5 Picks", url: zxe_Urantia_default }
+];
+
+// src/avs/bundled-presets.ts
+var BUNDLED_AVS_PRESETS = BUNDLED_AVS_PRESET_CATALOG;
+async function fetchBundledAvsPreset(preset2) {
+  const response = await fetch(new URL(preset2.url, import.meta.url));
+  if (!response.ok) throw new Error(`Could not load ${preset2.fileName}: HTTP ${response.status}`);
+  return new Uint8Array(await response.arrayBuffer());
 }
 
 // src/shaders/present.wgsl
@@ -16547,6 +17399,7 @@ var ui = new LayerUI({
   preset,
   registry: renderer.types,
   presets: PRESET_BANK.map((e) => ({ name: e.preset.name })),
+  avsPresets: BUNDLED_AVS_PRESETS.map(({ id, name, collection }) => ({ id, name, collection })),
   onPickPreset(name) {
     const i = PRESET_BANK.findIndex((e) => e.preset.name === name);
     if (i < 0) return;
@@ -16574,6 +17427,11 @@ var ui = new LayerUI({
     knownLayerIds = stack.all.map((l) => l.id).join("|");
     presetError = "";
     ui.setPreset(next);
+  },
+  async onPickAvsPreset(id) {
+    const bundled = BUNDLED_AVS_PRESETS.find((entry) => entry.id === id);
+    if (!bundled) throw new Error(`Unknown bundled AVS preset: ${id}`);
+    await loadAvsPreset(await fetchBundledAvsPreset(bundled), bundled.fileName);
   },
   async onLoadAvsPreset(bytes, fileName) {
     await loadAvsPreset(bytes, fileName);

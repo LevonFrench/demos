@@ -158,8 +158,16 @@
   background: rgba(255, 255, 255, .018);
 }
 .ui-preset-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: 6.6rem minmax(0, 1fr);
+  align-items: center;
   gap: .45rem;
+}
+.ui-preset-label {
+  color: var(--ui-muted);
+  font-size: .68rem;
+  letter-spacing: .045em;
+  text-transform: uppercase;
 }
 .ui-preset-select {
   flex: 1 1 auto;
