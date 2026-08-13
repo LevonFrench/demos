@@ -2362,66 +2362,114 @@ function blur(ctx, mode, roundUp) {
     destination.set(source);
     return;
   }
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const center = source[y * width + x];
-      const left = x > 0 ? source[y * width + x - 1] : 0;
-      const right = x + 1 < width ? source[y * width + x + 1] : 0;
-      const up = y > 0 ? source[(y - 1) * width + x] : 0;
-      const down = y + 1 < height ? source[(y + 1) * width + x] : 0;
-      destination[y * width + x] = blurPixel(
-        mode,
-        center,
-        left,
-        right,
-        up,
-        down,
-        x === 0,
-        x === width - 1,
-        y === 0,
-        y === height - 1,
-        roundUp
-      );
+  if (mode === 3) renderHeavyBlur(source, destination, width, height, roundUp);
+  else if (mode === 2) renderLightBlur(source, destination, width, height, roundUp);
+  else renderNormalBlur(source, destination, width, height, roundUp);
+}
+var SHIFT_1_MASK = 8355711;
+var SHIFT_2_MASK = 4144959;
+var SHIFT_3_MASK = 2039583;
+var SHIFT_4_MASK = 986895;
+var ROUND_1 = 65793;
+var ROUND_2 = 131586;
+var ROUND_3 = 197379;
+var ROUND_4 = 263172;
+var ROUND_5 = 328965;
+function shr1(pixel) {
+  return pixel >>> 1 & SHIFT_1_MASK;
+}
+function shr2(pixel) {
+  return pixel >>> 2 & SHIFT_2_MASK;
+}
+function shr3(pixel) {
+  return pixel >>> 3 & SHIFT_3_MASK;
+}
+function shr4(pixel) {
+  return pixel >>> 4 & SHIFT_4_MASK;
+}
+function renderNormalBlur(source, destination, width, height, roundUp) {
+  const cornerRound = roundUp ? ROUND_2 : 0;
+  const edgeRound = roundUp ? ROUND_3 : 0;
+  const centerRound = roundUp ? ROUND_4 : 0;
+  destination[0] = cornerRound + shr1(source[0]) + shr2(source[1]) + shr2(source[width]);
+  for (let x = 1; x < width - 1; x++) {
+    destination[x] = edgeRound + shr2(source[x]) + shr2(source[x - 1]) + shr2(source[x + 1]) + shr2(source[width + x]);
+  }
+  destination[width - 1] = cornerRound + shr1(source[width - 1]) + shr2(source[width - 2]) + shr2(source[width * 2 - 1]);
+  for (let y = 1; y < height - 1; y++) {
+    const row = y * width;
+    destination[row] = edgeRound + shr2(source[row]) + shr2(source[row + 1]) + shr2(source[row - width]) + shr2(source[row + width]);
+    for (let x = 1; x < width - 1; x++) {
+      const index = row + x;
+      destination[index] = centerRound + shr1(source[index]) + shr3(source[index - 1]) + shr3(source[index + 1]) + shr3(source[index - width]) + shr3(source[index + width]);
     }
+    const right = row + width - 1;
+    destination[right] = edgeRound + shr2(source[right]) + shr2(source[right - 1]) + shr2(source[right - width]) + shr2(source[right + width]);
   }
+  const bottom = (height - 1) * width;
+  destination[bottom] = cornerRound + shr1(source[bottom]) + shr2(source[bottom + 1]) + shr2(source[bottom - width]);
+  for (let x = 1; x < width - 1; x++) {
+    const index = bottom + x;
+    destination[index] = edgeRound + shr2(source[index]) + shr2(source[index - 1]) + shr2(source[index + 1]) + shr2(source[index - width]);
+  }
+  const final = source.length - 1;
+  destination[final] = cornerRound + shr1(source[final]) + shr2(source[final - 1]) + shr2(source[final - width]);
 }
-function blurPixel(mode, center, left, right, up, down, atLeft, atRight, atTop, atBottom, roundUp) {
-  if (mode === 3) {
-    const horizontal = atLeft ? [[right, 1]] : atRight ? [[left, 1]] : [[left, 2], [right, 2]];
-    const vertical = atTop ? [[down, 1]] : atBottom ? [[up, 1]] : [[up, 2], [down, 2]];
-    const rounding = atLeft || atRight ? atTop || atBottom ? 1 : 2 : atTop || atBottom ? 2 : 3;
-    return shiftedSum([...horizontal, ...vertical], roundUp ? rounding : 0);
+function renderLightBlur(source, destination, width, height, roundUp) {
+  const cornerRound = roundUp ? ROUND_3 : 0;
+  const edgeRound = roundUp ? ROUND_4 : 0;
+  const centerRound = roundUp ? ROUND_5 : 0;
+  destination[0] = cornerRound + shr1(source[0]) + shr2(source[0]) + shr3(source[1]) + shr3(source[width]);
+  for (let x = 1; x < width - 1; x++) {
+    destination[x] = edgeRound + shr1(source[x]) + shr3(source[x]) + shr3(source[x - 1]) + shr3(source[x + 1]) + shr3(source[width + x]);
   }
-  if (mode === 2) {
-    const corner2 = (atLeft || atRight) && (atTop || atBottom);
-    const edge2 = atLeft || atRight || atTop || atBottom;
-    const terms2 = [[center, 1]];
-    if (corner2) {
-      terms2.push([center, 2], [atLeft ? right : left, 3], [atTop ? down : up, 3]);
-    } else if (edge2) {
-      terms2.push([center, 3]);
-      if (!atLeft && !atRight) terms2.push([left, 3], [right, 3], [atTop ? down : up, 3]);
-      else terms2.push([atLeft ? right : left, 3], [up, 3], [down, 3]);
-    } else terms2.push([center, 2], [left, 4], [right, 4], [up, 4], [down, 4]);
-    return shiftedSum(terms2, roundUp ? corner2 ? 3 : edge2 ? 4 : 5 : 0);
+  destination[width - 1] = cornerRound + shr1(source[width - 1]) + shr2(source[width - 1]) + shr3(source[width - 2]) + shr3(source[width * 2 - 1]);
+  for (let y = 1; y < height - 1; y++) {
+    const row = y * width;
+    destination[row] = edgeRound + shr1(source[row]) + shr3(source[row]) + shr3(source[row + 1]) + shr3(source[row - width]) + shr3(source[row + width]);
+    for (let x = 1; x < width - 1; x++) {
+      const index = row + x;
+      destination[index] = centerRound + shr1(source[index]) + shr2(source[index]) + shr4(source[index - 1]) + shr4(source[index + 1]) + shr4(source[index - width]) + shr4(source[index + width]);
+    }
+    const right = row + width - 1;
+    destination[right] = edgeRound + shr1(source[right]) + shr3(source[right]) + shr3(source[right - 1]) + shr3(source[right - width]) + shr3(source[right + width]);
   }
-  const corner = (atLeft || atRight) && (atTop || atBottom);
-  const edge = atLeft || atRight || atTop || atBottom;
-  let terms;
-  if (corner) terms = [[center, 1], [atLeft ? right : left, 2], [atTop ? down : up, 2]];
-  else if (edge && (atTop || atBottom)) terms = [[center, 2], [left, 2], [right, 2], [atTop ? down : up, 2]];
-  else if (edge) terms = [[center, 2], [atLeft ? right : left, 2], [up, 2], [down, 2]];
-  else terms = [[center, 1], [left, 3], [right, 3], [up, 3], [down, 3]];
-  return shiftedSum(terms, roundUp ? corner ? 2 : edge ? 3 : 4 : 0);
+  const bottom = (height - 1) * width;
+  destination[bottom] = cornerRound + shr1(source[bottom]) + shr2(source[bottom]) + shr3(source[bottom + 1]) + shr3(source[bottom - width]);
+  for (let x = 1; x < width - 1; x++) {
+    const index = bottom + x;
+    destination[index] = edgeRound + shr1(source[index]) + shr3(source[index]) + shr3(source[index - 1]) + shr3(source[index + 1]) + shr3(source[index - width]);
+  }
+  const final = source.length - 1;
+  destination[final] = cornerRound + shr1(source[final]) + shr2(source[final]) + shr3(source[final - 1]) + shr3(source[final - width]);
 }
-function shiftedSum(terms, rounding) {
-  let r = rounding, g = rounding, b = rounding;
-  for (const [pixel, shift] of terms) {
-    r += (pixel & 255) >>> shift;
-    g += (pixel >>> 8 & 255) >>> shift;
-    b += (pixel >>> 16 & 255) >>> shift;
+function renderHeavyBlur(source, destination, width, height, roundUp) {
+  const cornerRound = roundUp ? ROUND_1 : 0;
+  const edgeRound = roundUp ? ROUND_2 : 0;
+  const centerRound = roundUp ? ROUND_3 : 0;
+  destination[0] = cornerRound + shr1(source[1]) + shr1(source[width]);
+  for (let x = 1; x < width - 1; x++) {
+    destination[x] = edgeRound + shr2(source[x - 1]) + shr2(source[x + 1]) + shr1(source[width + x]);
   }
-  return r & 255 | (g & 255) << 8 | (b & 255) << 16;
+  destination[width - 1] = cornerRound + shr1(source[width - 2]) + shr1(source[width * 2 - 1]);
+  for (let y = 1; y < height - 1; y++) {
+    const row = y * width;
+    destination[row] = edgeRound + shr1(source[row + 1]) + shr2(source[row - width]) + shr2(source[row + width]);
+    for (let x = 1; x < width - 1; x++) {
+      const index = row + x;
+      destination[index] = centerRound + shr2(source[index - 1]) + shr2(source[index + 1]) + shr2(source[index - width]) + shr2(source[index + width]);
+    }
+    const right = row + width - 1;
+    destination[right] = edgeRound + shr1(source[right - 1]) + shr2(source[right - width]) + shr2(source[right + width]);
+  }
+  const bottom = (height - 1) * width;
+  destination[bottom] = cornerRound + shr1(source[bottom + 1]) + shr1(source[bottom - width]);
+  for (let x = 1; x < width - 1; x++) {
+    const index = bottom + x;
+    destination[index] = edgeRound + shr2(source[index - 1]) + shr2(source[index + 1]) + shr1(source[index - width]);
+  }
+  const final = source.length - 1;
+  destination[final] = cornerRound + shr1(source[final - 1]) + shr1(source[final - width]);
 }
 function blitIn(ctx, value, blend2, subpixel) {
   const { width, height } = ctx.input;
@@ -6656,17 +6704,18 @@ function sampleBilinearFixed(bitmap, fx, fy, flipX, flipY) {
   const y = clamp12(fy >> 16, 0, Math.max(0, bitmap.height - 2));
   const dx = fx >>> 8 & 255;
   const dy = fy >>> 8 & 255;
-  let result = 0;
-  for (let shift = 0; shift <= 16; shift += 8) {
-    const a = sampleBitmap(bitmap, x, y, flipX, flipY) >>> shift & 255;
-    const b = sampleBitmap(bitmap, x + 1, y, flipX, flipY) >>> shift & 255;
-    const c = sampleBitmap(bitmap, x, y + 1, flipX, flipY) >>> shift & 255;
-    const d = sampleBitmap(bitmap, x + 1, y + 1, flipX, flipY) >>> shift & 255;
-    const upper = (a * (255 - dx) >>> 8) + (b * dx >>> 8);
-    const lower = (c * (255 - dx) >>> 8) + (d * dx >>> 8);
-    result |= ((upper * (255 - dy) >>> 8) + (lower * dy >>> 8) & 255) << shift;
-  }
-  return result;
+  const a = sampleBitmap(bitmap, x, y, flipX, flipY);
+  const b = sampleBitmap(bitmap, x + 1, y, flipX, flipY);
+  const c = sampleBitmap(bitmap, x, y + 1, flipX, flipY);
+  const d = sampleBitmap(bitmap, x + 1, y + 1, flipX, flipY);
+  const inverseX = 255 - dx;
+  const inverseY = 255 - dy;
+  return interpolateByte(a, b, c, d, dx, dy, inverseX, inverseY) | interpolateByte(a >>> 8, b >>> 8, c >>> 8, d >>> 8, dx, dy, inverseX, inverseY) << 8 | interpolateByte(a >>> 16, b >>> 16, c >>> 16, d >>> 16, dx, dy, inverseX, inverseY) << 16;
+}
+function interpolateByte(a, b, c, d, dx, dy, inverseX, inverseY) {
+  const upper = ((a & 255) * inverseX >>> 8) + ((b & 255) * dx >>> 8);
+  const lower = ((c & 255) * inverseX >>> 8) + ((d & 255) * dx >>> 8);
+  return (upper * inverseY >>> 8) + (lower * dy >>> 8) & 255;
 }
 function sampleBitmap(bitmap, x, y, flipX, flipY) {
   const sx = flipX ? bitmap.width - x - 1 : x;
@@ -6674,7 +6723,7 @@ function sampleBitmap(bitmap, x, y, flipX, flipY) {
   return bitmap.pixels[clamp12(sy, 0, bitmap.height - 1) * bitmap.width + clamp12(sx, 0, bitmap.width - 1)];
 }
 function filterPixel(pixel, color) {
-  return channels5(pixel, color, (source, mask) => source * mask >>> 8);
+  return (pixel & 255) * (color & 255) >>> 8 | (pixel >>> 8 & 255) * (color >>> 8 & 255) >>> 8 << 8 | (pixel >>> 16 & 255) * (color >>> 16 & 255) >>> 8 << 16;
 }
 function blendTexerPixel(source, destination, mode, amount) {
   source &= 16777215;
@@ -6978,6 +7027,248 @@ function copyAvsPixelsToRgba(source, rgba, rgbaWords) {
   }
 }
 
+// src/avs/gpu-frame-graph.ts
+var AVS_GPU_TERMINAL_CAPABILITY = {
+  id: "packed-u32-terminal",
+  backend: "webgpu",
+  lane: "exact",
+  byteExact: true,
+  reason: "Unpacks AVS 0x00RRGGBB channels with integer shifts; no filtering or blend approximation."
+};
+var AVS_PACKED_PRESENT_WGSL = (
+  /* wgsl */
+  `
+@group(0) @binding(0) var<storage, read> avs_pixels: array<u32>;
+@group(0) @binding(1) var<uniform> frame_width: u32;
+
+struct VertexOutput {
+  @builtin(position) position: vec4f,
+};
+
+@vertex fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+  var positions = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  var output: VertexOutput;
+  output.position = vec4f(positions[vertex_index], 0.0, 1.0);
+  return output;
+}
+
+@fragment fn fragment_main(@builtin(position) position: vec4f) -> @location(0) vec4f {
+  let coordinate = vec2u(position.xy);
+  let pixel = avs_pixels[coordinate.y * frame_width + coordinate.x];
+  return vec4f(
+    f32((pixel >> 16u) & 255u),
+    f32((pixel >> 8u) & 255u),
+    f32(pixel & 255u),
+    255.0,
+  ) / 255.0;
+}
+`
+);
+function planPackedAvsFrameGraph(width, height, maxStorageBufferBindingSize = Number.MAX_SAFE_INTEGER) {
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+    throw new RangeError(`Invalid AVS frame-graph size ${width}x${height}`);
+  }
+  const pixels = width * height;
+  const framebufferBytes = pixels * Uint32Array.BYTES_PER_ELEMENT;
+  if (!Number.isSafeInteger(framebufferBytes)) throw new RangeError("AVS framebuffer byte size is unsafe");
+  if (framebufferBytes > maxStorageBufferBindingSize) {
+    throw new RangeError(
+      `AVS framebuffer needs ${framebufferBytes} bytes; adapter limit is ${maxStorageBufferBindingSize}`
+    );
+  }
+  return { width, height, pixels, framebufferBytes, residentBytes: framebufferBytes * 2 };
+}
+function assertPackedAvsFrame(pixels, expectedPixels) {
+  if (pixels.length !== expectedPixels) {
+    throw new RangeError(`Packed AVS frame has ${pixels.length} pixels, expected ${expectedPixels}`);
+  }
+  if (!(pixels.buffer instanceof ArrayBuffer)) {
+    throw new TypeError("Packed AVS frame must use transferable ArrayBuffer storage");
+  }
+}
+function assertAvsPassCompatible(lane, capability) {
+  if (lane === "exact" && (!capability.byteExact || capability.lane !== "exact")) {
+    throw new Error(`Frame pass ${capability.id} requires the explicit 120 lane: ${capability.reason}`);
+  }
+}
+var PackedAvsGpuFrameGraph = class _PackedAvsGpuFrameGraph {
+  capability = AVS_GPU_TERMINAL_CAPABILITY;
+  plan;
+  lane;
+  device;
+  context;
+  canvas;
+  format;
+  buffers;
+  widthBuffer;
+  bindGroups;
+  pipeline;
+  onTiming;
+  frame = 0;
+  destroyed = false;
+  constructor(device, context2, format, options) {
+    this.device = device;
+    this.context = context2;
+    this.canvas = options.canvas;
+    this.format = format;
+    this.onTiming = options.onTiming;
+    this.lane = options.lane ?? "exact";
+    this.plan = planPackedAvsFrameGraph(
+      options.width,
+      options.height,
+      Number(device.limits.maxStorageBufferBindingSize)
+    );
+    this.canvas.width = options.width;
+    this.canvas.height = options.height;
+    this.context.configure({ device, format, alphaMode: "opaque" });
+    const createFramebuffer = (label) => device.createBuffer({
+      label,
+      size: this.plan.framebufferBytes,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+    });
+    this.buffers = {
+      primary: createFramebuffer("AVS frame graph primary"),
+      secondary: createFramebuffer("AVS frame graph secondary")
+    };
+    this.widthBuffer = device.createBuffer({
+      label: "AVS frame graph width",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    device.queue.writeBuffer(this.widthBuffer, 0, new Uint32Array([options.width]));
+    const module = device.createShaderModule({
+      label: "AVS exact packed-u32 terminal",
+      code: AVS_PACKED_PRESENT_WGSL
+    });
+    this.pipeline = device.createRenderPipeline({
+      label: "AVS exact packed-u32 terminal",
+      layout: "auto",
+      vertex: { module, entryPoint: "vertex_main" },
+      fragment: { module, entryPoint: "fragment_main", targets: [{ format }] },
+      primitive: { topology: "triangle-list" }
+    });
+    const layout = this.pipeline.getBindGroupLayout(0);
+    const bind = (slot) => device.createBindGroup({
+      label: `AVS exact terminal ${slot}`,
+      layout,
+      entries: [
+        { binding: 0, resource: { buffer: this.buffers[slot] } },
+        { binding: 1, resource: { buffer: this.widthBuffer } }
+      ]
+    });
+    this.bindGroups = { primary: bind("primary"), secondary: bind("secondary") };
+  }
+  static async create(options) {
+    const navigation = globalThis.navigator;
+    const gpu = navigation?.gpu;
+    if (!gpu) return null;
+    const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
+    if (!adapter) return null;
+    const device = await adapter.requestDevice();
+    const context2 = options.canvas.getContext("webgpu");
+    if (!context2) {
+      device.destroy();
+      return null;
+    }
+    try {
+      return new _PackedAvsGpuFrameGraph(device, context2, gpu.getPreferredCanvasFormat(), options);
+    } catch (error) {
+      context2.unconfigure();
+      device.destroy();
+      throw error;
+    }
+  }
+  buffer(slot) {
+    this.assertActive();
+    return this.buffers[slot];
+  }
+  upload(slot, pixels) {
+    this.assertActive();
+    assertPackedAvsFrame(pixels, this.plan.pixels);
+    const started = performance.now();
+    this.device.queue.writeBuffer(
+      this.buffers[slot],
+      0,
+      pixels.buffer,
+      pixels.byteOffset,
+      pixels.byteLength
+    );
+    return performance.now() - started;
+  }
+  present(slot, uploadMs = 0) {
+    return this.executeAndPresent([], slot, uploadMs);
+  }
+  /**
+   * Records the compiled pass chain and terminal presentation in one encoder.
+   * Every pass alternates the two resident buffers; no pass may read back.
+   */
+  executeAndPresent(passes, inputSlot = "primary", uploadMs = 0) {
+    this.assertActive();
+    const started = performance.now();
+    const encoder = this.device.createCommandEncoder({ label: "AVS frame graph encoder" });
+    let sourceSlot = inputSlot;
+    for (const framePass of passes) {
+      assertAvsPassCompatible(this.lane, framePass.capability);
+      const targetSlot = sourceSlot === "primary" ? "secondary" : "primary";
+      framePass.encode({
+        device: this.device,
+        encoder,
+        width: this.plan.width,
+        height: this.plan.height,
+        source: this.buffers[sourceSlot],
+        target: this.buffers[targetSlot]
+      });
+      sourceSlot = targetSlot;
+    }
+    const pass = encoder.beginRenderPass({
+      label: "AVS exact terminal pass",
+      colorAttachments: [{
+        view: this.context.getCurrentTexture().createView(),
+        loadOp: "clear",
+        storeOp: "store",
+        clearValue: { r: 0, g: 0, b: 0, a: 1 }
+      }]
+    });
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, this.bindGroups[sourceSlot]);
+    pass.draw(3);
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+    const encodeSubmitMs = performance.now() - started;
+    const frame = ++this.frame;
+    this.onTiming?.({ frame, uploadMs, encodeSubmitMs });
+    if (this.onTiming) {
+      const gpuStarted = performance.now();
+      void this.device.queue.onSubmittedWorkDone().then(() => {
+        if (!this.destroyed) {
+          this.onTiming?.({ frame, uploadMs, encodeSubmitMs, gpuCompleteMs: performance.now() - gpuStarted });
+        }
+      });
+    }
+    return { uploadMs, encodeSubmitMs };
+  }
+  uploadAndPresent(pixels, slot = "primary") {
+    const uploadMs = this.upload(slot, pixels);
+    return this.present(slot, uploadMs);
+  }
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.context.unconfigure();
+    this.buffers.primary.destroy();
+    this.buffers.secondary.destroy();
+    this.widthBuffer.destroy();
+    this.device.destroy();
+  }
+  assertActive() {
+    if (this.destroyed) throw new Error("AVS GPU frame graph is destroyed");
+  }
+};
+
 // src/avs-render.worker.ts
 var scope = globalThis;
 var runtime = null;
@@ -6986,6 +7277,7 @@ var surface = null;
 var context = null;
 var image = null;
 var imageWords = null;
+var gpuGraph = null;
 scope.onmessage = (event) => {
   void handle(event.data).catch((error) => {
     scope.postMessage({
@@ -7000,6 +7292,10 @@ async function handle(message) {
   if (message.type === "clear") {
     generation = message.generation;
     runtime = null;
+    gpuGraph?.destroy();
+    gpuGraph = null;
+    surface = null;
+    context = null;
     image = null;
     imageWords = null;
     return;
@@ -7011,7 +7307,8 @@ async function handle(message) {
     const registry = createAvsCompatibilityRegistry({}, { bitmapResolver: resolver });
     runtime = new AvsCompatibilityRuntime(message.preset, message.width, message.height, registry);
     const warmup = runtime.render(void 0, true);
-    ensureSurface(warmup.framebuffer.width, warmup.framebuffer.height);
+    await ensureSurface(warmup.framebuffer.width, warmup.framebuffer.height);
+    if (generation !== message.generation) return;
     scope.postMessage({ type: "ready", generation, unsupported: warmup.stats.unsupported });
     return;
   }
@@ -7033,10 +7330,23 @@ async function handle(message) {
   const started = performance.now();
   runtime.resize(message.width, message.height);
   const pcm = new Float32Array(message.pcm);
+  const effectStarted = performance.now();
   const frame = runtime.renderPcm({ left: pcm.subarray(0, 576), right: pcm.subarray(576) });
-  ensureSurface(frame.framebuffer.width, frame.framebuffer.height);
-  copyAvsPixelsToRgba(frame.framebuffer.pixels, image.data, imageWords);
-  context.putImageData(image, 0, 0);
+  const effectMs = performance.now() - effectStarted;
+  await ensureSurface(frame.framebuffer.width, frame.framebuffer.height);
+  let presenter;
+  let uploadMs = 0;
+  let encodeSubmitMs = 0;
+  if (gpuGraph) {
+    const timing = gpuGraph.uploadAndPresent(frame.framebuffer.pixels);
+    uploadMs = timing.uploadMs;
+    encodeSubmitMs = timing.encodeSubmitMs;
+    presenter = "webgpu-exact";
+  } else {
+    copyAvsPixelsToRgba(frame.framebuffer.pixels, image.data, imageWords);
+    context.putImageData(image, 0, 0);
+    presenter = "cpu-image-data";
+  }
   const bitmap = surface.transferToImageBitmap();
   const renderMs = performance.now() - started;
   scope.postMessage({
@@ -7048,22 +7358,30 @@ async function handle(message) {
     width: frame.framebuffer.width,
     height: frame.framebuffer.height,
     unsupported: frame.stats.unsupported,
-    renderMs
+    renderMs,
+    effectMs,
+    presenter,
+    uploadMs,
+    encodeSubmitMs
   }, [message.pcm, bitmap]);
 }
-function ensureSurface(width, height) {
-  if (!surface) {
+async function ensureSurface(width, height) {
+  if (surface?.width === width && surface.height === height) return;
+  gpuGraph?.destroy();
+  gpuGraph = null;
+  surface = new OffscreenCanvas(width, height);
+  context = null;
+  image = null;
+  imageWords = null;
+  try {
+    gpuGraph = await PackedAvsGpuFrameGraph.create({ canvas: surface, width, height });
+  } catch {
+    gpuGraph = null;
     surface = new OffscreenCanvas(width, height);
+  }
+  if (!gpuGraph) {
     context = surface.getContext("2d", { alpha: false });
-    if (!context) throw new Error("OffscreenCanvas 2D is unavailable");
-  }
-  if (surface.width !== width || surface.height !== height) {
-    surface.width = width;
-    surface.height = height;
-    image = null;
-    imageWords = null;
-  }
-  if (!image) {
+    if (!context) throw new Error("Neither WebGPU nor OffscreenCanvas 2D presentation is available");
     image = new ImageData(width, height);
     imageWords = new Uint32Array(image.data.buffer, image.data.byteOffset, width * height);
   }

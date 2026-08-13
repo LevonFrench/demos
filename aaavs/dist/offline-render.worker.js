@@ -2362,66 +2362,114 @@ function blur(ctx, mode, roundUp) {
     destination.set(source);
     return;
   }
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const center = source[y * width + x];
-      const left = x > 0 ? source[y * width + x - 1] : 0;
-      const right = x + 1 < width ? source[y * width + x + 1] : 0;
-      const up = y > 0 ? source[(y - 1) * width + x] : 0;
-      const down = y + 1 < height ? source[(y + 1) * width + x] : 0;
-      destination[y * width + x] = blurPixel(
-        mode,
-        center,
-        left,
-        right,
-        up,
-        down,
-        x === 0,
-        x === width - 1,
-        y === 0,
-        y === height - 1,
-        roundUp
-      );
+  if (mode === 3) renderHeavyBlur(source, destination, width, height, roundUp);
+  else if (mode === 2) renderLightBlur(source, destination, width, height, roundUp);
+  else renderNormalBlur(source, destination, width, height, roundUp);
+}
+var SHIFT_1_MASK = 8355711;
+var SHIFT_2_MASK = 4144959;
+var SHIFT_3_MASK = 2039583;
+var SHIFT_4_MASK = 986895;
+var ROUND_1 = 65793;
+var ROUND_2 = 131586;
+var ROUND_3 = 197379;
+var ROUND_4 = 263172;
+var ROUND_5 = 328965;
+function shr1(pixel) {
+  return pixel >>> 1 & SHIFT_1_MASK;
+}
+function shr2(pixel) {
+  return pixel >>> 2 & SHIFT_2_MASK;
+}
+function shr3(pixel) {
+  return pixel >>> 3 & SHIFT_3_MASK;
+}
+function shr4(pixel) {
+  return pixel >>> 4 & SHIFT_4_MASK;
+}
+function renderNormalBlur(source, destination, width, height, roundUp) {
+  const cornerRound = roundUp ? ROUND_2 : 0;
+  const edgeRound = roundUp ? ROUND_3 : 0;
+  const centerRound = roundUp ? ROUND_4 : 0;
+  destination[0] = cornerRound + shr1(source[0]) + shr2(source[1]) + shr2(source[width]);
+  for (let x = 1; x < width - 1; x++) {
+    destination[x] = edgeRound + shr2(source[x]) + shr2(source[x - 1]) + shr2(source[x + 1]) + shr2(source[width + x]);
+  }
+  destination[width - 1] = cornerRound + shr1(source[width - 1]) + shr2(source[width - 2]) + shr2(source[width * 2 - 1]);
+  for (let y = 1; y < height - 1; y++) {
+    const row = y * width;
+    destination[row] = edgeRound + shr2(source[row]) + shr2(source[row + 1]) + shr2(source[row - width]) + shr2(source[row + width]);
+    for (let x = 1; x < width - 1; x++) {
+      const index = row + x;
+      destination[index] = centerRound + shr1(source[index]) + shr3(source[index - 1]) + shr3(source[index + 1]) + shr3(source[index - width]) + shr3(source[index + width]);
     }
+    const right = row + width - 1;
+    destination[right] = edgeRound + shr2(source[right]) + shr2(source[right - 1]) + shr2(source[right - width]) + shr2(source[right + width]);
   }
+  const bottom = (height - 1) * width;
+  destination[bottom] = cornerRound + shr1(source[bottom]) + shr2(source[bottom + 1]) + shr2(source[bottom - width]);
+  for (let x = 1; x < width - 1; x++) {
+    const index = bottom + x;
+    destination[index] = edgeRound + shr2(source[index]) + shr2(source[index - 1]) + shr2(source[index + 1]) + shr2(source[index - width]);
+  }
+  const final = source.length - 1;
+  destination[final] = cornerRound + shr1(source[final]) + shr2(source[final - 1]) + shr2(source[final - width]);
 }
-function blurPixel(mode, center, left, right, up, down, atLeft, atRight, atTop, atBottom, roundUp) {
-  if (mode === 3) {
-    const horizontal = atLeft ? [[right, 1]] : atRight ? [[left, 1]] : [[left, 2], [right, 2]];
-    const vertical = atTop ? [[down, 1]] : atBottom ? [[up, 1]] : [[up, 2], [down, 2]];
-    const rounding = atLeft || atRight ? atTop || atBottom ? 1 : 2 : atTop || atBottom ? 2 : 3;
-    return shiftedSum([...horizontal, ...vertical], roundUp ? rounding : 0);
+function renderLightBlur(source, destination, width, height, roundUp) {
+  const cornerRound = roundUp ? ROUND_3 : 0;
+  const edgeRound = roundUp ? ROUND_4 : 0;
+  const centerRound = roundUp ? ROUND_5 : 0;
+  destination[0] = cornerRound + shr1(source[0]) + shr2(source[0]) + shr3(source[1]) + shr3(source[width]);
+  for (let x = 1; x < width - 1; x++) {
+    destination[x] = edgeRound + shr1(source[x]) + shr3(source[x]) + shr3(source[x - 1]) + shr3(source[x + 1]) + shr3(source[width + x]);
   }
-  if (mode === 2) {
-    const corner2 = (atLeft || atRight) && (atTop || atBottom);
-    const edge2 = atLeft || atRight || atTop || atBottom;
-    const terms2 = [[center, 1]];
-    if (corner2) {
-      terms2.push([center, 2], [atLeft ? right : left, 3], [atTop ? down : up, 3]);
-    } else if (edge2) {
-      terms2.push([center, 3]);
-      if (!atLeft && !atRight) terms2.push([left, 3], [right, 3], [atTop ? down : up, 3]);
-      else terms2.push([atLeft ? right : left, 3], [up, 3], [down, 3]);
-    } else terms2.push([center, 2], [left, 4], [right, 4], [up, 4], [down, 4]);
-    return shiftedSum(terms2, roundUp ? corner2 ? 3 : edge2 ? 4 : 5 : 0);
+  destination[width - 1] = cornerRound + shr1(source[width - 1]) + shr2(source[width - 1]) + shr3(source[width - 2]) + shr3(source[width * 2 - 1]);
+  for (let y = 1; y < height - 1; y++) {
+    const row = y * width;
+    destination[row] = edgeRound + shr1(source[row]) + shr3(source[row]) + shr3(source[row + 1]) + shr3(source[row - width]) + shr3(source[row + width]);
+    for (let x = 1; x < width - 1; x++) {
+      const index = row + x;
+      destination[index] = centerRound + shr1(source[index]) + shr2(source[index]) + shr4(source[index - 1]) + shr4(source[index + 1]) + shr4(source[index - width]) + shr4(source[index + width]);
+    }
+    const right = row + width - 1;
+    destination[right] = edgeRound + shr1(source[right]) + shr3(source[right]) + shr3(source[right - 1]) + shr3(source[right - width]) + shr3(source[right + width]);
   }
-  const corner = (atLeft || atRight) && (atTop || atBottom);
-  const edge = atLeft || atRight || atTop || atBottom;
-  let terms;
-  if (corner) terms = [[center, 1], [atLeft ? right : left, 2], [atTop ? down : up, 2]];
-  else if (edge && (atTop || atBottom)) terms = [[center, 2], [left, 2], [right, 2], [atTop ? down : up, 2]];
-  else if (edge) terms = [[center, 2], [atLeft ? right : left, 2], [up, 2], [down, 2]];
-  else terms = [[center, 1], [left, 3], [right, 3], [up, 3], [down, 3]];
-  return shiftedSum(terms, roundUp ? corner ? 2 : edge ? 3 : 4 : 0);
+  const bottom = (height - 1) * width;
+  destination[bottom] = cornerRound + shr1(source[bottom]) + shr2(source[bottom]) + shr3(source[bottom + 1]) + shr3(source[bottom - width]);
+  for (let x = 1; x < width - 1; x++) {
+    const index = bottom + x;
+    destination[index] = edgeRound + shr1(source[index]) + shr3(source[index]) + shr3(source[index - 1]) + shr3(source[index + 1]) + shr3(source[index - width]);
+  }
+  const final = source.length - 1;
+  destination[final] = cornerRound + shr1(source[final]) + shr2(source[final]) + shr3(source[final - 1]) + shr3(source[final - width]);
 }
-function shiftedSum(terms, rounding) {
-  let r = rounding, g = rounding, b = rounding;
-  for (const [pixel, shift] of terms) {
-    r += (pixel & 255) >>> shift;
-    g += (pixel >>> 8 & 255) >>> shift;
-    b += (pixel >>> 16 & 255) >>> shift;
+function renderHeavyBlur(source, destination, width, height, roundUp) {
+  const cornerRound = roundUp ? ROUND_1 : 0;
+  const edgeRound = roundUp ? ROUND_2 : 0;
+  const centerRound = roundUp ? ROUND_3 : 0;
+  destination[0] = cornerRound + shr1(source[1]) + shr1(source[width]);
+  for (let x = 1; x < width - 1; x++) {
+    destination[x] = edgeRound + shr2(source[x - 1]) + shr2(source[x + 1]) + shr1(source[width + x]);
   }
-  return r & 255 | (g & 255) << 8 | (b & 255) << 16;
+  destination[width - 1] = cornerRound + shr1(source[width - 2]) + shr1(source[width * 2 - 1]);
+  for (let y = 1; y < height - 1; y++) {
+    const row = y * width;
+    destination[row] = edgeRound + shr1(source[row + 1]) + shr2(source[row - width]) + shr2(source[row + width]);
+    for (let x = 1; x < width - 1; x++) {
+      const index = row + x;
+      destination[index] = centerRound + shr2(source[index - 1]) + shr2(source[index + 1]) + shr2(source[index - width]) + shr2(source[index + width]);
+    }
+    const right = row + width - 1;
+    destination[right] = edgeRound + shr1(source[right - 1]) + shr2(source[right - width]) + shr2(source[right + width]);
+  }
+  const bottom = (height - 1) * width;
+  destination[bottom] = cornerRound + shr1(source[bottom + 1]) + shr1(source[bottom - width]);
+  for (let x = 1; x < width - 1; x++) {
+    const index = bottom + x;
+    destination[index] = edgeRound + shr2(source[index - 1]) + shr2(source[index + 1]) + shr1(source[index - width]);
+  }
+  const final = source.length - 1;
+  destination[final] = cornerRound + shr1(source[final - 1]) + shr1(source[final - width]);
 }
 function blitIn(ctx, value, blend2, subpixel) {
   const { width, height } = ctx.input;
@@ -6656,17 +6704,18 @@ function sampleBilinearFixed(bitmap, fx, fy, flipX, flipY) {
   const y = clamp12(fy >> 16, 0, Math.max(0, bitmap.height - 2));
   const dx = fx >>> 8 & 255;
   const dy = fy >>> 8 & 255;
-  let result = 0;
-  for (let shift = 0; shift <= 16; shift += 8) {
-    const a = sampleBitmap(bitmap, x, y, flipX, flipY) >>> shift & 255;
-    const b = sampleBitmap(bitmap, x + 1, y, flipX, flipY) >>> shift & 255;
-    const c = sampleBitmap(bitmap, x, y + 1, flipX, flipY) >>> shift & 255;
-    const d = sampleBitmap(bitmap, x + 1, y + 1, flipX, flipY) >>> shift & 255;
-    const upper = (a * (255 - dx) >>> 8) + (b * dx >>> 8);
-    const lower = (c * (255 - dx) >>> 8) + (d * dx >>> 8);
-    result |= ((upper * (255 - dy) >>> 8) + (lower * dy >>> 8) & 255) << shift;
-  }
-  return result;
+  const a = sampleBitmap(bitmap, x, y, flipX, flipY);
+  const b = sampleBitmap(bitmap, x + 1, y, flipX, flipY);
+  const c = sampleBitmap(bitmap, x, y + 1, flipX, flipY);
+  const d = sampleBitmap(bitmap, x + 1, y + 1, flipX, flipY);
+  const inverseX = 255 - dx;
+  const inverseY = 255 - dy;
+  return interpolateByte(a, b, c, d, dx, dy, inverseX, inverseY) | interpolateByte(a >>> 8, b >>> 8, c >>> 8, d >>> 8, dx, dy, inverseX, inverseY) << 8 | interpolateByte(a >>> 16, b >>> 16, c >>> 16, d >>> 16, dx, dy, inverseX, inverseY) << 16;
+}
+function interpolateByte(a, b, c, d, dx, dy, inverseX, inverseY) {
+  const upper = ((a & 255) * inverseX >>> 8) + ((b & 255) * dx >>> 8);
+  const lower = ((c & 255) * inverseX >>> 8) + ((d & 255) * dx >>> 8);
+  return (upper * inverseY >>> 8) + (lower * dy >>> 8) & 255;
 }
 function sampleBitmap(bitmap, x, y, flipX, flipY) {
   const sx = flipX ? bitmap.width - x - 1 : x;
@@ -6674,7 +6723,7 @@ function sampleBitmap(bitmap, x, y, flipX, flipY) {
   return bitmap.pixels[clamp12(sy, 0, bitmap.height - 1) * bitmap.width + clamp12(sx, 0, bitmap.width - 1)];
 }
 function filterPixel(pixel, color) {
-  return channels5(pixel, color, (source, mask) => source * mask >>> 8);
+  return (pixel & 255) * (color & 255) >>> 8 | (pixel >>> 8 & 255) * (color >>> 8 & 255) >>> 8 << 8 | (pixel >>> 16 & 255) * (color >>> 16 & 255) >>> 8 << 16;
 }
 function blendTexerPixel(source, destination, mode, amount) {
   source &= 16777215;
@@ -6972,13 +7021,22 @@ function packRgbScanlines(pixels, width, height, output) {
   let source = 0;
   let target = 0;
   for (let y = 0; y < height; y++) {
-    output[target++] = 0;
+    output[target++] = 1;
     const end = source + width;
+    let priorR = 0;
+    let priorG = 0;
+    let priorB = 0;
     while (source < end) {
       const pixel = pixels[source++];
-      output[target++] = pixel >>> 16;
-      output[target++] = pixel >>> 8;
-      output[target++] = pixel;
+      const r = pixel >>> 16 & 255;
+      const g = pixel >>> 8 & 255;
+      const b = pixel & 255;
+      output[target++] = r - priorR;
+      output[target++] = g - priorG;
+      output[target++] = b - priorB;
+      priorR = r;
+      priorG = g;
+      priorB = b;
     }
   }
 }
@@ -6989,30 +7047,32 @@ async function encodeRgb24Png(scanlines, width, height) {
   if (typeof CompressionStream === "undefined") {
     throw new Error("This browser does not provide CompressionStream for lossless PNG export");
   }
-  const source = new Blob([scanlines.buffer]).stream();
-  const compressed = new Uint8Array(await new Response(
-    source.pipeThrough(new CompressionStream("deflate"))
-  ).arrayBuffer());
+  const compression = new CompressionStream("deflate");
+  const compressedResult = new Response(compression.readable).arrayBuffer();
+  const writer = compression.writable.getWriter();
+  await writer.write(scanlines);
+  await writer.close();
+  const compressed = new Uint8Array(await compressedResult);
   const ihdr = new Uint8Array(13);
   writeU32(ihdr, 0, width);
   writeU32(ihdr, 4, height);
   ihdr[8] = 8;
   ihdr[9] = 2;
-  const chunks = [
-    pngChunk("IHDR", ihdr),
-    pngChunk("sRGB", new Uint8Array([0])),
-    pngChunk("IDAT", compressed),
-    pngChunk("IEND", new Uint8Array(0))
-  ];
-  const length = PNG_SIGNATURE.length + chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const length = PNG_SIGNATURE.length + 12 + ihdr.length + 13 + 12 + compressed.length + 12;
   const png = new Uint8Array(length);
   png.set(PNG_SIGNATURE);
   let offset = PNG_SIGNATURE.length;
-  for (const chunk of chunks) {
-    png.set(chunk, offset);
-    offset += chunk.length;
-  }
+  offset = writeChunk(png, offset, "IHDR", ihdr);
+  offset = writeChunk(png, offset, "sRGB", SRGB_RENDERING_INTENT);
+  offset = writeChunk(png, offset, "IDAT", compressed);
+  writeChunk(png, offset, "IEND", EMPTY_BYTES);
   return png;
+}
+function choosePngEncodeSlots(width, height, hardwareConcurrency = 4, memoryBudgetBytes = 96 * 1024 * 1024) {
+  const scanlineBytes = rgbScanlineBytes(width, height);
+  const cpuSlots = Math.max(1, Math.min(4, Math.trunc(hardwareConcurrency) - 1 || 1));
+  const memorySlots = Math.max(1, Math.trunc(memoryBudgetBytes / (scanlineBytes * 3)));
+  return Math.min(cpuSlots, memorySlots);
 }
 function frameFileName(frame) {
   if (!Number.isSafeInteger(frame) || frame < 0 || frame > 999999) {
@@ -7027,13 +7087,15 @@ async function sha256Hex(bytes) {
   for (let i = 0; i < digest.length; i++) hex += digest[i].toString(16).padStart(2, "0");
   return hex;
 }
-function pngChunk(type, data) {
-  const chunk = new Uint8Array(12 + data.length);
-  writeU32(chunk, 0, data.length);
-  for (let i = 0; i < 4; i++) chunk[4 + i] = type.charCodeAt(i);
-  chunk.set(data, 8);
-  writeU32(chunk, 8 + data.length, crc32(chunk.subarray(4, 8 + data.length)));
-  return chunk;
+var EMPTY_BYTES = new Uint8Array(0);
+var SRGB_RENDERING_INTENT = new Uint8Array([0]);
+function writeChunk(output, offset, type, data) {
+  writeU32(output, offset, data.length);
+  for (let i = 0; i < 4; i++) output[offset + 4 + i] = type.charCodeAt(i);
+  output.set(data, offset + 8);
+  const crcInput = output.subarray(offset + 4, offset + 8 + data.length);
+  writeU32(output, offset + 8 + data.length, crc32(crcInput));
+  return offset + 12 + data.length;
 }
 function crc32(bytes) {
   let crc = 4294967295;
@@ -7064,7 +7126,6 @@ function assertRaster(width, height) {
 // src/offline-render.worker.ts
 var scope = globalThis;
 var AVS_SAMPLES = 576;
-var ENCODE_SLOTS = 2;
 var activeJobId = "";
 var cancelled = false;
 var paused = false;
@@ -7111,9 +7172,15 @@ async function run(message) {
   const right = new Float32Array(message.right, 0, message.totalSamples);
   const pcmLeft = new Float32Array(AVS_SAMPLES);
   const pcmRight = new Float32Array(AVS_SAMPLES);
-  const slots = Array.from({ length: ENCODE_SLOTS }, () => ({
+  const encodeSlots = choosePngEncodeSlots(
+    message.width,
+    message.height,
+    globalThis.navigator?.hardwareConcurrency ?? 4
+  );
+  const slots = Array.from({ length: encodeSlots }, () => ({
     scanlines: new Uint8Array(rgbScanlineBytes(message.width, message.height)),
-    pending: null
+    pending: null,
+    inFlight: false
   }));
   const artifacts = new Array(frameCount);
   const resolver = await loadBundledAvsBitmapResolver();
@@ -7142,7 +7209,6 @@ async function run(message) {
   const encodeAndWrite = async (slot, frame, sampleStart, sampleEnd) => {
     const started = performance.now();
     const png = await encodeRgb24Png(slot.scanlines, message.width, message.height);
-    const sha256 = await sha256Hex(png);
     if (cancelled) return;
     const name = frameFileName(frame);
     await refuseExistingFile(framesDirectory, name);
@@ -7153,8 +7219,19 @@ async function run(message) {
         await writable.abort();
         return;
       }
-      await writable.write(png.buffer);
+      const [sha256] = await Promise.all([
+        sha256Hex(png),
+        writable.write(png)
+      ]);
       await writable.close();
+      artifacts[frame] = {
+        frame,
+        path: `frames/${name}`,
+        sha256,
+        bytes: png.byteLength,
+        sampleStart,
+        sampleEnd
+      };
     } catch (error) {
       try {
         await writable.abort();
@@ -7162,14 +7239,6 @@ async function run(message) {
       }
       throw error;
     }
-    artifacts[frame] = {
-      frame,
-      path: `frames/${name}`,
-      sha256,
-      bytes: png.byteLength,
-      sampleStart,
-      sampleEnd
-    };
     writtenFrames++;
     encodeWriteMsTotal += performance.now() - started;
     const now = performance.now();
@@ -7227,7 +7296,10 @@ async function run(message) {
     }
     renderMsTotal += performance.now() - renderStarted;
     renderedFrames++;
-    slot.pending = encodeAndWrite(slot, frame, sampleStart, sampleEnd);
+    slot.inFlight = true;
+    slot.pending = encodeAndWrite(slot, frame, sampleStart, sampleEnd).finally(() => {
+      slot.inFlight = false;
+    });
     peakQueueDepth = Math.max(peakQueueDepth, pendingCount(slots));
   }
   await Promise.all(slots.map((slot) => slot.pending));
@@ -7325,7 +7397,7 @@ function releasePause() {
 }
 function pendingCount(slots) {
   let count = 0;
-  for (const slot of slots) if (slot.pending) count++;
+  for (const slot of slots) if (slot.inFlight) count++;
   return count;
 }
 async function assertDirectoryEmpty(directory) {

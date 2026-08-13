@@ -12751,66 +12751,114 @@ function blur(ctx, mode4, roundUp) {
     destination.set(source3);
     return;
   }
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const center = source3[y * width + x];
-      const left = x > 0 ? source3[y * width + x - 1] : 0;
-      const right = x + 1 < width ? source3[y * width + x + 1] : 0;
-      const up = y > 0 ? source3[(y - 1) * width + x] : 0;
-      const down = y + 1 < height ? source3[(y + 1) * width + x] : 0;
-      destination[y * width + x] = blurPixel(
-        mode4,
-        center,
-        left,
-        right,
-        up,
-        down,
-        x === 0,
-        x === width - 1,
-        y === 0,
-        y === height - 1,
-        roundUp
-      );
+  if (mode4 === 3) renderHeavyBlur(source3, destination, width, height, roundUp);
+  else if (mode4 === 2) renderLightBlur(source3, destination, width, height, roundUp);
+  else renderNormalBlur(source3, destination, width, height, roundUp);
+}
+var SHIFT_1_MASK = 8355711;
+var SHIFT_2_MASK = 4144959;
+var SHIFT_3_MASK = 2039583;
+var SHIFT_4_MASK = 986895;
+var ROUND_1 = 65793;
+var ROUND_2 = 131586;
+var ROUND_3 = 197379;
+var ROUND_4 = 263172;
+var ROUND_5 = 328965;
+function shr1(pixel) {
+  return pixel >>> 1 & SHIFT_1_MASK;
+}
+function shr2(pixel) {
+  return pixel >>> 2 & SHIFT_2_MASK;
+}
+function shr3(pixel) {
+  return pixel >>> 3 & SHIFT_3_MASK;
+}
+function shr4(pixel) {
+  return pixel >>> 4 & SHIFT_4_MASK;
+}
+function renderNormalBlur(source3, destination, width, height, roundUp) {
+  const cornerRound = roundUp ? ROUND_2 : 0;
+  const edgeRound = roundUp ? ROUND_3 : 0;
+  const centerRound = roundUp ? ROUND_4 : 0;
+  destination[0] = cornerRound + shr1(source3[0]) + shr2(source3[1]) + shr2(source3[width]);
+  for (let x = 1; x < width - 1; x++) {
+    destination[x] = edgeRound + shr2(source3[x]) + shr2(source3[x - 1]) + shr2(source3[x + 1]) + shr2(source3[width + x]);
+  }
+  destination[width - 1] = cornerRound + shr1(source3[width - 1]) + shr2(source3[width - 2]) + shr2(source3[width * 2 - 1]);
+  for (let y = 1; y < height - 1; y++) {
+    const row = y * width;
+    destination[row] = edgeRound + shr2(source3[row]) + shr2(source3[row + 1]) + shr2(source3[row - width]) + shr2(source3[row + width]);
+    for (let x = 1; x < width - 1; x++) {
+      const index = row + x;
+      destination[index] = centerRound + shr1(source3[index]) + shr3(source3[index - 1]) + shr3(source3[index + 1]) + shr3(source3[index - width]) + shr3(source3[index + width]);
     }
+    const right = row + width - 1;
+    destination[right] = edgeRound + shr2(source3[right]) + shr2(source3[right - 1]) + shr2(source3[right - width]) + shr2(source3[right + width]);
   }
+  const bottom = (height - 1) * width;
+  destination[bottom] = cornerRound + shr1(source3[bottom]) + shr2(source3[bottom + 1]) + shr2(source3[bottom - width]);
+  for (let x = 1; x < width - 1; x++) {
+    const index = bottom + x;
+    destination[index] = edgeRound + shr2(source3[index]) + shr2(source3[index - 1]) + shr2(source3[index + 1]) + shr2(source3[index - width]);
+  }
+  const final = source3.length - 1;
+  destination[final] = cornerRound + shr1(source3[final]) + shr2(source3[final - 1]) + shr2(source3[final - width]);
 }
-function blurPixel(mode4, center, left, right, up, down, atLeft, atRight, atTop, atBottom, roundUp) {
-  if (mode4 === 3) {
-    const horizontal = atLeft ? [[right, 1]] : atRight ? [[left, 1]] : [[left, 2], [right, 2]];
-    const vertical = atTop ? [[down, 1]] : atBottom ? [[up, 1]] : [[up, 2], [down, 2]];
-    const rounding = atLeft || atRight ? atTop || atBottom ? 1 : 2 : atTop || atBottom ? 2 : 3;
-    return shiftedSum([...horizontal, ...vertical], roundUp ? rounding : 0);
+function renderLightBlur(source3, destination, width, height, roundUp) {
+  const cornerRound = roundUp ? ROUND_3 : 0;
+  const edgeRound = roundUp ? ROUND_4 : 0;
+  const centerRound = roundUp ? ROUND_5 : 0;
+  destination[0] = cornerRound + shr1(source3[0]) + shr2(source3[0]) + shr3(source3[1]) + shr3(source3[width]);
+  for (let x = 1; x < width - 1; x++) {
+    destination[x] = edgeRound + shr1(source3[x]) + shr3(source3[x]) + shr3(source3[x - 1]) + shr3(source3[x + 1]) + shr3(source3[width + x]);
   }
-  if (mode4 === 2) {
-    const corner2 = (atLeft || atRight) && (atTop || atBottom);
-    const edge2 = atLeft || atRight || atTop || atBottom;
-    const terms2 = [[center, 1]];
-    if (corner2) {
-      terms2.push([center, 2], [atLeft ? right : left, 3], [atTop ? down : up, 3]);
-    } else if (edge2) {
-      terms2.push([center, 3]);
-      if (!atLeft && !atRight) terms2.push([left, 3], [right, 3], [atTop ? down : up, 3]);
-      else terms2.push([atLeft ? right : left, 3], [up, 3], [down, 3]);
-    } else terms2.push([center, 2], [left, 4], [right, 4], [up, 4], [down, 4]);
-    return shiftedSum(terms2, roundUp ? corner2 ? 3 : edge2 ? 4 : 5 : 0);
+  destination[width - 1] = cornerRound + shr1(source3[width - 1]) + shr2(source3[width - 1]) + shr3(source3[width - 2]) + shr3(source3[width * 2 - 1]);
+  for (let y = 1; y < height - 1; y++) {
+    const row = y * width;
+    destination[row] = edgeRound + shr1(source3[row]) + shr3(source3[row]) + shr3(source3[row + 1]) + shr3(source3[row - width]) + shr3(source3[row + width]);
+    for (let x = 1; x < width - 1; x++) {
+      const index = row + x;
+      destination[index] = centerRound + shr1(source3[index]) + shr2(source3[index]) + shr4(source3[index - 1]) + shr4(source3[index + 1]) + shr4(source3[index - width]) + shr4(source3[index + width]);
+    }
+    const right = row + width - 1;
+    destination[right] = edgeRound + shr1(source3[right]) + shr3(source3[right]) + shr3(source3[right - 1]) + shr3(source3[right - width]) + shr3(source3[right + width]);
   }
-  const corner = (atLeft || atRight) && (atTop || atBottom);
-  const edge = atLeft || atRight || atTop || atBottom;
-  let terms;
-  if (corner) terms = [[center, 1], [atLeft ? right : left, 2], [atTop ? down : up, 2]];
-  else if (edge && (atTop || atBottom)) terms = [[center, 2], [left, 2], [right, 2], [atTop ? down : up, 2]];
-  else if (edge) terms = [[center, 2], [atLeft ? right : left, 2], [up, 2], [down, 2]];
-  else terms = [[center, 1], [left, 3], [right, 3], [up, 3], [down, 3]];
-  return shiftedSum(terms, roundUp ? corner ? 2 : edge ? 3 : 4 : 0);
+  const bottom = (height - 1) * width;
+  destination[bottom] = cornerRound + shr1(source3[bottom]) + shr2(source3[bottom]) + shr3(source3[bottom + 1]) + shr3(source3[bottom - width]);
+  for (let x = 1; x < width - 1; x++) {
+    const index = bottom + x;
+    destination[index] = edgeRound + shr1(source3[index]) + shr3(source3[index]) + shr3(source3[index - 1]) + shr3(source3[index + 1]) + shr3(source3[index - width]);
+  }
+  const final = source3.length - 1;
+  destination[final] = cornerRound + shr1(source3[final]) + shr2(source3[final]) + shr3(source3[final - 1]) + shr3(source3[final - width]);
 }
-function shiftedSum(terms, rounding) {
-  let r = rounding, g = rounding, b = rounding;
-  for (const [pixel, shift] of terms) {
-    r += (pixel & 255) >>> shift;
-    g += (pixel >>> 8 & 255) >>> shift;
-    b += (pixel >>> 16 & 255) >>> shift;
+function renderHeavyBlur(source3, destination, width, height, roundUp) {
+  const cornerRound = roundUp ? ROUND_1 : 0;
+  const edgeRound = roundUp ? ROUND_2 : 0;
+  const centerRound = roundUp ? ROUND_3 : 0;
+  destination[0] = cornerRound + shr1(source3[1]) + shr1(source3[width]);
+  for (let x = 1; x < width - 1; x++) {
+    destination[x] = edgeRound + shr2(source3[x - 1]) + shr2(source3[x + 1]) + shr1(source3[width + x]);
   }
-  return r & 255 | (g & 255) << 8 | (b & 255) << 16;
+  destination[width - 1] = cornerRound + shr1(source3[width - 2]) + shr1(source3[width * 2 - 1]);
+  for (let y = 1; y < height - 1; y++) {
+    const row = y * width;
+    destination[row] = edgeRound + shr1(source3[row + 1]) + shr2(source3[row - width]) + shr2(source3[row + width]);
+    for (let x = 1; x < width - 1; x++) {
+      const index = row + x;
+      destination[index] = centerRound + shr2(source3[index - 1]) + shr2(source3[index + 1]) + shr2(source3[index - width]) + shr2(source3[index + width]);
+    }
+    const right = row + width - 1;
+    destination[right] = edgeRound + shr1(source3[right - 1]) + shr2(source3[right - width]) + shr2(source3[right + width]);
+  }
+  const bottom = (height - 1) * width;
+  destination[bottom] = cornerRound + shr1(source3[bottom + 1]) + shr1(source3[bottom - width]);
+  for (let x = 1; x < width - 1; x++) {
+    const index = bottom + x;
+    destination[index] = edgeRound + shr2(source3[index - 1]) + shr2(source3[index + 1]) + shr1(source3[index - width]);
+  }
+  const final = source3.length - 1;
+  destination[final] = cornerRound + shr1(source3[final - 1]) + shr1(source3[final - width]);
 }
 function blitIn(ctx, value, blend2, subpixel) {
   const { width, height } = ctx.input;
@@ -17045,17 +17093,18 @@ function sampleBilinearFixed(bitmap, fx, fy, flipX, flipY) {
   const y = clamp22(fy >> 16, 0, Math.max(0, bitmap.height - 2));
   const dx = fx >>> 8 & 255;
   const dy = fy >>> 8 & 255;
-  let result = 0;
-  for (let shift = 0; shift <= 16; shift += 8) {
-    const a = sampleBitmap(bitmap, x, y, flipX, flipY) >>> shift & 255;
-    const b = sampleBitmap(bitmap, x + 1, y, flipX, flipY) >>> shift & 255;
-    const c = sampleBitmap(bitmap, x, y + 1, flipX, flipY) >>> shift & 255;
-    const d = sampleBitmap(bitmap, x + 1, y + 1, flipX, flipY) >>> shift & 255;
-    const upper = (a * (255 - dx) >>> 8) + (b * dx >>> 8);
-    const lower = (c * (255 - dx) >>> 8) + (d * dx >>> 8);
-    result |= ((upper * (255 - dy) >>> 8) + (lower * dy >>> 8) & 255) << shift;
-  }
-  return result;
+  const a = sampleBitmap(bitmap, x, y, flipX, flipY);
+  const b = sampleBitmap(bitmap, x + 1, y, flipX, flipY);
+  const c = sampleBitmap(bitmap, x, y + 1, flipX, flipY);
+  const d = sampleBitmap(bitmap, x + 1, y + 1, flipX, flipY);
+  const inverseX = 255 - dx;
+  const inverseY = 255 - dy;
+  return interpolateByte(a, b, c, d, dx, dy, inverseX, inverseY) | interpolateByte(a >>> 8, b >>> 8, c >>> 8, d >>> 8, dx, dy, inverseX, inverseY) << 8 | interpolateByte(a >>> 16, b >>> 16, c >>> 16, d >>> 16, dx, dy, inverseX, inverseY) << 16;
+}
+function interpolateByte(a, b, c, d, dx, dy, inverseX, inverseY) {
+  const upper = ((a & 255) * inverseX >>> 8) + ((b & 255) * dx >>> 8);
+  const lower = ((c & 255) * inverseX >>> 8) + ((d & 255) * dx >>> 8);
+  return (upper * inverseY >>> 8) + (lower * dy >>> 8) & 255;
 }
 function sampleBitmap(bitmap, x, y, flipX, flipY) {
   const sx = flipX ? bitmap.width - x - 1 : x;
@@ -17063,7 +17112,7 @@ function sampleBitmap(bitmap, x, y, flipX, flipY) {
   return bitmap.pixels[clamp22(sy, 0, bitmap.height - 1) * bitmap.width + clamp22(sx, 0, bitmap.width - 1)];
 }
 function filterPixel(pixel, color) {
-  return channels5(pixel, color, (source3, mask) => source3 * mask >>> 8);
+  return (pixel & 255) * (color & 255) >>> 8 | (pixel >>> 8 & 255) * (color >>> 8 & 255) >>> 8 << 8 | (pixel >>> 16 & 255) * (color >>> 16 & 255) >>> 8 << 16;
 }
 function blendTexerPixel(source3, destination, mode4, amount) {
   source3 &= 16777215;
@@ -18044,6 +18093,10 @@ var AvsWorkerRenderer = class {
   unsupported = 0;
   lastRenderMs = 0;
   lastPresentMs = 0;
+  lastEffectMs = 0;
+  lastUploadMs = 0;
+  lastEncodeSubmitMs = 0;
+  presenter = "cpu-image-data";
   static supported() {
     return typeof Worker !== "undefined" && typeof OffscreenCanvas !== "undefined";
   }
@@ -18124,6 +18177,10 @@ var AvsWorkerRenderer = class {
       message.bitmap.close();
       this.lastPresentMs = performance.now() - started;
       this.lastRenderMs = message.renderMs;
+      this.lastEffectMs = message.effectMs ?? message.renderMs;
+      this.lastUploadMs = message.uploadMs ?? 0;
+      this.lastEncodeSubmitMs = message.encodeSubmitMs ?? 0;
+      this.presenter = message.presenter ?? "cpu-image-data";
       this.emaMs = this.emaMs === 0 ? message.renderMs : this.emaMs * 0.85 + message.renderMs * 0.15;
       this.unsupported = message.unsupported;
       this.onFrame?.();
@@ -21047,7 +21104,7 @@ function updateHud(t, bpm) {
     ],
     ["preset ", bold(avsActive ? `${avsPresetName} (AVS compatibility)` : preset.name), ` \xB7 ${avsActive ? "legacy ordered graph" : `${stack.length} layers`} \xB7 auto `, bold(director.enabled ? "on" : "off"), ` (${director.dynamic ? `${director.minBars}\u2013${director.maxBars}bar responsive` : `${director.every}bar`})`],
     ...avsActive ? [[
-      `AVS ${avsLastRenderMs.toFixed(1)}ms \xB7 ${avsWorkerRenderer?.active ? `worker \xB7 present ${avsWorkerRenderer.lastPresentMs.toFixed(2)}ms \xB7 full quality` : `fallback quality ${avsGovernor.qualityIndex + 1}/${AVS_QUALITY_TIERS.length}`} \xB7 unsupported records `,
+      `AVS ${avsLastRenderMs.toFixed(1)}ms \xB7 ${avsWorkerRenderer?.active ? `${avsWorkerRenderer.presenter} \xB7 present ${avsWorkerRenderer.lastPresentMs.toFixed(2)}ms \xB7 full quality` : `fallback quality ${avsGovernor.qualityIndex + 1}/${AVS_QUALITY_TIERS.length}`} \xB7 unsupported records `,
       bold(avsUnsupported)
     ]] : [],
     ["tempo ", bold(lock), ` \xB7 horizon ${timeline.horizonSec.toFixed(2)}s`],
@@ -21079,6 +21136,30 @@ function disposePage() {
 }
 window.addEventListener("pagehide", disposePage, { once: true });
 window.addEventListener("beforeunload", disposePage, { once: true });
+var avsCompatibilityDiagnostics = {
+  get workerRenderer() {
+    return avsWorkerRenderer;
+  },
+  get diagnostics() {
+    return avsWorkerRenderer ? {
+      active: avsWorkerRenderer.active,
+      presenter: avsWorkerRenderer.presenter,
+      renderMs: avsWorkerRenderer.lastRenderMs,
+      effectMs: avsWorkerRenderer.lastEffectMs,
+      uploadMs: avsWorkerRenderer.lastUploadMs,
+      encodeSubmitMs: avsWorkerRenderer.lastEncodeSubmitMs,
+      mainThreadPresentMs: avsWorkerRenderer.lastPresentMs
+    } : {
+      active: false,
+      presenter: "main-thread-cpu",
+      renderMs: avsLastRenderMs,
+      effectMs: avsLastRenderMs,
+      uploadMs: 0,
+      encodeSubmitMs: 0,
+      mainThreadPresentMs: 0
+    };
+  }
+};
 globalThis.__aaavs = {
   audio,
   tempo,
@@ -21093,7 +21174,8 @@ globalThis.__aaavs = {
   ui,
   offline,
   post,
-  gpu
+  gpu,
+  avsCompatibility: avsCompatibilityDiagnostics
 };
 function patchParams(type, patch) {
   let touched = false;
