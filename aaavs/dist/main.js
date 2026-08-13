@@ -11052,8 +11052,8 @@ function compileNode(node) {
       if (node.name === "$pi") return () => Math.PI;
       if (node.name === "$e") return () => Math.E;
       if (node.name === "$phi") return () => (1 + Math.sqrt(5)) * 0.5;
-      const reference = compileReference(node);
-      return (vm) => reference(vm).get();
+      const name = normalizeVariable(node.name);
+      return (vm) => vm.getVariable(name);
     }
     case "sequence": {
       const values = node.values.map(compileNode);
@@ -11087,46 +11087,24 @@ function compileNode(node) {
       return (vm) => truth(condition(vm)) ? yes(vm) : no(vm);
     }
     case "assign": {
+      if (node.target.kind === "variable") {
+        const name = normalizeVariable(node.target.name);
+        const value2 = compileNode(node.value);
+        return (vm) => {
+          const right = value2(vm);
+          const left = vm.getVariable(name);
+          const result = assignment(node.operator, left, right);
+          vm.setVariable(name, result);
+          return result;
+        };
+      }
       const target = compileReference(node.target);
       const value = compileNode(node.value);
       return (vm) => {
         const reference = target(vm);
         const right = value(vm);
         const left = reference.get();
-        let result;
-        switch (node.operator) {
-          case "=":
-            result = right;
-            break;
-          case "+=":
-            result = left + right;
-            break;
-          case "-=":
-            result = left - right;
-            break;
-          case "*=":
-            result = left * right;
-            break;
-          case "/=":
-            result = divide(left, right);
-            break;
-          case "%=":
-            result = modulo(left, right);
-            break;
-          case "|=":
-            result = integer(left) | integer(right);
-            break;
-          case "&=":
-            result = integer(left) & integer(right);
-            break;
-          case "^=":
-            result = integer(left) ^ integer(right);
-            break;
-          case "**=":
-            result = Math.pow(left, right);
-            break;
-        }
-        result = finite2(result);
+        const result = assignment(node.operator, left, right);
         reference.set(result);
         return result;
       };
@@ -11204,8 +11182,16 @@ function compileCall(name, nodes, span) {
   }
   if (name === "assign") {
     arity(name, nodes, 2, span);
-    const target = compileReference(nodes[0]);
     const value = compileNode(nodes[1]);
+    if (nodes[0].kind === "variable") {
+      const targetName = normalizeVariable(nodes[0].name);
+      return (vm) => {
+        const result = finite2(value(vm));
+        vm.setVariable(targetName, result);
+        return result;
+      };
+    }
+    const target = compileReference(nodes[0]);
     return (vm) => {
       const reference = target(vm);
       const result = finite2(value(vm));
@@ -11306,7 +11292,8 @@ function compileReference(node) {
     if (node.name === "$pi" || node.name === "$e" || node.name === "$phi") {
       throw new AvsEelCompileError(`Cannot assign to constant ${node.name}`, node.span);
     }
-    return (vm) => vm.variable(node.name);
+    const name = normalizeVariable(node.name);
+    return (vm) => vm.variable(name);
   }
   if (node.kind === "call" && (node.name === "megabuf" || node.name === "gmegabuf")) {
     arity(node.name, node.args, 1, node.span);
@@ -11348,6 +11335,47 @@ function divide(a, b) {
 }
 function modulo(a, b) {
   return Math.abs(b) < Number.EPSILON ? 0 : finite2(a % b);
+}
+function normalizeVariable(name) {
+  return name.toLowerCase().slice(0, 8);
+}
+function assignment(operator, left, right) {
+  let result;
+  switch (operator) {
+    case "=":
+      result = right;
+      break;
+    case "+=":
+      result = left + right;
+      break;
+    case "-=":
+      result = left - right;
+      break;
+    case "*=":
+      result = left * right;
+      break;
+    case "/=":
+      result = divide(left, right);
+      break;
+    case "%=":
+      result = modulo(left, right);
+      break;
+    case "|=":
+      result = integer(left) | integer(right);
+      break;
+    case "&=":
+      result = integer(left) & integer(right);
+      break;
+    case "^=":
+      result = integer(left) ^ integer(right);
+      break;
+    case "**=":
+      result = Math.pow(left, right);
+      break;
+    default:
+      result = 0;
+  }
+  return finite2(result);
 }
 
 // src/avs/eel/vm.ts
@@ -11396,6 +11424,7 @@ var AvsEelVm = class {
   maxLoopIterations;
   hostFunctions;
   randomState;
+  references = /* @__PURE__ */ new Map();
   constructor(options = {}) {
     this.global = options.global ?? new AvsEelGlobalState();
     this.hostFunctions = options.host ?? {};
@@ -11417,24 +11446,42 @@ var AvsEelVm = class {
   set(name, value) {
     this.variable(name).set(value);
   }
+  /** Fast path for compiler-normalized static identifiers. */
+  getVariable(name) {
+    const register = registerIndex(name);
+    return register < 0 ? this.variables.get(name) ?? 0 : this.global.registers[register] ?? 0;
+  }
+  /** Fast path for compiler-normalized static identifiers. */
+  setVariable(name, value) {
+    const next = clean(value);
+    const register = registerIndex(name);
+    if (register < 0) this.variables.set(name, next);
+    else this.global.registers[register] = next;
+  }
   variable(rawName) {
     const name = rawName.toLowerCase().slice(0, 8);
+    const cached = this.references.get(name);
+    if (cached) return cached;
     const match = /^reg(\d\d)$/.exec(name);
     if (match) {
       const index = Number(match[1]);
-      return {
+      const reference2 = {
         get: () => this.global.registers[index] ?? 0,
         set: (value) => {
           this.global.registers[index] = clean(value);
         }
       };
+      this.references.set(name, reference2);
+      return reference2;
     }
-    return {
+    const reference = {
       get: () => this.variables.get(name) ?? 0,
       set: (value) => {
         this.variables.set(name, clean(value));
       }
     };
+    this.references.set(name, reference);
+    return reference;
   }
   memory(global, rawIndex) {
     const memory2 = global ? this.global.memory : this.localMemory;
@@ -11470,6 +11517,12 @@ function memoryIndex(value) {
 }
 function clean(value) {
   return Number.isFinite(value) ? value : 0;
+}
+function registerIndex(name) {
+  if (name.length !== 5 || name.charCodeAt(0) !== 114 || name.charCodeAt(1) !== 101 || name.charCodeAt(2) !== 103) return -1;
+  const tens = name.charCodeAt(3) - 48;
+  const ones = name.charCodeAt(4) - 48;
+  return tens >= 0 && tens <= 9 && ones >= 0 && ones <= 9 ? tens * 10 + ones : -1;
 }
 
 // src/avs/framebuffer.ts
@@ -11526,15 +11579,69 @@ var AvsFramebuffer = class _AvsFramebuffer {
       this.assertShape(depth);
     }
     const alpha = clampByte(amount);
-    for (let i = 0; i < this.pixels.length; i++) {
-      if (mode4 === "every-other-line" && Math.floor(i / this.width) % 2 !== 0) continue;
-      if (mode4 === "every-other-pixel") {
-        const y = Math.floor(i / this.width);
-        const x = i - y * this.width;
-        if ((x & 1) !== (y & 1)) continue;
+    const destination = this.pixels;
+    const input = source3.pixels;
+    const length = destination.length;
+    if (mode4 === "every-other-line") {
+      const width = this.width;
+      for (let y = 0; y < this.height; y += 2) {
+        const end = (y + 1) * width;
+        for (let i = y * width; i < end; i++) destination[i] = input[i];
       }
-      const mix = mode4 === "buffer-depth" ? depthOf(depth.pixels[i], invertDepth) : alpha;
-      this.pixels[i] = blendPixel(source3.pixels[i], this.pixels[i], mode4, mix);
+      return;
+    }
+    if (mode4 === "every-other-pixel") {
+      const width = this.width;
+      for (let y = 0; y < this.height; y++) {
+        const end = (y + 1) * width;
+        for (let i = y * width + (y & 1); i < end; i += 2) destination[i] = input[i];
+      }
+      return;
+    }
+    if (mode4 === "buffer-depth") {
+      const depthPixels = depth.pixels;
+      for (let i = 0; i < length; i++) {
+        const depthPixel = depthPixels[i];
+        const low = depthPixel & 255;
+        const middle = depthPixel >>> 8 & 255;
+        const high = depthPixel >>> 16 & 255;
+        let mix = low > middle ? low : middle;
+        if (high > mix) mix = high;
+        if (invertDepth) mix = 255 - mix;
+        destination[i] = adjustablePixel(input[i], destination[i], mix);
+      }
+      return;
+    }
+    switch (mode4) {
+      case "average":
+        for (let i = 0; i < length; i++) {
+          destination[i] = (input[i] >>> 1 & 8355711) + (destination[i] >>> 1 & 8355711);
+        }
+        return;
+      case "maximum":
+        for (let i = 0; i < length; i++) destination[i] = maximumPixel(input[i], destination[i]);
+        return;
+      case "minimum":
+        for (let i = 0; i < length; i++) destination[i] = minimumPixel(input[i], destination[i]);
+        return;
+      case "additive":
+        for (let i = 0; i < length; i++) destination[i] = additivePixel(input[i], destination[i]);
+        return;
+      case "destination-minus-source":
+        for (let i = 0; i < length; i++) destination[i] = subtractPixel(destination[i], input[i]);
+        return;
+      case "source-minus-destination":
+        for (let i = 0; i < length; i++) destination[i] = subtractPixel(input[i], destination[i]);
+        return;
+      case "xor":
+        for (let i = 0; i < length; i++) destination[i] = (input[i] ^ destination[i]) & 16777215;
+        return;
+      case "adjustable":
+        for (let i = 0; i < length; i++) destination[i] = adjustablePixel(input[i], destination[i], alpha);
+        return;
+      case "multiply":
+        for (let i = 0; i < length; i++) destination[i] = multiplyPixel(input[i], destination[i]);
+        return;
     }
   }
   assertShape(other) {
@@ -11575,45 +11682,81 @@ function blendPixel(source3, destination, mode4, amount = 128) {
     case "average":
       return (source3 >>> 1 & 8355711) + (destination >>> 1 & 8355711);
     case "maximum":
-      return channels(source3, destination, Math.max);
+      return maximumPixel(source3, destination);
     case "minimum":
-      return channels(source3, destination, Math.min);
+      return minimumPixel(source3, destination);
     case "additive":
-      return channels(source3, destination, (a, b) => Math.min(255, a + b));
+      return additivePixel(source3, destination);
     case "destination-minus-source":
-      return channels(source3, destination, (a, b) => Math.max(0, b - a));
+      return subtractPixel(destination, source3);
     case "source-minus-destination":
-      return channels(source3, destination, (a, b) => Math.max(0, a - b));
+      return subtractPixel(source3, destination);
     case "xor":
       return (source3 ^ destination) & 16777215;
     case "adjustable":
     case "buffer-depth": {
       const a = clampByte(amount);
-      return channels(source3, destination, (s, d) => table(s, a) + table(d, 255 - a));
+      return adjustablePixel(source3, destination, a);
     }
     case "multiply":
-      return channels(source3, destination, table);
+      return multiplyPixel(source3, destination);
     // Selection for these modes is performed by blendFrom because it needs x/y.
     case "every-other-line":
     case "every-other-pixel":
       return source3;
   }
 }
-function channels(a, b, fn) {
-  const c0 = fn(a & 255, b & 255) & 255;
-  const c1 = fn(a >>> 8 & 255, b >>> 8 & 255) & 255;
-  const c2 = fn(a >>> 16 & 255, b >>> 16 & 255) & 255;
+function maximumPixel(a, b) {
+  const a0 = a & 255;
+  const b0 = b & 255;
+  const a1 = a >>> 8 & 255;
+  const b1 = b >>> 8 & 255;
+  const a2 = a >>> 16 & 255;
+  const b2 = b >>> 16 & 255;
+  return (a0 > b0 ? a0 : b0) | (a1 > b1 ? a1 : b1) << 8 | (a2 > b2 ? a2 : b2) << 16;
+}
+function minimumPixel(a, b) {
+  const a0 = a & 255;
+  const b0 = b & 255;
+  const a1 = a >>> 8 & 255;
+  const b1 = b >>> 8 & 255;
+  const a2 = a >>> 16 & 255;
+  const b2 = b >>> 16 & 255;
+  return (a0 < b0 ? a0 : b0) | (a1 < b1 ? a1 : b1) << 8 | (a2 < b2 ? a2 : b2) << 16;
+}
+function additivePixel(a, b) {
+  let c0 = (a & 255) + (b & 255);
+  let c1 = (a >>> 8 & 255) + (b >>> 8 & 255);
+  let c2 = (a >>> 16 & 255) + (b >>> 16 & 255);
+  if (c0 > 255) c0 = 255;
+  if (c1 > 255) c1 = 255;
+  if (c2 > 255) c2 = 255;
   return c0 | c1 << 8 | c2 << 16;
+}
+function subtractPixel(a, b) {
+  let c0 = (a & 255) - (b & 255);
+  let c1 = (a >>> 8 & 255) - (b >>> 8 & 255);
+  let c2 = (a >>> 16 & 255) - (b >>> 16 & 255);
+  if (c0 < 0) c0 = 0;
+  if (c1 < 0) c1 = 0;
+  if (c2 < 0) c2 = 0;
+  return c0 | c1 << 8 | c2 << 16;
+}
+function adjustablePixel(source3, destination, amount) {
+  const inverse = 255 - amount;
+  const c0 = table(source3 & 255, amount) + table(destination & 255, inverse);
+  const c1 = table(source3 >>> 8 & 255, amount) + table(destination >>> 8 & 255, inverse);
+  const c2 = table(source3 >>> 16 & 255, amount) + table(destination >>> 16 & 255, inverse);
+  return c0 | c1 << 8 | c2 << 16;
+}
+function multiplyPixel(a, b) {
+  return table(a & 255, b & 255) | table(a >>> 8 & 255, b >>> 8 & 255) << 8 | table(a >>> 16 & 255, b >>> 16 & 255) << 16;
 }
 function table(x, y) {
   return Math.trunc(x / 255 * y);
 }
 function clampByte(value) {
   return value < 0 ? 0 : value > 255 ? 255 : Math.trunc(value);
-}
-function depthOf(pixel, invert) {
-  const depth = Math.max(pixel & 255, pixel >>> 8 & 255, pixel >>> 16 & 255);
-  return invert ? 255 - depth : depth;
 }
 
 // src/avs/executor.ts
@@ -12654,89 +12797,130 @@ function decodeAvsConvolutionConfig(payload) {
   };
 }
 function registerAvsConvolutionFilter(registry = new AvsEffectRegistry()) {
+  const states = /* @__PURE__ */ new Map();
   registry.registerApe(AVS_CONVOLUTION_APE_ID, (context) => {
-    const config = decodeAvsConvolutionConfig(context.component.payload);
-    if (!config.enabled || context.input.width === 0 || context.input.height === 0) return;
-    return renderConvolution(context, config);
+    let state = states.get(context.component.path);
+    if (!state) {
+      state = prepareConvolution(decodeAvsConvolutionConfig(context.component.payload));
+      states.set(context.component.path, state);
+    }
+    if (!state.config.enabled || context.input.width === 0 || context.input.height === 0) return;
+    return renderConvolution(context, state);
   });
   return registry;
 }
-function renderConvolution(context, config) {
-  const firstNonzero = [...config.kernel, config.bias].findIndex((value) => value !== 0);
-  const swap = firstNonzero >= 0 && firstNonzero < 24;
+function prepareConvolution(config) {
+  let firstNonzero = -1;
+  const sign = config.scale < 0 ? -1 : 1;
+  const taps = [];
+  const rotatedTaps = [];
+  for (let index = 0; index < KERNEL_CELLS; index++) {
+    const raw = config.kernel[index];
+    if (raw === 0) continue;
+    if (firstNonzero < 0) firstNonzero = index;
+    const coefficient = Math.imul(raw, sign);
+    const dx = index % 7 - 3;
+    const dy = Math.floor(index / 7) - 3;
+    taps.push({ dx, dy, coefficient });
+    rotatedTaps.push({ dx: -dy, dy: dx, coefficient });
+  }
+  if (firstNonzero < 0 && config.bias !== 0) firstNonzero = KERNEL_CELLS;
+  const sums = coefficientSums(config.kernel, config.bias);
+  const bias = Math.imul(config.bias, sign);
+  return {
+    config,
+    taps,
+    rotatedTaps,
+    bias,
+    biasProduct: Math.imul(Math.abs(bias) & 65535, 256) & 65535,
+    divisor: Math.abs(config.scale) || 1,
+    hasNegative: bias < 0 || taps.some((tap) => tap.coefficient < 0),
+    saturatePositive: sums.saturatePositive,
+    saturateNegative: sums.saturateNegative,
+    swap: firstNonzero >= 0 && firstNonzero < 24
+  };
+}
+function renderConvolution(context, state) {
+  const { config } = state;
+  const swap = state.swap;
   const source3 = context.input.pixels;
   const target = swap ? context.output.pixels : source3;
   const width = context.input.width;
   const height = context.input.height;
-  const divisor = Math.abs(config.scale) || 1;
-  const sign = config.scale < 0 ? -1 : 1;
-  const kernel = config.kernel.map((value) => Math.imul(value, sign));
-  const bias = Math.imul(config.bias, sign);
-  const sums = coefficientSums(config.kernel, config.bias);
+  const first = new Uint16Array(4);
+  const second = new Uint16Array(4);
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
-      const words = convolvePass(source3, width, height, x, y, kernel, bias, sums, false, config);
+      convolvePass(source3, width, height, x, y, state.taps, state, first);
       if (config.twoPass) {
-        const second = convolvePass(source3, width, height, x, y, kernel, bias, sums, true, config);
+        convolvePass(source3, width, height, x, y, state.rotatedTaps, state, second);
         for (let channel = 0; channel < 4; channel++) {
-          words[channel] = Math.min(65535, words[channel] + second[channel]);
+          first[channel] = Math.min(65535, first[channel] + second[channel]);
         }
       }
-      let pixel = 0;
-      for (let channel = 0; channel < 4; channel++) {
-        pixel |= packByte(scaleWord(words[channel], divisor)) << channel * 8;
-      }
-      target[y * width + x] = pixel >>> 0;
+      target[y * width + x] = (packByte(scaleWord(first[0], state.divisor)) | packByte(scaleWord(first[1], state.divisor)) << 8 | packByte(scaleWord(first[2], state.divisor)) << 16 | packByte(scaleWord(first[3], state.divisor)) << 24) >>> 0;
     }
   }
   return swap ? { swap: true } : void 0;
 }
 function coefficientSums(kernel, bias) {
-  let positive = 0;
+  let positive2 = 0;
   let negative = 0;
   for (const coefficient of [...kernel, bias]) {
-    if (coefficient > 0) positive = positive + coefficient >>> 0;
+    if (coefficient > 0) positive2 = positive2 + coefficient >>> 0;
     else if (coefficient < 0) negative = negative + (-coefficient >>> 0) >>> 0;
   }
-  return { saturatePositive: positive >= 256, saturateNegative: negative >= 256 };
+  return { saturatePositive: positive2 >= 256, saturateNegative: negative >= 256 };
 }
-function convolvePass(source3, width, height, x, y, kernel, bias, sums, rotate, config) {
-  const channels7 = [0, 0, 0, 0];
-  const hasNegative = bias < 0 || kernel.some((coefficient) => coefficient < 0);
-  for (let shift = 0; shift <= 24; shift += 8) {
-    let positive = 0;
-    let negative = 0;
-    for (let index = 0; index < KERNEL_CELLS; index++) {
-      const coefficient = kernel[index];
-      if (coefficient === 0) continue;
-      const kx = index % 7 - 3;
-      const ky = Math.floor(index / 7) - 3;
-      const dx = rotate ? -ky : kx;
-      const dy = rotate ? kx : ky;
-      const sx = clamp14(x + dx, 0, width - 1);
-      const sy = clamp14(y + dy, 0, height - 1);
-      const sample2 = source3[sy * width + sx] >>> shift & 255;
-      const product = Math.imul(sample2, Math.abs(coefficient) & 65535) & 65535;
-      if (coefficient > 0) positive = addWord(positive, product, sums.saturatePositive);
-      else negative = addWord(negative, product, sums.saturateNegative);
-    }
-    const biasProduct = Math.imul(Math.abs(bias) & 65535, 256) & 65535;
-    if (bias > 0) positive = Math.min(65535, positive + biasProduct);
-    else if (bias < 0) negative = Math.min(65535, negative + biasProduct);
-    let value;
-    if (!hasNegative) {
-      value = positive;
-    } else if (config.absolute) {
-      const difference = clamp14(signed16(positive) - signed16(negative), -32768, 32767) & 65535;
-      value = difference & 32767;
-    } else if (config.wrap) {
-      value = positive - negative & 65535;
+function convolvePass(source3, width, height, x, y, taps, state, output) {
+  let p0 = 0;
+  let p1 = 0;
+  let p2 = 0;
+  let p3 = 0;
+  let n0 = 0;
+  let n1 = 0;
+  let n2 = 0;
+  let n3 = 0;
+  for (const tap of taps) {
+    const sx = clamp14(x + tap.dx, 0, width - 1);
+    const sy = clamp14(y + tap.dy, 0, height - 1);
+    const pixel = source3[sy * width + sx];
+    const magnitude = Math.abs(tap.coefficient) & 65535;
+    if (tap.coefficient > 0) {
+      p0 = addWord(p0, Math.imul(pixel & 255, magnitude) & 65535, state.saturatePositive);
+      p1 = addWord(p1, Math.imul(pixel >>> 8 & 255, magnitude) & 65535, state.saturatePositive);
+      p2 = addWord(p2, Math.imul(pixel >>> 16 & 255, magnitude) & 65535, state.saturatePositive);
+      p3 = addWord(p3, Math.imul(pixel >>> 24, magnitude) & 65535, state.saturatePositive);
     } else {
-      value = Math.max(0, positive - negative);
+      n0 = addWord(n0, Math.imul(pixel & 255, magnitude) & 65535, state.saturateNegative);
+      n1 = addWord(n1, Math.imul(pixel >>> 8 & 255, magnitude) & 65535, state.saturateNegative);
+      n2 = addWord(n2, Math.imul(pixel >>> 16 & 255, magnitude) & 65535, state.saturateNegative);
+      n3 = addWord(n3, Math.imul(pixel >>> 24, magnitude) & 65535, state.saturateNegative);
     }
-    channels7[shift >>> 3] = value;
   }
-  return channels7;
+  if (state.bias > 0) {
+    p0 = Math.min(65535, p0 + state.biasProduct);
+    p1 = Math.min(65535, p1 + state.biasProduct);
+    p2 = Math.min(65535, p2 + state.biasProduct);
+    p3 = Math.min(65535, p3 + state.biasProduct);
+  } else if (state.bias < 0) {
+    n0 = Math.min(65535, n0 + state.biasProduct);
+    n1 = Math.min(65535, n1 + state.biasProduct);
+    n2 = Math.min(65535, n2 + state.biasProduct);
+    n3 = Math.min(65535, n3 + state.biasProduct);
+  }
+  output[0] = combineWords(p0, n0, state);
+  output[1] = combineWords(p1, n1, state);
+  output[2] = combineWords(p2, n2, state);
+  output[3] = combineWords(p3, n3, state);
+}
+function combineWords(positive2, negative, state) {
+  if (!state.hasNegative) return positive2;
+  if (state.config.absolute) {
+    return clamp14(signed16(positive2) - signed16(negative), -32768, 32767) & 65535 & 32767;
+  }
+  if (state.config.wrap) return positive2 - negative & 65535;
+  return positive2 > negative ? positive2 - negative : 0;
 }
 function scaleWord(value, divisor) {
   if (divisor <= 1) return value & 65535;
@@ -13523,8 +13707,8 @@ function shadeBump(context, depthPixels, config, currentDepth, lightX, lightY) {
       const above = depthPixels[index - width];
       const below = depthPixels[index + width];
       if (currentDepthBuffer && !(left || right || above || below)) continue;
-      let horizontal = depthOf2(right, config.invertDepth) - depthOf2(left, config.invertDepth) - (x - lightX);
-      let vertical = depthOf2(below, config.invertDepth) - depthOf2(above, config.invertDepth) - relativeY;
+      let horizontal = depthOf(right, config.invertDepth) - depthOf(left, config.invertDepth) - (x - lightX);
+      let vertical = depthOf(below, config.invertDepth) - depthOf(above, config.invertDepth) - relativeY;
       horizontal = 127 - Math.abs(horizontal);
       vertical = 127 - Math.abs(vertical);
       const original = source3[index];
@@ -13533,7 +13717,7 @@ function shadeBump(context, depthPixels, config, currentDepth, lightX, lightY) {
     }
   }
 }
-function depthOf2(pixel, invert) {
+function depthOf(pixel, invert) {
   const depth = Math.max(pixel & 255, pixel >>> 8 & 255, pixel >>> 16 & 255);
   return invert ? 255 - depth : depth;
 }
@@ -13623,10 +13807,11 @@ function registerAvsDynamicMovement(registry) {
   const states = /* @__PURE__ */ new Map();
   registry.registerBuiltin(43, (context) => {
     let state = states.get(context.component.path);
-    const config = decodeAvsDynamicMovement(context.component.payload);
     if (!state) {
+      const config = decodeAvsDynamicMovement(context.component.payload);
       const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath6(context.component.path) });
       state = {
+        config,
         vm,
         programs: [
           compileOrNull3(config.point),
@@ -13634,12 +13819,15 @@ function registerAvsDynamicMovement(registry) {
           compileOrNull3(config.beat),
           compileOrNull3(config.init)
         ],
+        gridX: new Float64Array(0),
+        gridY: new Float64Array(0),
+        gridAlpha: new Float64Array(0),
         initialized: false
       };
       states.set(context.component.path, state);
     }
     if (context.preinit) return;
-    return renderDynamicMovement(context, config, state);
+    return renderDynamicMovement(context, state.config, state);
   });
   return registry;
 }
@@ -13663,7 +13851,15 @@ function renderDynamicMovement(context, config, state) {
   if (context.beat) execute3(state.programs[2], vm);
   const columns = clamp16(Math.trunc(config.gridWidth) + 1, 2, 256);
   const rows = clamp16(Math.trunc(config.gridHeight) + 1, 2, 256);
-  const grid2 = new Array(columns * rows);
+  const gridSize = columns * rows;
+  if (state.gridX.length !== gridSize) {
+    state.gridX = new Float64Array(gridSize);
+    state.gridY = new Float64Array(gridSize);
+    state.gridAlpha = new Float64Array(gridSize);
+  }
+  const gridX = state.gridX;
+  const gridY = state.gridY;
+  const gridAlpha = state.gridAlpha;
   const width = context.input.width;
   const height = context.input.height;
   const radius = Math.sqrt(width * width + height * height) * 0.5;
@@ -13689,7 +13885,10 @@ function renderDynamicMovement(context, config, state) {
         x = width * 0.5 + Math.cos(angle) * distance;
         y = height * 0.5 + Math.sin(angle) * distance;
       }
-      grid2[gx + gy * columns] = { x, y, alpha: clamp16(vm.get("alpha"), 0, 1) };
+      const index = gx + gy * columns;
+      gridX[index] = x;
+      gridY[index] = y;
+      gridAlpha[index] = clamp16(vm.get("alpha"), 0, 1);
     }
   }
   for (let y = 0; y < height; y++) {
@@ -13700,17 +13899,17 @@ function renderDynamicMovement(context, config, state) {
       const px = x * (columns - 1) / width;
       const cellX = Math.min(columns - 2, Math.trunc(px));
       const fx = px - cellX;
-      const topLeft = grid2[cellX + cellY * columns];
-      const topRight = grid2[cellX + 1 + cellY * columns];
-      const bottomLeft = grid2[cellX + (cellY + 1) * columns];
-      const bottomRight = grid2[cellX + 1 + (cellY + 1) * columns];
-      const mappedX = bilerp(topLeft.x, topRight.x, bottomLeft.x, bottomRight.x, fx, fy);
-      const mappedY = bilerp(topLeft.y, topRight.y, bottomLeft.y, bottomRight.y, fx, fy);
+      const topLeft = cellX + cellY * columns;
+      const topRight = topLeft + 1;
+      const bottomLeft = topLeft + columns;
+      const bottomRight = bottomLeft + 1;
+      const mappedX = bilerp(gridX[topLeft], gridX[topRight], gridX[bottomLeft], gridX[bottomRight], fx, fy);
+      const mappedY = bilerp(gridY[topLeft], gridY[topRight], gridY[bottomLeft], gridY[bottomRight], fx, fy);
       const alpha = Math.trunc(clamp16(bilerp(
-        topLeft.alpha,
-        topRight.alpha,
-        bottomLeft.alpha,
-        bottomRight.alpha,
+        gridAlpha[topLeft],
+        gridAlpha[topRight],
+        gridAlpha[bottomLeft],
+        gridAlpha[bottomRight],
         fx,
         fy
       ), 0, 1) * 255);
@@ -13745,15 +13944,21 @@ function sample(pixels, width, height, rawX, rawY, wrap2, bilinear3) {
   if (!bilinear3 || width < 2 || height < 2) return pixels[ix + iy * width];
   const fx = Math.trunc((x - ix) * 256) & 255;
   const fy = Math.trunc((y - iy) * 256) & 255;
-  const weights = [table3(255 - fx, 255 - fy), table3(fx, 255 - fy), table3(255 - fx, fy), table3(fx, fy)];
-  const points = [pixels[ix + iy * width], pixels[ix + 1 + iy * width], pixels[ix + (iy + 1) * width], pixels[ix + 1 + (iy + 1) * width]];
-  let result = 0;
-  for (let shift = 0; shift <= 16; shift += 8) {
-    let value = 0;
-    for (let i = 0; i < 4; i++) value += table3(points[i] >>> shift & 255, weights[i]);
-    result |= (value & 255) << shift;
-  }
-  return result;
+  const inverseX = 255 - fx;
+  const inverseY = 255 - fy;
+  const w0 = table3(inverseX, inverseY);
+  const w1 = table3(fx, inverseY);
+  const w2 = table3(inverseX, fy);
+  const w3 = table3(fx, fy);
+  const offset = ix + iy * width;
+  const p0 = pixels[offset];
+  const p1 = pixels[offset + 1];
+  const p2 = pixels[offset + width];
+  const p3 = pixels[offset + width + 1];
+  const low = table3(p0 & 255, w0) + table3(p1 & 255, w1) + table3(p2 & 255, w2) + table3(p3 & 255, w3);
+  const middle = table3(p0 >>> 8 & 255, w0) + table3(p1 >>> 8 & 255, w1) + table3(p2 >>> 8 & 255, w2) + table3(p3 >>> 8 & 255, w3);
+  const high = table3(p0 >>> 16 & 255, w0) + table3(p1 >>> 16 & 255, w1) + table3(p2 >>> 16 & 255, w2) + table3(p3 >>> 16 & 255, w3);
+  return low & 255 | (middle & 255) << 8 | (high & 255) << 16;
 }
 function readString2(payload, offset) {
   if (offset + 4 > payload.length) return { value: "", next: payload.length };
@@ -13902,7 +14107,7 @@ function bilinear2(context, s, t) {
   const pixels = context.input.pixels, base2 = x + y * width;
   const weights = [table4(255 - fx, 255 - fy), table4(fx, 255 - fy), table4(255 - fx, fy), table4(fx, fy)];
   const samples = [pixels[base2], pixels[base2 + 1], pixels[base2 + width], pixels[base2 + width + 1]];
-  return channels3(samples, weights);
+  return channels(samples, weights);
 }
 function interference(context, points, alpha, rgb2) {
   const width = context.input.width, height = context.input.height;
@@ -14009,7 +14214,7 @@ function multiplyMatrices(destination, source3) {
 function applyMatrix(m, x, y, z) {
   return [x * m[0] + y * m[1] + z * m[2] + m[3], x * m[4] + y * m[5] + z * m[6] + m[7], x * m[8] + y * m[9] + z * m[10] + m[11]];
 }
-function channels3(samples, weights) {
+function channels(samples, weights) {
   let out = 0;
   for (let channel = 0; channel < 3; channel++) {
     let value = 0;
@@ -14369,26 +14574,27 @@ function renderForward(context, table7, blend2) {
   else output.fill(0);
   for (let i = 0; i < source3.length; i++) {
     const destination = table7.offsets[i];
-    output[destination] = maximumPixel(source3[i], output[destination]);
+    output[destination] = maximumPixel2(source3[i], output[destination]);
   }
   if (blend2) {
     for (let i = 0; i < output.length; i++) output[i] = averagePixel3(output[i], source3[i]);
   }
 }
 function sampleBilinear(source3, offset, width, xp, yp) {
-  const weights = [
-    table5(255 - xp, 255 - yp),
-    table5(xp, 255 - yp),
-    table5(255 - xp, yp),
-    table5(xp, yp)
-  ];
-  const pixels = [source3[offset], source3[offset + 1], source3[offset + width], source3[offset + width + 1]];
-  const channel = (shift) => {
-    let value = 0;
-    for (let i = 0; i < 4; i++) value += table5(pixels[i] >>> shift & 255, weights[i]);
-    return value & 255;
-  };
-  return channel(0) | channel(8) << 8 | channel(16) << 16;
+  const inverseX = 255 - xp;
+  const inverseY = 255 - yp;
+  const w0 = table5(inverseX, inverseY);
+  const w1 = table5(xp, inverseY);
+  const w2 = table5(inverseX, yp);
+  const w3 = table5(xp, yp);
+  const p0 = source3[offset];
+  const p1 = source3[offset + 1];
+  const p2 = source3[offset + width];
+  const p3 = source3[offset + width + 1];
+  const low = table5(p0 & 255, w0) + table5(p1 & 255, w1) + table5(p2 & 255, w2) + table5(p3 & 255, w3);
+  const middle = table5(p0 >>> 8 & 255, w0) + table5(p1 >>> 8 & 255, w1) + table5(p2 >>> 8 & 255, w2) + table5(p3 >>> 8 & 255, w3);
+  const high = table5(p0 >>> 16 & 255, w0) + table5(p1 >>> 16 & 255, w1) + table5(p2 >>> 16 & 255, w2) + table5(p3 >>> 16 & 255, w3);
+  return low & 255 | (middle & 255) << 8 | (high & 255) << 16;
 }
 function fillIdentity(table7, width, height) {
   for (let i = 0; i < width * height; i++) table7.offsets[i] = i;
@@ -14396,7 +14602,7 @@ function fillIdentity(table7, width, height) {
 function averagePixel3(a, b) {
   return (a >>> 1 & 8355711) + (b >>> 1 & 8355711) & 16777215;
 }
-function maximumPixel(a, b) {
+function maximumPixel2(a, b) {
   return Math.max(a & 255, b & 255) | Math.max(a >>> 8 & 255, b >>> 8 & 255) << 8 | Math.max(a >>> 16 & 255, b >>> 16 & 255) << 16;
 }
 function nextRandom3(state) {
@@ -14866,14 +15072,14 @@ function multiplyColors(context, mode4) {
     const pixel = pixels[i];
     if (mode4 <= 3) {
       const factor = 1 << 4 - mode4;
-      pixels[i] = channels5(pixel, (value) => Math.min(255, value * factor));
+      pixels[i] = channels3(pixel, (value) => Math.min(255, value * factor));
     } else {
       const shift = mode4 - 3;
-      pixels[i] = channels5(pixel, (value) => value >>> shift);
+      pixels[i] = channels3(pixel, (value) => value >>> shift);
     }
   }
 }
-function channels5(pixel, fn) {
+function channels3(pixel, fn) {
   const blue = fn(pixel & 255);
   const green = fn(pixel >>> 8 & 255);
   const red = fn(pixel >>> 16 & 255);
@@ -15329,6 +15535,7 @@ function registerAvsSuperScope(registry, global = registry.eelGlobal) {
       const vm = new AvsEelVm({ global, seed: hashPath11(context.component.path) });
       vm.set("n", 100);
       state = {
+        config,
         vm,
         programs: [
           compileOrNull4(config.point),
@@ -15337,12 +15544,13 @@ function registerAvsSuperScope(registry, global = registry.eelGlobal) {
           compileOrNull4(config.init)
         ],
         initialized: false,
-        colorPosition: 0
+        colorPosition: 0,
+        centeredAudio: new Uint8Array(576)
       };
       states.set(context.component.path, state);
     }
     if (context.preinit) return;
-    renderSuperScope(context, decodeAvsSuperScope(context.component.payload), state);
+    renderSuperScope(context, state.config, state);
   });
   return registry;
 }
@@ -15374,7 +15582,7 @@ function renderSuperScope(context, config, state) {
   if (!state.programs[0]) return;
   const count = Math.min(MAX_POINTS, Math.trunc(vm.get("n")));
   if (count <= 0) return;
-  const data = scopeChannel(context, config.channel);
+  const data = scopeChannel(context, config.channel, state.centeredAudio);
   const xor = (config.channel & 4) !== 0 ? 0 : 128;
   let canDraw = false;
   let lastX = 0;
@@ -15404,11 +15612,10 @@ function renderSuperScope(context, config, state) {
     lastY = y;
   }
 }
-function scopeChannel(context, selection) {
+function scopeChannel(context, selection, centered) {
   const source3 = (selection & 4) !== 0 ? context.audio.spectrum : context.audio.waveform;
   const channel = selection & 3;
   if (channel < 2) return source3[channel];
-  const centered = new Uint8Array(576);
   for (let i = 0; i < centered.length; i++) {
     centered[i] = Math.trunc(signed3(source3[0][i]) / 2) + Math.trunc(signed3(source3[1][i]) / 2) & 255;
   }
@@ -16158,37 +16365,37 @@ function sampleBitmap(bitmap, x, y, flipX, flipY) {
   return bitmap.pixels[clamp22(sy, 0, bitmap.height - 1) * bitmap.width + clamp22(sx, 0, bitmap.width - 1)];
 }
 function filterPixel(pixel, color) {
-  return channels6(pixel, color, (source3, mask) => source3 * mask >>> 8);
+  return channels5(pixel, color, (source3, mask) => source3 * mask >>> 8);
 }
 function blendTexerPixel(source3, destination, mode4, amount) {
   source3 &= 16777215;
   destination &= 16777215;
   switch (mode4) {
     case 1:
-      return channels6(source3, destination, (s, d) => Math.min(255, s + d));
+      return channels5(source3, destination, (s, d) => Math.min(255, s + d));
     case 2:
-      return channels6(source3, destination, Math.max);
+      return channels5(source3, destination, Math.max);
     case 3:
       return (source3 >>> 1 & 8355711) + (destination >>> 1 & 8355711);
     case 4:
-      return channels6(source3, destination, (s, d) => Math.max(0, d - s));
+      return channels5(source3, destination, (s, d) => Math.max(0, d - s));
     case 5:
-      return channels6(source3, destination, (s, d) => Math.max(0, s - d));
+      return channels5(source3, destination, (s, d) => Math.max(0, s - d));
     case 6:
-      return channels6(source3, destination, (s, d) => s * d >>> 8);
+      return channels5(source3, destination, (s, d) => s * d >>> 8);
     case 7: {
       const alpha = clamp22(amount, 0, 255);
-      return channels6(source3, destination, (s, d) => (s * alpha >>> 8) + (d * (256 - alpha) >>> 8));
+      return channels5(source3, destination, (s, d) => (s * alpha >>> 8) + (d * (256 - alpha) >>> 8));
     }
     case 8:
       return (source3 ^ destination) & 16777215;
     case 9:
-      return channels6(source3, destination, Math.min);
+      return channels5(source3, destination, Math.min);
     default:
       return source3;
   }
 }
-function channels6(a, b, fn) {
+function channels5(a, b, fn) {
   return fn(a & 255, b & 255) & 255 | (fn(a >>> 8 & 255, b >>> 8 & 255) & 255) << 8 | (fn(a >>> 16 & 255, b >>> 16 & 255) & 255) << 16;
 }
 function resolveTexer2Bitmap(name, options) {
@@ -16945,6 +17152,155 @@ async function fetchBundledAvsPreset(preset2) {
   return new Uint8Array(await response.arrayBuffer());
 }
 
+// src/avs-presentation.ts
+var AVS_QUALITY_TIERS = [
+  { scale: 1, fps: 30 },
+  { scale: 0.8, fps: 30 },
+  { scale: 0.67, fps: 24 },
+  { scale: 0.5, fps: 20 }
+];
+var AvsFrameGovernor = class {
+  tiers;
+  downgradeSamples;
+  upgradeSamples;
+  overloadRatio;
+  headroomRatio;
+  maxPixels;
+  maxEdge;
+  initialTier;
+  nextRenderMs = null;
+  overloadCount = 0;
+  headroomCount = 0;
+  emaMs = 0;
+  samples = 0;
+  tierIndex;
+  constructor(options = {}) {
+    this.tiers = options.tiers ?? AVS_QUALITY_TIERS;
+    if (this.tiers.length === 0) throw new RangeError("AVS quality tiers cannot be empty");
+    for (const tier of this.tiers) {
+      if (!(tier.scale > 0) || !(tier.fps > 0)) throw new RangeError("Invalid AVS quality tier");
+    }
+    this.initialTier = clampIndex(options.initialTier ?? 2, this.tiers.length);
+    this.tierIndex = this.initialTier;
+    this.downgradeSamples = positiveInteger(options.downgradeSamples ?? 8, "downgradeSamples");
+    this.upgradeSamples = positiveInteger(options.upgradeSamples ?? 180, "upgradeSamples");
+    this.overloadRatio = positive(options.overloadRatio ?? 0.7, "overloadRatio");
+    this.headroomRatio = positive(options.headroomRatio ?? 0.3, "headroomRatio");
+    this.maxPixels = positive(options.maxPixels ?? 640 * 360, "maxPixels");
+    this.maxEdge = positive(options.maxEdge ?? 640, "maxEdge");
+  }
+  get tier() {
+    return this.tiers[this.tierIndex];
+  }
+  get qualityIndex() {
+    return this.tierIndex;
+  }
+  get averageRenderMs() {
+    return this.emaMs;
+  }
+  reset() {
+    this.tierIndex = this.initialTier;
+    this.nextRenderMs = null;
+    this.resetSamples();
+  }
+  /** True at most once per target interval; late callbacks never cause catch-up bursts. */
+  shouldRender(nowMs) {
+    if (!Number.isFinite(nowMs)) return false;
+    const interval = 1e3 / this.tier.fps;
+    if (this.nextRenderMs === null || nowMs - this.nextRenderMs > interval * 2) {
+      this.nextRenderMs = nowMs + interval;
+      return true;
+    }
+    if (nowMs + 0.25 < this.nextRenderMs) return false;
+    const intervalsLate = Math.max(0, Math.floor((nowMs - this.nextRenderMs) / interval));
+    this.nextRenderMs += (intervalsLate + 1) * interval;
+    return true;
+  }
+  /** Records runtime + pixel conversion + canvas upload time. Returns true on a tier change. */
+  recordRender(renderMs) {
+    if (!Number.isFinite(renderMs) || renderMs < 0) return false;
+    this.emaMs = this.samples === 0 ? renderMs : this.emaMs * 0.85 + renderMs * 0.15;
+    this.samples++;
+    const budget = 1e3 / this.tier.fps;
+    if (renderMs > budget * 2 && this.tierIndex < this.tiers.length - 1) {
+      this.tierIndex++;
+      this.nextRenderMs = null;
+      this.resetSamples();
+      return true;
+    }
+    const overloaded = renderMs > budget || this.emaMs > budget * this.overloadRatio;
+    const hasHeadroom = renderMs < budget * 0.5 && this.emaMs < budget * this.headroomRatio;
+    this.overloadCount = overloaded ? this.overloadCount + 1 : Math.max(0, this.overloadCount - 1);
+    this.headroomCount = hasHeadroom ? this.headroomCount + 1 : 0;
+    if (this.overloadCount >= this.downgradeSamples && this.tierIndex < this.tiers.length - 1) {
+      this.tierIndex++;
+      this.nextRenderMs = null;
+      this.resetSamples();
+      return true;
+    }
+    if (this.headroomCount >= this.upgradeSamples && this.tierIndex > 0) {
+      this.tierIndex--;
+      this.nextRenderMs = null;
+      this.resetSamples();
+      return true;
+    }
+    return false;
+  }
+  dimensions(displayWidth, displayHeight) {
+    const sourceWidth = Math.max(1, Math.trunc(displayWidth));
+    const sourceHeight = Math.max(1, Math.trunc(displayHeight));
+    const fit = Math.min(
+      1,
+      this.maxEdge / Math.max(sourceWidth, sourceHeight),
+      Math.sqrt(this.maxPixels / (sourceWidth * sourceHeight))
+    );
+    const scale = fit * this.tier.scale;
+    return {
+      width: Math.max(1, Math.round(sourceWidth * scale)),
+      height: Math.max(1, Math.round(sourceHeight * scale))
+    };
+  }
+  resetSamples() {
+    this.overloadCount = 0;
+    this.headroomCount = 0;
+    this.emaMs = 0;
+    this.samples = 0;
+  }
+};
+var LITTLE_ENDIAN = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+function copyAvsPixelsToRgba(source3, rgba, rgbaWords) {
+  if (rgba.length !== source3.length * 4) {
+    throw new RangeError(`RGBA buffer has ${rgba.length} bytes, expected ${source3.length * 4}`);
+  }
+  if (LITTLE_ENDIAN) {
+    const words = rgbaWords ?? new Uint32Array(rgba.buffer, rgba.byteOffset, source3.length);
+    if (words.length !== source3.length) throw new RangeError("RGBA word view has the wrong length");
+    for (let i = 0; i < source3.length; i++) {
+      const pixel = source3[i];
+      words[i] = 4278190080 | (pixel & 255) << 16 | pixel & 65280 | pixel >>> 16 & 255;
+    }
+    return;
+  }
+  for (let i = 0; i < source3.length; i++) {
+    const pixel = source3[i];
+    const offset = i * 4;
+    rgba[offset] = pixel >>> 16 & 255;
+    rgba[offset + 1] = pixel >>> 8 & 255;
+    rgba[offset + 2] = pixel & 255;
+    rgba[offset + 3] = 255;
+  }
+}
+function positive(value, name) {
+  if (!Number.isFinite(value) || value <= 0) throw new RangeError(`${name} must be positive`);
+  return value;
+}
+function positiveInteger(value, name) {
+  return Math.trunc(positive(value, name));
+}
+function clampIndex(value, length) {
+  return Math.max(0, Math.min(length - 1, Math.trunc(value)));
+}
+
 // src/shaders/present.wgsl
 var present_default = "// Final pass: HDR accumulation -> swapchain.\n//\n// Everything upstream is rgba16float and freely exceeds 1.0. This is the only\n// place that becomes a displayable image, so it owns bloom, tone mapping and\n// the vignette, and it is the only place that should.\n\nstruct Post {\n  bloom    : f32,\n  exposure : f32,\n  vignette : f32,\n  aspect   : f32,\n  grain    : f32,\n  time     : f32,\n  pad0     : f32,\n  pad1     : f32,\n};\n\n@group(0) @binding(0) var src : texture_2d<f32>;\n@group(0) @binding(1) var samp : sampler;\n@group(0) @binding(2) var<uniform> P : Post;\n\n@vertex\nfn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {\n  let p = array<vec2<f32>, 3>(\n    vec2<f32>(-1.0, -1.0), vec2<f32>( 3.0, -1.0), vec2<f32>(-1.0,  3.0),\n  );\n  return vec4<f32>(p[vi], 0.0, 1.0);\n}\n\n// Narkowicz ACES. A *look*, not a correction \u2014 it rolls highlights off so\n// additive accumulation stops clipping to flat white.\nfn aces(x: vec3<f32>) -> vec3<f32> {\n  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;\n  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));\n}\n\nfn hash21(p: vec2<f32>) -> f32 {\n  var p3 = fract(vec3<f32>(p.xyx) * 0.1031);\n  p3 = p3 + dot(p3, p3.yzx + 33.33);\n  return fract((p3.x + p3.y) * p3.z);\n}\n\n@fragment\nfn fs(@builtin(position) frag : vec4<f32>) -> @location(0) vec4<f32> {\n  let dims = vec2<f32>(textureDimensions(src));\n  let uv = frag.xy / dims;\n  let texel = 1.0 / dims;\n\n  var col = textureSampleLevel(src, samp, uv, 0.0).rgb;\n\n  // Cheap threshold bloom. A real mip chain belongs here (plan \xA74.11) \u2014 this is\n  // a fixed 12-tap ring, which is honest for a vertical slice and would be the\n  // wrong answer at 2K120.\n  if (P.bloom > 0.001) {\n    var sum = vec3<f32>(0.0);\n    let radius = 9.0;\n    for (var i = 0; i < 12; i = i + 1) {\n      let a = f32(i) * 0.5235988;           // 2pi/12\n      let o = vec2<f32>(cos(a), sin(a)) * radius * texel;\n      let s = textureSampleLevel(src, samp, uv + o, 0.0).rgb;\n      sum = sum + max(s - vec3<f32>(0.6), vec3<f32>(0.0));\n    }\n    col = col + sum * (P.bloom / 12.0);\n  }\n\n  col = col * P.exposure;\n\n  // Vignette. Multiplicative and gentle \u2014 art-direction \xA74.3 wants most of the\n  // frame near-black, and this helps without eating the subject.\n  let d = length((uv - 0.5) * vec2<f32>(P.aspect, 1.0));\n  col = col * mix(1.0, smoothstep(1.05, 0.25, d), P.vignette);\n\n  col = aces(col);\n\n  // Grain after tone mapping, so it lives in display space and does not get\n  // crushed by the curve.\n  if (P.grain > 0.001) {\n    let n = hash21(frag.xy + vec2<f32>(P.time * 60.0, P.time * 37.0)) - 0.5;\n    col = col + vec3<f32>(n * P.grain * 0.06);\n  }\n\n  return vec4<f32>(col, 1.0);\n}\n";
 
@@ -16956,7 +17312,7 @@ avsCanvas.id = "avs-stage";
 avsCanvas.setAttribute("aria-label", "Imported Winamp AVS preset");
 avsCanvas.style.cssText = "display:none;position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none;image-rendering:pixelated";
 canvas.insertAdjacentElement("afterend", avsCanvas);
-var avsContext = avsCanvas.getContext("2d", { alpha: false });
+var avsContext = avsCanvas.getContext("2d", { alpha: false, desynchronized: true });
 var hud = $("hud");
 var err = $("err");
 var post = {
@@ -17332,10 +17688,26 @@ var avsPresetName = "";
 var avsUnsupported = 0;
 var avsPcmLeft = new Float32Array(576);
 var avsPcmRight = new Float32Array(576);
+var avsGovernor = new AvsFrameGovernor();
+var avsImage = null;
+var avsImageWords = null;
+var avsLastRenderMs = 0;
+function syncAvsSurface() {
+  if (!avsRuntime) return;
+  const { width, height } = avsGovernor.dimensions(gpu.width, gpu.height);
+  if (avsRuntime.framebuffer.width !== width || avsRuntime.framebuffer.height !== height) {
+    avsRuntime.resize(width, height);
+  }
+  if (avsCanvas.width !== width || avsCanvas.height !== height) {
+    avsCanvas.width = width;
+    avsCanvas.height = height;
+    avsImage = null;
+    avsImageWords = null;
+  }
+}
 async function loadAvsPreset(bytes, fileName) {
-  const maxWidth = 640;
-  const width = Math.max(1, Math.min(maxWidth, gpu.width));
-  const height = Math.max(1, Math.round(width * gpu.height / gpu.width));
+  avsGovernor.reset();
+  const { width, height } = avsGovernor.dimensions(gpu.width, gpu.height);
   const bitmapResolver = await loadBundledAvsBitmapResolver();
   const registry = createAvsCompatibilityRegistry({}, { bitmapResolver });
   avsRuntime = new AvsCompatibilityRuntime(bytes, width, height, registry);
@@ -17343,11 +17715,16 @@ async function loadAvsPreset(bytes, fileName) {
   avsPresetName = fileName.replace(/\.avs$/i, "");
   avsCanvas.width = width;
   avsCanvas.height = height;
+  avsImage = null;
+  avsImageWords = null;
+  avsLastRenderMs = 0;
   avsCanvas.style.display = "block";
   director.enabled = false;
 }
-function renderAvsPreset(audioFrame) {
-  if (!avsRuntime || !avsContext) return;
+function renderAvsPreset(audioFrame, nowMs) {
+  if (!avsRuntime || !avsContext || !avsGovernor.shouldRender(nowMs)) return false;
+  syncAvsSurface();
+  const started = performance.now();
   const frames2 = Math.max(1, Math.trunc(audioFrame.waveform.length / 2));
   for (let i = 0; i < 576; i++) {
     const source3 = Math.min(frames2 - 1, Math.trunc(i * frames2 / 576));
@@ -17356,12 +17733,19 @@ function renderAvsPreset(audioFrame) {
   }
   const frame2 = avsRuntime.renderPcm({ left: avsPcmLeft, right: avsPcmRight });
   avsUnsupported = frame2.stats.unsupported;
-  const image = new ImageData(
-    new Uint8ClampedArray(avsRuntime.rgbaBytes()),
-    frame2.framebuffer.width,
-    frame2.framebuffer.height
-  );
-  avsContext.putImageData(image, 0, 0);
+  if (!avsImage || avsImage.width !== frame2.framebuffer.width || avsImage.height !== frame2.framebuffer.height) {
+    avsImage = new ImageData(frame2.framebuffer.width, frame2.framebuffer.height);
+    avsImageWords = new Uint32Array(
+      avsImage.data.buffer,
+      avsImage.data.byteOffset,
+      frame2.framebuffer.pixels.length
+    );
+  }
+  copyAvsPixelsToRgba(frame2.framebuffer.pixels, avsImage.data, avsImageWords ?? void 0);
+  avsContext.putImageData(avsImage, 0, 0);
+  avsLastRenderMs = performance.now() - started;
+  avsGovernor.recordRender(avsLastRenderMs);
+  return true;
 }
 var presentPipeline = createFullscreenPipeline(gpu, "present", present_default, gpu.swapFormat);
 var postParams = device.createBuffer({
@@ -17476,6 +17860,41 @@ function snapshot(t) {
     peaks: audio.peaks
   };
 }
+function updateFrameReadout(a, t, bpm, transportBeats, dt, presented) {
+  fpsAcc += dt;
+  if (presented) frames++;
+  let refreshHud = false;
+  if (fpsAcc >= 0.5) {
+    fps = frames / fpsAcc;
+    frames = 0;
+    fpsAcc = 0;
+    refreshHud = true;
+  }
+  if (refreshHud) updateHud(t, bpm);
+  if (presented || refreshHud) {
+    ui.update({
+      bpm,
+      locked: tempo.locked,
+      confidence: timeline.confidence,
+      beats: transportBeats,
+      playing: audio.isPlaying,
+      canControl: audio.canTransport
+    });
+  }
+  if (overlay.visible && (presented || refreshHud)) {
+    overlay.draw({
+      audio: a,
+      flux: detector.attached ? detector.features.flux : audio.debugFlux,
+      threshold: detector.attached ? detector.features.thresh : audio.debugThresh,
+      timings: timer.timings,
+      bpm,
+      tempoLocked: tempo.locked,
+      confidence: timeline.confidence,
+      fps,
+      sampleRate: audio.ctx?.sampleRate ?? 48e3
+    });
+  }
+}
 function frame(nowMs) {
   try {
     renderFrame(nowMs);
@@ -17488,7 +17907,8 @@ function frame(nowMs) {
   }
 }
 function renderFrame(nowMs) {
-  const dt = harness ? harness.dt : Math.min((nowMs - last) / 1e3, 1 / 20);
+  const wallDt = harness ? harness.dt : Math.max(0, (nowMs - last) / 1e3);
+  const dt = harness ? harness.dt : Math.min(wallDt, 1 / 20);
   last = nowMs;
   scheduler.outputLatency = audio.ctx?.outputLatency ?? 0;
   let a;
@@ -17506,7 +17926,6 @@ function renderFrame(nowMs) {
     t = audio.currentTime;
     a = snapshot(t);
   }
-  if (!audio.isPaused || harness) renderAvsPreset(a);
   tierB.update(t);
   const tlBpm = timeline.bpm(t);
   const bpm = tlBpm > 0 ? tlBpm : 120;
@@ -17536,6 +17955,13 @@ function renderFrame(nowMs) {
   peakLevel = Math.max(a.level, peakLevel - dt * 0.9);
   const nowBeats = timeline.slotAt(t) / SLOTS_PER_BEAT;
   const transportBeats = tlBpm > 0 ? nowBeats : t * bpm / 60;
+  if (avsRuntime && !harness) {
+    const presented = !audio.isPaused && renderAvsPreset(a, nowMs);
+    if (presented) frameCount++;
+    updateFrameReadout(a, t, bpm, transportBeats, wallDt, presented);
+    requestAnimationFrame(frame);
+    return;
+  }
   stack.update(nowBeats);
   const framed = stack.frame(nowBeats);
   plan = framed.plan;
@@ -17586,35 +18012,7 @@ function renderFrame(nowMs) {
   device.queue.submit([encoder.finish()]);
   timer.poll();
   frameCount++;
-  fpsAcc += dt;
-  frames++;
-  if (fpsAcc >= 0.5) {
-    fps = frames / fpsAcc;
-    frames = 0;
-    fpsAcc = 0;
-  }
-  if (frames === 0) updateHud(t, bpm);
-  ui.update({
-    bpm,
-    locked: tempo.locked,
-    confidence: timeline.confidence,
-    beats: transportBeats,
-    playing: audio.isPlaying,
-    canControl: audio.canTransport
-  });
-  if (overlay.visible) {
-    overlay.draw({
-      audio: a,
-      flux: detector.attached ? detector.features.flux : audio.debugFlux,
-      threshold: detector.attached ? detector.features.thresh : audio.debugThresh,
-      timings: timer.timings,
-      bpm,
-      tempoLocked: tempo.locked,
-      confidence: timeline.confidence,
-      fps,
-      sampleRate: audio.ctx?.sampleRate ?? 48e3
-    });
-  }
+  updateFrameReadout(a, t, bpm, transportBeats, wallDt, true);
   if (harness) {
     harness.advance();
     if (harness.done) {
@@ -17633,9 +18031,16 @@ function updateHud(t, bpm) {
     return node;
   };
   const lines = [
-    [bold(`${fps.toFixed(0)} fps`), ` \xB7 ${gpu.width}\xD7${gpu.height}`, ...harness ? [" \xB7 ", bold("GOLDEN")] : []],
+    [
+      bold(`${fps.toFixed(0)} fps`),
+      ` \xB7 ${avsRuntime ? `${avsRuntime.framebuffer.width}\xD7${avsRuntime.framebuffer.height} AVS` : `${gpu.width}\xD7${gpu.height}`}`,
+      ...harness ? [" \xB7 ", bold("GOLDEN")] : []
+    ],
     ["preset ", bold(avsRuntime ? `${avsPresetName} (AVS compatibility)` : preset.name), ` \xB7 ${avsRuntime ? "legacy ordered graph" : `${stack.length} layers`} \xB7 auto `, bold(director.enabled ? "on" : "off"), ` (${director.dynamic ? `${director.minBars}\u2013${director.maxBars}bar responsive` : `${director.every}bar`})`],
-    ...avsRuntime ? [[`AVS unsupported records this frame: `, bold(avsUnsupported)]] : [],
+    ...avsRuntime ? [[
+      `AVS ${avsLastRenderMs.toFixed(1)}ms \xB7 quality ${avsGovernor.qualityIndex + 1}/${AVS_QUALITY_TIERS.length} \xB7 unsupported records `,
+      bold(avsUnsupported)
+    ]] : [],
     ["tempo ", bold(lock), ` \xB7 horizon ${timeline.horizonSec.toFixed(2)}s`],
     [`slot ${timeline.slotAt(t).toFixed(0)} \xB7 scheduled ${stats.scheduledEvents} \xB7 late ${(stats.lateBy * 1e3).toFixed(1)}ms`],
     [`audio clock ${t.toFixed(2)}s \xB7 level ${peakLevel.toFixed(2)}`],
