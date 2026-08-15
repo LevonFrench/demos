@@ -9927,7 +9927,7 @@ var LayerUI = class {
     this.body.id = "aaavs-ui-body";
     this.toggleBtn.setAttribute("aria-controls", this.body.id);
     const transport = el("div", "ui-section ui-transport-section");
-    const transportLegend = el("span", "ui-legend", "live transport");
+    const transportLegend = el("span", "ui-legend ui-sr-only", "live transport");
     const stats2 = el("dl", "ui-transport");
     const bpmStat = this.stat("tempo", "bpm");
     const lockStat = this.stat("lock", "confidence");
@@ -9937,21 +9937,21 @@ var LayerUI = class {
     this.outPos = posStat.value;
     stats2.append(bpmStat.node, lockStat.node, posStat.node);
     const transportControls = el("div", "ui-transport-controls");
-    this.previousBarButton = el("button", "ui-transport-button", "\u22121 bar");
+    this.previousBarButton = el("button", "ui-transport-button", "\u22121");
     this.previousBarButton.type = "button";
     this.previousBarButton.setAttribute("aria-label", "Previous bar");
     this.previousBarButton.title = "Previous bar (Left Arrow)";
     this.previousBarButton.addEventListener("click", () => {
       void opts.onSkipBar?.(-1);
     });
-    this.playButton = el("button", "ui-transport-button is-primary", "pause");
+    this.playButton = el("button", "ui-transport-button is-primary", "\u2161");
     this.playButton.type = "button";
     this.playButton.setAttribute("aria-label", "Pause");
     this.playButton.title = "Pause or resume (Space)";
     this.playButton.addEventListener("click", () => {
       void opts.onTogglePlayback?.();
     });
-    this.nextBarButton = el("button", "ui-transport-button", "+1 bar");
+    this.nextBarButton = el("button", "ui-transport-button", "+1");
     this.nextBarButton.type = "button";
     this.nextBarButton.setAttribute("aria-label", "Next bar");
     this.nextBarButton.title = "Next bar (Right Arrow)";
@@ -10372,8 +10372,8 @@ var LayerUI = class {
     this.previousBarButton.disabled = !readout.canControl;
     this.playButton.disabled = !readout.canControl;
     this.nextBarButton.disabled = !readout.canControl;
-    const playLabel = readout.playing ? "pause" : "resume";
-    if (this.playButton.textContent !== playLabel) this.playButton.textContent = playLabel;
+    const playGlyph = readout.playing ? "\u2161" : "\u25B6";
+    if (this.playButton.textContent !== playGlyph) this.playButton.textContent = playGlyph;
     this.playButton.setAttribute("aria-label", readout.playing ? "Pause" : "Resume");
   }
   dispose() {
@@ -10607,9 +10607,10 @@ var LayerUI = class {
   }
   stat(label, hint) {
     const node = el("div", "ui-stat");
-    const dt = el("dt", void 0, label);
+    const dt = el("dt", "ui-sr-only", label);
     dt.title = hint;
     const dd = el("dd", "is-idle", "\u2014");
+    dd.title = `${label} \xB7 ${hint}`;
     node.append(dt, dd);
     return { node, value: dd };
   }
@@ -18687,6 +18688,7 @@ var AvsEditor = class {
   decodedModel;
   statusLine = null;
   selectedPath = null;
+  workbenchCollapsed = false;
   visible;
   disposed = false;
   setPreset(preset2, presetName = this.presetName) {
@@ -18742,7 +18744,28 @@ var AvsEditor = class {
       stat(String(model.listCount), "lists"),
       stat(String(model.maxDepth), "depth")
     );
+    const workbench = element("div", "avs-editor__workbench");
+    workbench.id = "aaavs-avs-workbench";
+    workbench.hidden = this.workbenchCollapsed;
+    root.classList.toggle("is-workbench-collapsed", this.workbenchCollapsed);
     const actions = element("div", "avs-editor__actions");
+    const collapse = controlButton(
+      "avs-editor__action avs-editor__collapse",
+      this.workbenchCollapsed ? "\u25B8" : "\u25BE",
+      this.workbenchCollapsed ? "Expand AVS layer list" : "Collapse AVS layer list"
+    );
+    collapse.setAttribute("aria-controls", workbench.id);
+    collapse.setAttribute("aria-expanded", String(!this.workbenchCollapsed));
+    collapse.addEventListener("click", () => {
+      this.workbenchCollapsed = !this.workbenchCollapsed;
+      workbench.hidden = this.workbenchCollapsed;
+      root.classList.toggle("is-workbench-collapsed", this.workbenchCollapsed);
+      collapse.textContent = this.workbenchCollapsed ? "\u25B8" : "\u25BE";
+      collapse.title = this.workbenchCollapsed ? "Expand AVS layer list" : "Collapse AVS layer list";
+      collapse.setAttribute("aria-label", collapse.title);
+      collapse.setAttribute("aria-expanded", String(!this.workbenchCollapsed));
+    });
+    actions.append(collapse);
     if (this.options.onExitToNative) {
       const exit = controlButton("avs-editor__action", "Native layers", "Return to native aaavs layers");
       exit.addEventListener("click", () => {
@@ -18763,7 +18786,6 @@ var AvsEditor = class {
     }
     header.append(titleBlock, meter);
     if (actions.childElementCount) header.append(actions);
-    const workbench = element("div", "avs-editor__workbench");
     const graph = element("div", "avs-editor__graph");
     const graphHead = element("div", "avs-editor__section-head");
     graphHead.append(

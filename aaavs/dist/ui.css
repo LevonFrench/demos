@@ -98,22 +98,24 @@
   text-transform: uppercase;
 }
 .ui-transport {
+  display: contents;
+}
+.ui-transport-section {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: .45rem;
+  grid-template-columns: minmax(4.8rem, .82fr) minmax(6.2rem, 1fr) minmax(4rem, .72fr) repeat(3, minmax(3.25rem, .62fr));
+  align-items: stretch;
+  gap: .38rem;
+  padding-block: .55rem;
 }
 .ui-stat {
+  display: grid;
+  place-items: center;
   min-width: 0;
-  padding: .42rem .45rem .38rem;
+  min-height: 2rem;
+  padding: .28rem .4rem;
   border: 1px solid var(--ui-line);
   border-radius: 7px;
   background: var(--ui-sunk);
-}
-.ui-stat dt {
-  margin: 0;
-  color: var(--ui-dim);
-  font-size: 9px;
-  letter-spacing: .08em;
 }
 .ui-stat dd {
   margin: 0;
@@ -121,17 +123,14 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
 }
 .ui-stat dd.is-idle {
   color: var(--ui-dim);
 }
 .ui-transport-controls {
-  display: grid;
-  grid-template-columns: 1fr 1.2fr 1fr;
-  gap: .45rem;
-  margin-top: .5rem;
+  display: contents;
 }
 .ui-transport-button {
   min-height: 2rem;
@@ -523,6 +522,21 @@
   }
   .ui-fields {
     grid-template-columns: 1fr;
+  }
+  .ui-transport-section {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: .22rem;
+    padding-inline: .45rem;
+  }
+  .ui-stat,
+  .ui-transport-button {
+    min-height: 1.8rem;
+    padding-inline: .2rem;
+  }
+  .ui-stat dd,
+  .ui-transport-button {
+    font-size: 9px;
+    letter-spacing: 0;
   }
 }
 @media (max-width: 420px) {
