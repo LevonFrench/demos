@@ -70,7 +70,7 @@ function readComponents(bytes, start, end, parent, absoluteBase = 0) {
     const payload = bytes.slice(payloadStart, payloadEnd);
     let list = null;
     let listCode = null;
-    let children = [];
+    let children4 = [];
     if (effectId === EFFECT_LIST_ID && payload.length > 0) {
       list = readListSettings(payload, payloadStart);
       let childOffset = list.byteLength;
@@ -79,7 +79,7 @@ function readComponents(bytes, start, end, parent, absoluteBase = 0) {
         listCode = codeRecord.code;
         childOffset = codeRecord.nextOffset;
       }
-      children = readComponents(payload, childOffset, payload.length, path, absoluteBase + payloadStart);
+      children4 = readComponents(payload, childOffset, payload.length, path, absoluteBase + payloadStart);
     }
     components.push({
       effectId,
@@ -87,7 +87,7 @@ function readComponents(bytes, start, end, parent, absoluteBase = 0) {
       payload,
       fileOffset: absoluteBase + cursor,
       path,
-      children,
+      children: children4,
       list,
       listCode
     });
@@ -126,7 +126,7 @@ function readListSettings(payload, absoluteOffset) {
   if (byteLength < 5 || byteLength > payload.length) {
     throw new AvsPresetError(`Invalid Effect List header length ${byteLength}`, absoluteOffset + 4);
   }
-  const ext = (index, fallback) => 5 + index * 4 + 4 <= byteLength ? i32(payload, 5 + index * 4) : fallback;
+  const ext = (index, fallback2) => 5 + index * 4 + 4 <= byteLength ? i32(payload, 5 + index * 4) : fallback2;
   return {
     mode,
     enabled: (mode & 2) === 0,
@@ -666,44 +666,6 @@ var HELPERS = {
   },
   modulo(a, b) {
     return Math.abs(b) < Number.EPSILON ? 0 : Number.isFinite(a % b) ? a % b : 0;
-  },
-  assignment(operator, left, right) {
-    let result;
-    switch (operator) {
-      case "=":
-        result = right;
-        break;
-      case "+=":
-        result = left + right;
-        break;
-      case "-=":
-        result = left - right;
-        break;
-      case "*=":
-        result = left * right;
-        break;
-      case "/=":
-        result = this.divide(left, right);
-        break;
-      case "%=":
-        result = this.modulo(left, right);
-        break;
-      case "|=":
-        result = this.integer(left) | this.integer(right);
-        break;
-      case "&=":
-        result = this.integer(left) & this.integer(right);
-        break;
-      case "^=":
-        result = this.integer(left) ^ this.integer(right);
-        break;
-      case "**=":
-        result = Math.pow(left, right);
-        break;
-      default:
-        result = 0;
-    }
-    return this.finite(result);
   }
 };
 function compileAvsEelJit(node) {
@@ -872,7 +834,7 @@ var Builder = class {
       const rightTemp = this.store(right);
       const left = this.store(targetAccess);
       const result = this.temp();
-      this.lines.push(`const ${result}=H.assignment(${JSON.stringify(operator)},${left},${rightTemp});`);
+      this.lines.push(`const ${result}=${this.assignment(operator, left, rightTemp)};`);
       this.lines.push(`${targetAccess}=${result};`);
       return result;
     }
@@ -882,7 +844,7 @@ var Builder = class {
       const global = target.name === "gmegabuf";
       const left = this.store(`vm.readMemory(${global},${address})`);
       const result = this.temp();
-      this.lines.push(`const ${result}=H.assignment(${JSON.stringify(operator)},${left},${right});`);
+      this.lines.push(`const ${result}=${this.assignment(operator, left, right)};`);
       this.lines.push(`vm.writeMemory(${global},${address},${result});`);
       return result;
     }
@@ -996,6 +958,33 @@ var Builder = class {
     this.lines.push(`const ${temporary}=${expression};`);
     return temporary;
   }
+  /** Inline the compile-time-known assignment operator in hot point scripts. */
+  assignment(operator, left, right) {
+    switch (operator) {
+      case "=":
+        return `H.finite(${right})`;
+      case "+=":
+        return `H.finite((${left})+(${right}))`;
+      case "-=":
+        return `H.finite((${left})-(${right}))`;
+      case "*=":
+        return `H.finite((${left})*(${right}))`;
+      case "/=":
+        return `H.divide(${left},${right})`;
+      case "%=":
+        return `H.modulo(${left},${right})`;
+      case "|=":
+        return `(H.integer(${left})|H.integer(${right}))`;
+      case "&=":
+        return `(H.integer(${left})&H.integer(${right}))`;
+      case "^=":
+        return `(H.integer(${left})^H.integer(${right}))`;
+      case "**=":
+        return `H.finite(Math.pow(${left},${right}))`;
+      default:
+        throw new UnsupportedJitNode();
+    }
+  }
   temp() {
     return `t${this.temporary++}`;
   }
@@ -1018,18 +1007,19 @@ function compileAvsEel(source) {
   return compileAvsEelAst(parseAvsEel(source));
 }
 function compileAvsEelAst(ast) {
-  const fallback = compileNode(ast.body);
+  const fallback2 = compileNode(ast.body);
   const bindJit = ast.source.length <= 1400 ? compileAvsEelJit(ast.body) : null;
+  const bind = (vm) => bindJit ? bindJit(vm) : () => fallback2(vm);
   let boundVm;
   let boundExecute;
-  const execute7 = (vm) => {
+  const execute8 = (vm) => {
     if (vm !== boundVm) {
       boundVm = vm;
-      boundExecute = bindJit ? bindJit(vm) : () => fallback(vm);
+      boundExecute = bind(vm);
     }
     return boundExecute();
   };
-  return { source: ast.source, ast, execute: execute7 };
+  return { source: ast.source, ast, bind, execute: execute8 };
 }
 function compileNode(node) {
   switch (node.kind) {
@@ -1851,6 +1841,7 @@ var AvsExecutor = class {
     this.preset = preset;
     this.registry = registry;
     this.eelGlobal = registry.eelGlobal;
+    this.indexComponents(preset.components, null);
   }
   buffers = new AvsBufferBank();
   stats = { rendered: 0, unsupported: 0, lists: 0 };
@@ -1860,6 +1851,56 @@ var AvsExecutor = class {
   alternates = /* @__PURE__ */ new Map();
   beatFrames = /* @__PURE__ */ new Map();
   listEel = /* @__PURE__ */ new Map();
+  components = /* @__PURE__ */ new Map();
+  parents = /* @__PURE__ */ new Map();
+  controlsByPath = /* @__PURE__ */ new Map();
+  soloSelection = null;
+  /** Current non-default controls, in preset traversal order. */
+  get controls() {
+    const result = [];
+    for (const path of this.components.keys()) {
+      const control = this.controlsByPath.get(path);
+      if (control) result.push(control);
+    }
+    return result;
+  }
+  /**
+   * Atomically replaces graph controls. Unknown or duplicate paths are rejected
+   * so stale editor state cannot silently control a different preset.
+   */
+  setControls(controls) {
+    const next = /* @__PURE__ */ new Map();
+    for (const control of controls) {
+      if (!this.components.has(control.path)) throw new RangeError(`Unknown AVS component path ${control.path}`);
+      if (next.has(control.path)) throw new RangeError(`Duplicate AVS component control path ${control.path}`);
+      const resolved = {
+        path: control.path,
+        enabled: control.enabled ?? true,
+        muted: control.muted ?? false,
+        solo: control.solo ?? false
+      };
+      if (!isDefaultControl(resolved)) next.set(control.path, resolved);
+    }
+    if (sameControls(this.controlsByPath, next)) return;
+    this.controlsByPath = next;
+    this.rebuildSoloSelection();
+    this.resetControlSensitiveState();
+  }
+  /** Merge one path's editor state without disturbing controls on other paths. */
+  setComponentControl(path, patch) {
+    if (!this.components.has(path)) throw new RangeError(`Unknown AVS component path ${path}`);
+    const current = this.controlsByPath.get(path) ?? { path, enabled: true, muted: false, solo: false };
+    const next = {
+      path,
+      enabled: patch.enabled ?? current.enabled,
+      muted: patch.muted ?? current.muted,
+      solo: patch.solo ?? current.solo
+    };
+    this.setControls([
+      ...this.controls.filter((control) => control.path !== path),
+      next
+    ]);
+  }
   render(framebuffer, audio, preinit = false) {
     this.stats.rendered = 0;
     this.stats.unsupported = 0;
@@ -1878,11 +1919,12 @@ var AvsExecutor = class {
     this.listEel.clear();
     this.buffers.release();
   }
-  runChildren(children, primary, alternate, audio, line, preinit, initialBeat) {
+  runChildren(children4, primary, alternate, audio, line, preinit, initialBeat) {
     let current = primary;
     let spare = alternate;
     let beat = initialBeat;
-    for (const component of children) {
+    for (const component of children4) {
+      if (!this.shouldRun(component)) continue;
       if (component.list) {
         this.runList(component, current, audio, line, preinit, beat);
         continue;
@@ -2024,7 +2066,60 @@ var AvsExecutor = class {
     store.set(key, created);
     return created;
   }
+  indexComponents(children4, parent) {
+    for (const component of children4) {
+      if (this.components.has(component.path)) throw new Error(`Duplicate AVS component path ${component.path}`);
+      this.components.set(component.path, component);
+      this.parents.set(component.path, parent);
+      this.indexComponents(component.children, component.path);
+    }
+  }
+  shouldRun(component) {
+    const control = this.controlsByPath.get(component.path);
+    if (control && (!control.enabled || control.muted)) return false;
+    return this.soloSelection === null || this.soloSelection.has(component.path);
+  }
+  rebuildSoloSelection() {
+    const solos = [...this.controlsByPath.values()].filter((control) => control.solo);
+    if (solos.length === 0) {
+      this.soloSelection = null;
+      return;
+    }
+    const selected = /* @__PURE__ */ new Set();
+    for (const solo of solos) {
+      let path = solo.path;
+      while (path !== null) {
+        selected.add(path);
+        path = this.parents.get(path) ?? null;
+      }
+      const component = this.components.get(solo.path);
+      if (component.list) this.selectSubtree(component, selected);
+    }
+    this.soloSelection = selected;
+  }
+  selectSubtree(component, selected) {
+    selected.add(component.path);
+    for (const child of component.children) this.selectSubtree(child, selected);
+  }
+  resetControlSensitiveState() {
+    this.retained.clear();
+    this.alternates.clear();
+    this.beatFrames.clear();
+    this.listEel.clear();
+    this.buffers.release();
+  }
 };
+function isDefaultControl(control) {
+  return control.enabled && !control.muted && !control.solo;
+}
+function sameControls(left, right) {
+  if (left.size !== right.size) return false;
+  for (const [path, a] of left) {
+    const b = right.get(path);
+    if (!b || a.enabled !== b.enabled || a.muted !== b.muted || a.solo !== b.solo) return false;
+  }
+  return true;
+}
 function compileOrNull(source) {
   if (!source.trim()) return null;
   try {
@@ -2165,16 +2260,16 @@ function blendLine(source, destination, mode, amount) {
       return source & 16777215;
   }
 }
-function int(ctx, offset, fallback) {
-  if (offset + 4 > ctx.component.payload.length) return fallback;
+function int(ctx, offset, fallback2) {
+  if (offset + 4 > ctx.component.payload.length) return fallback2;
   return new DataView(
     ctx.component.payload.buffer,
     ctx.component.payload.byteOffset,
     ctx.component.payload.byteLength
   ).getInt32(offset, true);
 }
-function uint(ctx, offset, fallback) {
-  if (offset + 4 > ctx.component.payload.length) return fallback >>> 0;
+function uint(ctx, offset, fallback2) {
+  if (offset + 4 > ctx.component.payload.length) return fallback2 >>> 0;
   return new DataView(
     ctx.component.payload.buffer,
     ctx.component.payload.byteOffset,
@@ -2227,8 +2322,8 @@ function render(context2, config) {
     }
   }
 }
-function i322(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+function i322(payload, offset, fallback2) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback2;
 }
 
 // src/avs/effects/classic.ts
@@ -2296,22 +2391,22 @@ function registerAvsClassicEffects(registry = new AvsEffectRegistry(), options =
       ctx.output.copyFrom(ctx.input);
       return { swap: true };
     }
-    let table6 = scatterTables.get(width);
-    if (!table6) {
-      table6 = new Int32Array(512);
-      for (let i = 0; i < table6.length; i++) {
+    let table5 = scatterTables.get(width);
+    if (!table5) {
+      table5 = new Int32Array(512);
+      for (let i = 0; i < table5.length; i++) {
         let dx = i % 8 - 4;
         let dy = Math.floor(i / 8) % 8 - 4;
         if (dx < 0) dx++;
         if (dy < 0) dy++;
-        table6[i] = width * dy + dx;
+        table5[i] = width * dy + dx;
       }
-      scatterTables.set(width, table6);
+      scatterTables.set(width, table5);
     }
     const edge = width * 4;
     ctx.output.pixels.set(ctx.input.pixels.subarray(0, edge), 0);
     for (let i = edge; i < width * (height - 4); i++) {
-      const offset = table6[normalizeRandom(randomInt(512), 512)];
+      const offset = table5[normalizeRandom(randomInt(512), 512)];
       ctx.output.pixels[i] = ctx.input.pixels[i + offset];
     }
     ctx.output.pixels.set(ctx.input.pixels.subarray(width * (height - 4)), width * (height - 4));
@@ -2618,8 +2713,8 @@ function channels2(a, b, fn) {
 function channels4(a, b, c, d, fn) {
   return fn(a & 255, b & 255, c & 255, d & 255) & 255 | (fn(a >>> 8 & 255, b >>> 8 & 255, c >>> 8 & 255, d >>> 8 & 255) & 255) << 8 | (fn(a >>> 16 & 255, b >>> 16 & 255, c >>> 16 & 255, d >>> 16 & 255) & 255) << 16;
 }
-function int2(ctx, offset, fallback) {
-  if (offset + 4 > ctx.component.payload.length) return fallback;
+function int2(ctx, offset, fallback2) {
+  if (offset + 4 > ctx.component.payload.length) return fallback2;
   return new DataView(
     ctx.component.payload.buffer,
     ctx.component.payload.byteOffset,
@@ -2682,11 +2777,11 @@ function decodeAvsColorMap(payload) {
   };
 }
 function buildAvsColorMapTable(points) {
-  const table6 = new Uint32Array(256);
+  const table5 = new Uint32Array(256);
   const sorted = points.length > 0 ? [...points].sort((a, b) => a.position - b.position || a.color - b.color) : defaultPoints();
   const first = sorted[0];
   const firstPosition = clamp3(first.position, 0, 255);
-  table6.fill(first.color & 16777215, 0, firstPosition);
+  table5.fill(first.color & 16777215, 0, firstPosition);
   for (let i = 0; i + 1 < sorted.length; i++) {
     const left = sorted[i];
     const right = sorted[i + 1];
@@ -2698,13 +2793,13 @@ function buildAvsColorMapTable(points) {
     let fraction = 0;
     for (let position = leftPosition; position <= rightPosition; position++) {
       const weight = Math.min(256, fraction >>> 8);
-      table6[position] = mix256(left.color, right.color, weight);
+      table5[position] = mix256(left.color, right.color, weight);
       fraction += increment;
     }
   }
   const last = sorted[sorted.length - 1];
-  table6.fill(last.color & 16777215, clamp3(last.position, 0, 255), 256);
-  return table6;
+  table5.fill(last.color & 16777215, clamp3(last.position, 0, 255), 256);
+  return table5;
 }
 function registerAvsColorMap(registry = new AvsEffectRegistry()) {
   const states = /* @__PURE__ */ new Map();
@@ -2725,8 +2820,8 @@ function registerAvsColorMap(registry = new AvsEffectRegistry()) {
       };
       states.set(context2.component.path, state);
     }
-    const table6 = selectTable(config, state, context2.beat);
-    transform(context2, config, table6);
+    const table5 = selectTable(config, state, context2.beat);
+    transform(context2, config, table5);
   });
   return registry;
 }
@@ -2761,18 +2856,18 @@ function selectTable(config, state, beat) {
     state.previous = state.target;
     return state.tables[state.target];
   }
-  const table6 = new Uint32Array(256);
+  const table5 = new Uint32Array(256);
   const previous = state.tables[state.previous];
   const target = state.tables[state.target];
-  for (let i = 0; i < 256; i++) table6[i] = mix256(previous[i], target[i], state.progress);
-  return table6;
+  for (let i = 0; i < 256; i++) table5[i] = mix256(previous[i], target[i], state.progress);
+  return table5;
 }
-function transform(context2, config, table6) {
+function transform(context2, config, table5) {
   for (let i = 0; i < context2.input.pixels.length; i++) {
     const destination = context2.input.pixels[i] & 16777215;
     const key = colorKey(destination, config.key);
     if (key === null) continue;
-    const source = table6[key];
+    const source = table5[key];
     context2.input.pixels[i] = blend(source, destination, config.blendMode, config.adjustBlend);
   }
 }
@@ -2854,8 +2949,8 @@ function normalizeCycleSpeed(raw) {
   if (signed3 === 0) return 8;
   return clamp3(signed3, 1, 64);
 }
-function readI32(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+function readI32(payload, offset, fallback2) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback2;
 }
 function firstEnabled(maps) {
   return maps.find((map) => map.enabled)?.index ?? 0;
@@ -2946,6 +3041,7 @@ function prepareConvolution(config) {
   const divisor = Math.abs(config.scale) || 1;
   const positiveTaps = taps.filter((tap) => tap.coefficient > 0);
   const negativeTaps = taps.filter((tap) => tap.coefficient < 0);
+  const boxCoefficient = taps.length === KERNEL_CELLS && taps.every((tap) => tap.coefficient === taps[0].coefficient) && taps[0].coefficient > 0 ? taps[0].coefficient : 0;
   return {
     config,
     taps,
@@ -2965,7 +3061,9 @@ function prepareConvolution(config) {
     positiveCoefficients: Uint16Array.from(positiveTaps, (tap) => tap.coefficient),
     negativeDx: Int8Array.from(negativeTaps, (tap) => tap.dx),
     negativeDy: Int8Array.from(negativeTaps, (tap) => tap.dy),
-    negativeCoefficients: Uint16Array.from(negativeTaps, (tap) => -tap.coefficient)
+    negativeCoefficients: Uint16Array.from(negativeTaps, (tap) => -tap.coefficient),
+    boxCoefficient,
+    boxScratch: null
   };
 }
 function renderConvolution(context2, state) {
@@ -2975,7 +3073,11 @@ function renderConvolution(context2, state) {
   const target = swap ? context2.output.pixels : source;
   const width = context2.input.width;
   const height = context2.input.height;
-  if (swap && !config.twoPass && state.bias === 0 && !state.saturatePositive && !state.saturateNegative && !config.absolute && !config.wrap && state.scaleShift >= 0) {
+  if (swap && !config.twoPass && state.bias === 0 && !state.saturatePositive && !state.saturateNegative && (!state.hasNegative || !config.absolute && !config.wrap)) {
+    if (state.boxCoefficient !== 0) {
+      renderBoxConvolution(source, target, width, height, state);
+      return { swap: true };
+    }
     renderFastConvolution(source, target, width, height, state);
     return { swap: true };
   }
@@ -3025,6 +3127,7 @@ function renderFastConvolution(source, target, width, height, state) {
   const interiorStart = Math.min(width, state.leftEdge);
   const interiorEnd = Math.max(interiorStart, width - state.rightEdge);
   const shift = state.scaleShift;
+  const reciprocal = shift < 0 ? Math.floor(65536 / state.divisor) & 65535 : 0;
   for (let y = 0; y < height; y++) {
     for (let tap = 0; tap < tapCount; tap++) {
       rowBases[tap] = clamp4(y + dy[tap], 0, height - 1) * width;
@@ -3067,15 +3170,105 @@ function renderFastConvolution(source, target, width, height, state) {
         red = red > negativeRed ? red - negativeRed : 0;
         alpha = alpha > negativeAlpha ? alpha - negativeAlpha : 0;
       }
-      blue >>>= shift;
-      green >>>= shift;
-      red >>>= shift;
-      alpha >>>= shift;
-      if (blue > 255) blue = 255;
-      if (green > 255) green = 255;
-      if (red > 255) red = 255;
-      if (alpha > 255) alpha = 255;
+      if (shift >= 0) {
+        blue >>>= shift;
+        green >>>= shift;
+        red >>>= shift;
+        alpha >>>= shift;
+      } else {
+        blue = Math.floor(blue * reciprocal / 65536) & 65535;
+        green = Math.floor(green * reciprocal / 65536) & 65535;
+        red = Math.floor(red * reciprocal / 65536) & 65535;
+        alpha = Math.floor(alpha * reciprocal / 65536) & 65535;
+      }
+      blue = packByte(blue);
+      green = packByte(green);
+      red = packByte(red);
+      alpha = packByte(alpha);
       target[targetRow + x] = (blue | green << 8 | red << 16 | alpha << 24) >>> 0;
+    }
+  }
+}
+function renderBoxConvolution(source, target, width, height, state) {
+  let scratch = state.boxScratch;
+  if (!scratch || scratch.width !== width || scratch.height !== height) {
+    scratch = {
+      width,
+      height,
+      redBlue: new Uint32Array(width * height),
+      greenAlpha: new Uint32Array(width * height)
+    };
+    state.boxScratch = scratch;
+  }
+  const horizontalRedBlue = scratch.redBlue;
+  const horizontalGreenAlpha = scratch.greenAlpha;
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    const first = source[row];
+    let redBlue = (first & 255) * 4 + (first >>> 16 & 255) * 4 * 65536;
+    let greenAlpha = (first >>> 8 & 255) * 4 + (first >>> 24) * 4 * 65536;
+    for (let x = 1; x <= Math.min(3, width - 1); x++) {
+      const pixel = source[row + x];
+      redBlue += (pixel & 255) + (pixel >>> 16 & 255) * 65536;
+      greenAlpha += (pixel >>> 8 & 255) + (pixel >>> 24) * 65536;
+    }
+    if (width < 4) {
+      const last = source[row + width - 1];
+      const missing = 4 - width;
+      redBlue += (last & 255) * missing + (last >>> 16 & 255) * missing * 65536;
+      greenAlpha += (last >>> 8 & 255) * missing + (last >>> 24) * missing * 65536;
+    }
+    for (let x = 0; x < width; x++) {
+      horizontalRedBlue[row + x] = redBlue;
+      horizontalGreenAlpha[row + x] = greenAlpha;
+      const removeX = x < 3 ? 0 : x - 3;
+      const addX = x + 4 >= width ? width - 1 : x + 4;
+      const remove = source[row + removeX];
+      const add3 = source[row + addX];
+      redBlue += (add3 & 255) - (remove & 255) + ((add3 >>> 16 & 255) - (remove >>> 16 & 255)) * 65536;
+      greenAlpha += (add3 >>> 8 & 255) - (remove >>> 8 & 255) + ((add3 >>> 24) - (remove >>> 24)) * 65536;
+    }
+  }
+  const coefficient = state.boxCoefficient;
+  const reciprocal = state.scaleShift < 0 ? Math.floor(65536 / state.divisor) & 65535 : 0;
+  for (let x = 0; x < width; x++) {
+    let redBlue = horizontalRedBlue[x] * 4;
+    let greenAlpha = horizontalGreenAlpha[x] * 4;
+    for (let y = 1; y <= Math.min(3, height - 1); y++) {
+      redBlue += horizontalRedBlue[y * width + x];
+      greenAlpha += horizontalGreenAlpha[y * width + x];
+    }
+    if (height < 4) {
+      const last = (height - 1) * width + x;
+      const missing = 4 - height;
+      redBlue += horizontalRedBlue[last] * missing;
+      greenAlpha += horizontalGreenAlpha[last] * missing;
+    }
+    for (let y = 0; y < height; y++) {
+      let blue = (redBlue & 65535) * coefficient;
+      let red = Math.floor(redBlue / 65536) * coefficient;
+      let green = (greenAlpha & 65535) * coefficient;
+      let alpha = Math.floor(greenAlpha / 65536) * coefficient;
+      if (state.scaleShift >= 0) {
+        blue >>>= state.scaleShift;
+        green >>>= state.scaleShift;
+        red >>>= state.scaleShift;
+        alpha >>>= state.scaleShift;
+      } else {
+        blue = Math.floor(blue * reciprocal / 65536) & 65535;
+        green = Math.floor(green * reciprocal / 65536) & 65535;
+        red = Math.floor(red * reciprocal / 65536) & 65535;
+        alpha = Math.floor(alpha * reciprocal / 65536) & 65535;
+      }
+      blue = packByte(blue);
+      green = packByte(green);
+      red = packByte(red);
+      alpha = packByte(alpha);
+      target[y * width + x] = (blue | green << 8 | red << 16 | alpha << 24) >>> 0;
+      const removeY = y < 3 ? 0 : y - 3;
+      const addY = y + 4 >= height ? height - 1 : y + 4;
+      redBlue += horizontalRedBlue[addY * width + x] - horizontalRedBlue[removeY * width + x];
+      greenAlpha += horizontalGreenAlpha[addY * width + x] - horizontalGreenAlpha[removeY * width + x];
     }
   }
 }
@@ -3160,6 +3353,1774 @@ function clamp4(value, minimum, maximum) {
   return value < minimum ? minimum : value > maximum ? maximum : value;
 }
 
+// src/avs/effects/movement.ts
+var TEXT2 = new TextDecoder("windows-1252");
+var CUSTOM_EFFECT = 32767;
+var LAST_BUILTIN_EFFECT = 23;
+var OFFSET_MASK = (1 << 22) - 1;
+var BILINEAR_WEIGHTS = (() => {
+  const weights = [
+    new Uint8Array(32 * 32),
+    new Uint8Array(32 * 32),
+    new Uint8Array(32 * 32),
+    new Uint8Array(32 * 32)
+  ];
+  for (let x = 0; x < 32; x++) {
+    const xp = x << 3;
+    const inverseX = 255 - xp;
+    for (let y = 0; y < 32; y++) {
+      const yp = y << 3;
+      const inverseY = 255 - yp;
+      const key = x << 5 | y;
+      weights[0][key] = AVS_BLEND_TABLE[inverseX << 8 | inverseY];
+      weights[1][key] = AVS_BLEND_TABLE[xp << 8 | inverseY];
+      weights[2][key] = AVS_BLEND_TABLE[inverseX << 8 | yp];
+      weights[3][key] = AVS_BLEND_TABLE[xp << 8 | yp];
+    }
+  }
+  return weights;
+})();
+var EVALUATED_BUILTINS = {
+  18: {
+    source: "d=d*(1-(sin((r-$pi*.5)*7)*.03));r=r+(cos(d*12)*.03)",
+    rectangular: false
+  },
+  19: {
+    source: "d=d*(1-(sin((r-$pi*.5)*12)*.05));r=r+(cos(d*18)*.05);d=d*(1-((d-.4)*.03));r=r+((d-.4)*.13)",
+    rectangular: false
+  },
+  20: { source: "x=x+(cos(y*18)*.02);y=y+(sin(x*14)*.03)", rectangular: true },
+  21: {
+    source: "x=x+(cos(abs(y-.5)*8)*.02);y=y+(sin(abs(x-.5)*8)*.05);x=x*.95;y=y*.95",
+    rectangular: true
+  },
+  22: {
+    source: "y=y*(1+(sin(r+$pi/2)*.3));x=x*(1+(cos(r+$pi/2)*.3));x=x*.995;y=y*.995",
+    rectangular: true
+  },
+  23: { source: "y=(r*6)/$pi;x=d", rectangular: true }
+};
+function decodeAvsMovement(payload) {
+  let offset = 0;
+  let effect = readI322(payload, offset, 1);
+  offset += 4;
+  let expression = "";
+  let rectangular = false;
+  if (effect === CUSTOM_EFFECT) {
+    if (asciiEquals(payload, offset, "!rect ")) {
+      offset += 6;
+      rectangular = true;
+    }
+    if (payload[offset] === 1) {
+      offset++;
+      const length = readI322(payload, offset, 0);
+      offset += 4;
+      if (length > 0 && offset + length <= payload.length) {
+        expression = nulText3(payload.subarray(offset, offset + length));
+        offset += length;
+      }
+    } else {
+      const length = 256 - (rectangular ? 6 : 0);
+      if (offset + length <= payload.length) {
+        expression = nulText3(payload.subarray(offset, offset + length));
+        offset += length;
+      }
+    }
+  }
+  const blend2 = readI322(payload, offset, 0) !== 0;
+  offset += 4;
+  const sourceMapped = readI322(payload, offset, 0);
+  offset += 4;
+  rectangular = readI322(payload, offset, rectangular ? 1 : 0) !== 0;
+  offset += 4;
+  const subpixel = readI322(payload, offset, 0) !== 0;
+  offset += 4;
+  const wrap = readI322(payload, offset, 0) !== 0;
+  offset += 4;
+  if (effect === 0 && offset + 4 <= payload.length) effect = readI322(payload, offset, 0);
+  if (effect !== CUSTOM_EFFECT && effect > LAST_BUILTIN_EFFECT || effect < 0) effect = 0;
+  return { effect, expression, blend: blend2, sourceMapped, rectangular, subpixel, wrap };
+}
+function registerAvsMovement(registry, global = new AvsEelGlobalState()) {
+  const states = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(15, (context2) => {
+    let state = states.get(context2.component.path);
+    if (!state) {
+      const config = decodeAvsMovement(context2.component.payload);
+      state = {
+        config,
+        program: movementProgram(config),
+        sourceMapped: config.sourceMapped,
+        width: 0,
+        height: 0,
+        table: null,
+        randomState: hashPath3(context2.component.path)
+      };
+      states.set(context2.component.path, state);
+    }
+    if (state.config.effect === 0) return;
+    if (!state.table || state.width !== context2.input.width || state.height !== context2.input.height) {
+      state.table = buildMovementTable(context2, state, global);
+      state.width = context2.input.width;
+      state.height = context2.input.height;
+    }
+    if (context2.preinit) return;
+    if ((state.sourceMapped & 2) !== 0 && context2.beat) state.sourceMapped ^= 1;
+    if ((state.sourceMapped & 1) !== 0) renderForward(context2, state.table, state.config.blend);
+    else renderInverse(context2, state.table, state.config.blend);
+    return { swap: true };
+  });
+  return registry;
+}
+function buildStaticAvsMovementGpuMap(config, width, height) {
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) return null;
+  if (config.sourceMapped !== 0 || config.effect < 2 || config.effect > 17) return null;
+  const count = width * height;
+  if (!Number.isSafeInteger(count) || count >= 1 << 22) return null;
+  const bilinear3 = config.subpixel && width > 1 && height > 1 && config.effect >= 3 && config.effect !== 7;
+  const table5 = {
+    offsets: new Uint32Array(count),
+    weightKeys: new Uint16Array(count),
+    bilinear: bilinear3
+  };
+  buildStaticMovementTable(config, table5, width, height);
+  const packedCoordinates = new Uint32Array(count);
+  for (let index = 0; index < count; index++) {
+    packedCoordinates[index] = table5.offsets[index] | table5.weightKeys[index] << 22;
+  }
+  return { packedCoordinates, bilinear: bilinear3, blend: config.blend };
+}
+function movementProgram(config) {
+  const source = config.effect === CUSTOM_EFFECT ? config.expression : EVALUATED_BUILTINS[config.effect]?.source;
+  if (!source?.trim()) return null;
+  try {
+    return compileAvsEel(source);
+  } catch {
+    return null;
+  }
+}
+function buildMovementTable(context2, state, global) {
+  const { width, height } = context2.input;
+  const count = width * height;
+  const config = state.config;
+  const bilinear3 = config.subpixel && width > 1 && height > 1 && count < 1 << 22 && (config.effect === CUSTOM_EFFECT || config.effect >= 3 && config.effect <= 23 && config.effect !== 7);
+  const table5 = {
+    offsets: new Uint32Array(count),
+    weightKeys: new Uint16Array(count),
+    bilinear: bilinear3
+  };
+  if (config.effect === 1) {
+    for (let i = 0; i < count; i++) {
+      const dx = nextRandom(state) % 3 - 1;
+      const dy = nextRandom(state) % 3 - 1;
+      table5.offsets[i] = clamp5(i + dx + dy * width, 0, count - 1);
+    }
+    return table5;
+  }
+  if (config.effect === 2) {
+    buildStaticMovementTable(config, table5, width, height);
+    return table5;
+  }
+  if (config.effect === 7) {
+    buildStaticMovementTable(config, table5, width, height);
+    return table5;
+  }
+  if (state.program) buildEvaluatedTable(context2, state, table5, global);
+  else if (config.effect >= 3 && config.effect <= 17) buildStaticMovementTable(config, table5, width, height);
+  else fillIdentity(table5, width, height);
+  return table5;
+}
+function buildStaticMovementTable(config, table5, width, height) {
+  if (config.effect === 2) {
+    const shift = Math.trunc(width / 64);
+    for (let y = 0; y < height; y++) {
+      let sourceX = shift;
+      for (let x = 0; x < width; x++) {
+        table5.offsets[x + y * width] = sourceX + y * width;
+        sourceX++;
+        if (sourceX >= width) sourceX -= width;
+      }
+    }
+    return;
+  }
+  if (config.effect === 7) {
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+      let sourceX = x;
+      let sourceY = y;
+      if ((x & 2) === 0 && (y & 2) === 0) {
+        sourceX = Math.trunc(width / 2 + ((x & ~1) - width / 2) * 7 / 8);
+        sourceY = Math.trunc(height / 2 + ((y & ~1) - height / 2) * 7 / 8);
+      }
+      table5.offsets[x + y * width] = clamp5(sourceX, 0, width - 1) + clamp5(sourceY, 0, height - 1) * width;
+    }
+    return;
+  }
+  const halfWidth = Math.trunc(width / 2);
+  const halfHeight = Math.trunc(height / 2);
+  const maxDistance = Math.sqrt(width * width + height * height) / 2;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const xd = x - halfWidth;
+      const yd = y - halfHeight;
+      let distance = Math.hypot(xd, yd);
+      let angle = Math.atan2(yd, xd);
+      let xOffset = 0;
+      switch (config.effect) {
+        case 3:
+          angle += 0.1 - 0.2 * distance / maxDistance;
+          distance *= 0.96;
+          break;
+        case 4:
+          distance *= 0.99 * (1 - Math.sin(angle) / 32);
+          angle += 0.03 * Math.sin(distance / maxDistance * Math.PI * 4);
+          break;
+        case 5:
+          distance *= 0.94 + Math.cos(angle * 32) * 0.06;
+          break;
+        case 6:
+          distance *= 1.01 + Math.cos(angle * 4) * 0.04;
+          angle += 0.03 * Math.sin(distance / maxDistance * Math.PI * 4);
+          break;
+        case 8:
+          angle += 0.1 * Math.sin(distance / maxDistance * Math.PI * 5);
+          break;
+        case 9: {
+          const t = Math.sin(distance / maxDistance * Math.PI);
+          distance -= 8 * t ** 5;
+          break;
+        }
+        case 10: {
+          const t = Math.sin(distance / maxDistance * Math.PI);
+          distance -= 8 * t ** 5;
+          const swirl = Math.cos(distance / maxDistance * Math.PI / 2);
+          angle += 0.1 * swirl ** 3;
+          break;
+        }
+        case 11:
+          distance *= 0.95 + Math.cos(angle * 5 - Math.PI / 2.5) * 0.03;
+          break;
+        case 12:
+          angle += 0.04;
+          distance *= 0.96 + Math.cos(distance / maxDistance * Math.PI) * 0.05;
+          break;
+        case 13: {
+          const t = Math.cos(distance / maxDistance * Math.PI);
+          angle += 0.07 * t;
+          distance *= 0.98 + t * 0.1;
+          break;
+        }
+        case 14:
+          angle += 0.1 - 0.2 * distance / maxDistance;
+          distance *= 0.96;
+          xOffset = 8;
+          break;
+        case 15:
+          distance = maxDistance * 0.15;
+          break;
+        case 16:
+          angle = Math.cos(angle * 3);
+          break;
+        case 17:
+          distance *= 1 - (distance / maxDistance - 0.35) * 0.5;
+          angle += 0.1;
+          break;
+      }
+      const sampleX = halfWidth + Math.cos(angle) * distance + 0.5 + xOffset * width / 256;
+      const sampleY = halfHeight + Math.sin(angle) * distance + 0.5;
+      storeCoordinate(table5, x + y * width, sampleX, sampleY, width, height, config.wrap);
+    }
+  }
+}
+function buildEvaluatedTable(context2, state, table5, global) {
+  const { width, height } = context2.input;
+  const halfWidth = Math.trunc(width / 2);
+  const halfHeight = Math.trunc(height / 2);
+  const maxDistance = Math.sqrt(width * width + height * height) / 2;
+  const vm = new AvsEelVm({ global, seed: state.randomState });
+  vm.setHost({
+    getosc: (band, span, channel) => avsAudioSample(context2.audio, "osc", band, span, channel),
+    getspec: (band, span, channel) => avsAudioSample(context2.audio, "spec", band, span, channel)
+  });
+  vm.set("sw", width);
+  vm.set("sh", height);
+  const rectangular = state.config.effect === CUSTOM_EFFECT ? state.config.rectangular : EVALUATED_BUILTINS[state.config.effect]?.rectangular === true;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const xd = x - halfWidth;
+      const yd = y - halfHeight;
+      vm.set("x", halfWidth === 0 ? 0 : xd / halfWidth);
+      vm.set("y", halfHeight === 0 ? 0 : yd / halfHeight);
+      vm.set("d", maxDistance === 0 ? 0 : Math.hypot(xd, yd) / maxDistance);
+      vm.set("r", Math.atan2(yd, xd) + Math.PI / 2);
+      vm.execute(state.program);
+      let sampleX;
+      let sampleY;
+      if (rectangular) {
+        sampleX = (vm.get("x") + 1) * halfWidth;
+        sampleY = (vm.get("y") + 1) * halfHeight;
+      } else {
+        const distance = vm.get("d") * maxDistance;
+        const angle = vm.get("r") - Math.PI / 2;
+        sampleX = halfWidth + Math.cos(angle) * distance;
+        sampleY = halfHeight + Math.sin(angle) * distance;
+      }
+      if (!table5.bilinear) {
+        sampleX += 0.5;
+        sampleY += 0.5;
+      }
+      storeCoordinate(table5, x + y * width, sampleX, sampleY, width, height, state.config.wrap);
+    }
+  }
+}
+function storeCoordinate(table5, destination, rawX, rawY, width, height, wrap) {
+  if (!table5.bilinear) {
+    let x2 = Math.trunc(rawX);
+    let y2 = Math.trunc(rawY);
+    if (wrap) {
+      x2 = modulo3(x2, width);
+      y2 = modulo3(y2, height);
+    } else {
+      x2 = clamp5(x2, 0, width - 1);
+      y2 = clamp5(y2, 0, height - 1);
+    }
+    table5.offsets[destination] = x2 + y2 * width;
+    return;
+  }
+  let x = Math.trunc(rawX);
+  let y = Math.trunc(rawY);
+  let xPartial = Math.trunc(32 * (rawX - x));
+  let yPartial = Math.trunc(32 * (rawY - y));
+  if (wrap) {
+    x = modulo3(x, width - 1);
+    y = modulo3(y, height - 1);
+  } else {
+    if (x < 0) {
+      x = 0;
+      xPartial = 0;
+    } else if (x >= width - 1) {
+      x = width - 2;
+      xPartial = 31;
+    }
+    if (y < 0) {
+      y = 0;
+      yPartial = 0;
+    } else if (y >= height - 1) {
+      y = height - 2;
+      yPartial = 31;
+    }
+  }
+  const packed = (x + y * width | yPartial << 22 | xPartial << 27) >>> 0;
+  table5.offsets[destination] = packed & OFFSET_MASK;
+  const xWeight = packed >>> 24 & 31 << 3;
+  const yWeight = packed >>> 19 & 31 << 3;
+  table5.weightKeys[destination] = xWeight << 2 | yWeight >>> 3;
+}
+function renderInverse(context2, table5, blend2) {
+  const source = context2.input.pixels;
+  const output = context2.output.pixels;
+  const width = context2.input.width;
+  if (table5.bilinear) {
+    if (blend2) {
+      for (let i = 0; i < output.length; i++) {
+        output[i] = averagePixel3(source[i], sampleBilinear(
+          source,
+          table5.offsets[i],
+          width,
+          table5.weightKeys[i]
+        ));
+      }
+    } else {
+      for (let i = 0; i < output.length; i++) {
+        output[i] = sampleBilinear(source, table5.offsets[i], width, table5.weightKeys[i]);
+      }
+    }
+  } else if (blend2) {
+    for (let i = 0; i < output.length; i++) output[i] = averagePixel3(source[i], source[table5.offsets[i]]);
+  } else {
+    for (let i = 0; i < output.length; i++) output[i] = source[table5.offsets[i]];
+  }
+}
+function renderForward(context2, table5, blend2) {
+  const source = context2.input.pixels;
+  const output = context2.output.pixels;
+  if (blend2) output.set(source);
+  else output.fill(0);
+  for (let i = 0; i < source.length; i++) {
+    const destination = table5.offsets[i];
+    output[destination] = maximumPixel2(source[i], output[destination]);
+  }
+  if (blend2) {
+    for (let i = 0; i < output.length; i++) output[i] = averagePixel3(output[i], source[i]);
+  }
+}
+function sampleBilinear(source, offset, width, weightKey) {
+  const blendTable = AVS_BLEND_TABLE;
+  const w0 = BILINEAR_WEIGHTS[0][weightKey];
+  const w1 = BILINEAR_WEIGHTS[1][weightKey];
+  const w2 = BILINEAR_WEIGHTS[2][weightKey];
+  const w3 = BILINEAR_WEIGHTS[3][weightKey];
+  const p0 = source[offset];
+  const p1 = source[offset + 1];
+  const p2 = source[offset + width];
+  const p3 = source[offset + width + 1];
+  const low = blendTable[(p0 & 255) << 8 | w0] + blendTable[(p1 & 255) << 8 | w1] + blendTable[(p2 & 255) << 8 | w2] + blendTable[(p3 & 255) << 8 | w3];
+  const middle = blendTable[(p0 >>> 8 & 255) << 8 | w0] + blendTable[(p1 >>> 8 & 255) << 8 | w1] + blendTable[(p2 >>> 8 & 255) << 8 | w2] + blendTable[(p3 >>> 8 & 255) << 8 | w3];
+  const high = blendTable[(p0 >>> 16 & 255) << 8 | w0] + blendTable[(p1 >>> 16 & 255) << 8 | w1] + blendTable[(p2 >>> 16 & 255) << 8 | w2] + blendTable[(p3 >>> 16 & 255) << 8 | w3];
+  return low & 255 | (middle & 255) << 8 | (high & 255) << 16;
+}
+function fillIdentity(table5, width, height) {
+  for (let i = 0; i < width * height; i++) table5.offsets[i] = i;
+}
+function averagePixel3(a, b) {
+  return (a >>> 1 & 8355711) + (b >>> 1 & 8355711) & 16777215;
+}
+function maximumPixel2(a, b) {
+  return Math.max(a & 255, b & 255) | Math.max(a >>> 8 & 255, b >>> 8 & 255) << 8 | Math.max(a >>> 16 & 255, b >>> 16 & 255) << 16;
+}
+function nextRandom(state) {
+  let x = state.randomState || 1831565813;
+  x ^= x << 13;
+  x ^= x >>> 17;
+  x ^= x << 5;
+  state.randomState = x >>> 0;
+  return state.randomState;
+}
+function modulo3(value, modulus) {
+  if (modulus <= 0) return 0;
+  const result = value % modulus;
+  return result < 0 ? result + modulus : result;
+}
+function readI322(payload, offset, fallback2) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback2;
+}
+function asciiEquals(payload, offset, value) {
+  if (offset + value.length > payload.length) return false;
+  for (let i = 0; i < value.length; i++) if (payload[offset + i] !== value.charCodeAt(i)) return false;
+  return true;
+}
+function nulText3(bytes) {
+  const end = bytes.indexOf(0);
+  return TEXT2.decode(end < 0 ? bytes : bytes.subarray(0, end));
+}
+function clamp5(value, minimum, maximum) {
+  return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+function hashPath3(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+
+// src/avs/effects/blitter-gpu.ts
+function decodeAvsRotoBlitter(payload) {
+  return {
+    zoom: int3(payload, 0, 31),
+    direction: int3(payload, 4, 31),
+    blend: int3(payload, 8, 0) !== 0,
+    beatReverse: int3(payload, 12, 0) !== 0,
+    beatSpeed: int3(payload, 16, 0),
+    beatZoom: int3(payload, 20, 31),
+    beatScale: int3(payload, 24, 0) !== 0,
+    subpixel: int3(payload, 28, 0) !== 0
+  };
+}
+function decodeAvsBlitterFeedback(payload) {
+  return {
+    scale: int3(payload, 0, 30),
+    beatScale: int3(payload, 4, 30),
+    blend: int3(payload, 8, 0) !== 0,
+    changeOnBeat: int3(payload, 12, 0) !== 0,
+    subpixel: int3(payload, 16, 0) !== 0
+  };
+}
+function buildStaticAvsBlitterFeedbackGpuParams(config, width, height) {
+  if (config.changeOnBeat || !Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) return null;
+  const pixels = width * height;
+  if (!Number.isSafeInteger(pixels) || pixels > 2147483647) return null;
+  const value = Math.max(0, config.scale);
+  if (value === 32) return null;
+  if (value < 32) {
+    const step2 = Math.trunc((value + 32) * 65536 / 64);
+    const startX2 = Math.trunc((width * 65536 - step2 * width) / 2);
+    const startY2 = Math.trunc((height * 65536 - step2 * height) / 2);
+    if (Math.max(startX2 + width * step2 * 2, startY2 + height * step2) > 2147483647) return null;
+    return {
+      width,
+      height,
+      pixels,
+      mode: 1,
+      step: step2,
+      startX: startX2,
+      startY: startY2,
+      regionWidth: width,
+      regionHeight: height,
+      blend: config.blend,
+      subpixel: config.subpixel
+    };
+  }
+  if (value > 4095) return null;
+  const step = value + 96 << 9;
+  if (step <= 0) return null;
+  const regionWidth = Math.trunc(width * 65536 / step) & ~3;
+  const regionHeight = Math.trunc(height * 65536 / step);
+  if (regionWidth >= width || regionHeight >= height || regionWidth <= 0 || regionHeight <= 0) return null;
+  const startX = Math.trunc((width - regionWidth) / 2);
+  const startY = Math.trunc((height - regionHeight) / 2);
+  if (Math.max(regionWidth * step * 2, regionHeight * step) > 2147483647) return null;
+  return {
+    width,
+    height,
+    pixels,
+    mode: 2,
+    step,
+    startX,
+    startY,
+    regionWidth,
+    regionHeight,
+    blend: config.blend,
+    subpixel: false
+  };
+}
+function buildStaticAvsRotoBlitterGpuParams(config, width, height) {
+  if (config.beatReverse || config.beatScale || width < 2 || height < 2) return null;
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width > 16384 || height > 16384) return null;
+  const pixels = width * height;
+  if (!Number.isSafeInteger(pixels) || pixels > 2147483647) return null;
+  const ds = width - 1 << 16;
+  const dt = height - 1 << 16;
+  if (ds <= 0 || dt <= 0) return null;
+  const zoom = 1 + (config.zoom - 31) / 31;
+  const radians = (config.direction - 32) * Math.PI / 180;
+  const cosine = Math.cos(radians) * zoom;
+  const sine = Math.sin(radians) * zoom;
+  const dsDx = Math.trunc(cosine * 65536);
+  const dtDy = Math.trunc(cosine * 65536);
+  const dsDy = -Math.trunc(sine * 65536);
+  const dtDx = Math.trunc(sine * 65536);
+  if (dsDx <= -ds || dsDx >= ds || dtDx <= -dt || dtDx >= dt) return null;
+  if (![dsDx, dtDy, dsDy, dtDx].every(Number.isSafeInteger)) return null;
+  const safe = 2147483647;
+  if (Math.abs(dsDx) * (width - 1) + Math.abs(dsDy) * (height - 1) + ds > safe) return null;
+  if (Math.abs(dtDx) * (width - 1) + Math.abs(dtDy) * (height - 1) + dt > safe) return null;
+  const halfWidth = Math.trunc((width - 1) / 2);
+  const halfHeight = Math.trunc((height - 1) / 2);
+  const sStart = modulo4(
+    -halfWidth * dsDx - halfHeight * dsDy + (width - 1) * (32768 + (1 << 20)),
+    ds
+  );
+  const tStart = modulo4(
+    -halfWidth * dtDx - halfHeight * dtDy + (height - 1) * (32768 + (1 << 20)),
+    dt
+  );
+  return {
+    width,
+    height,
+    pixels,
+    ds,
+    dt,
+    dsDx,
+    dsDy,
+    dtDx,
+    dtDy,
+    sStart,
+    tStart,
+    subpixel: config.subpixel,
+    blend: config.blend
+  };
+}
+function modulo4(value, divisor) {
+  const result = value % divisor;
+  return result < 0 ? result + divisor : result;
+}
+function int3(payload, offset, fallback2) {
+  if (offset + 4 > payload.byteLength) return fallback2;
+  return new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true);
+}
+
+// src/avs/gpu-frame-graph.ts
+var AVS_GPU_TERMINAL_CAPABILITY = {
+  id: "packed-u32-terminal",
+  backend: "webgpu",
+  lane: "exact",
+  byteExact: true,
+  reason: "Unpacks AVS 0x00RRGGBB channels with integer shifts; no filtering or blend approximation."
+};
+var AVS_GPU_BLUR_CAPABILITY = {
+  id: "classic-blur-packed-u32",
+  backend: "webgpu",
+  lane: "exact",
+  byteExact: true,
+  reason: "Uses AVS integer channel shifts, zero-edge kernels, and per-mode rounding in packed u32 storage."
+};
+var AVS_GPU_POINTWISE_CAPABILITY = {
+  id: "classic-pointwise-fused-packed-u32",
+  backend: "webgpu",
+  lane: "exact",
+  byteExact: true,
+  reason: "Fuses stateless AVS byte-channel transforms into one integer storage-buffer dispatch."
+};
+var AVS_GPU_MOVEMENT_CAPABILITY = {
+  id: "classic-movement-static-map-packed-u32",
+  backend: "webgpu",
+  lane: "exact",
+  byteExact: true,
+  reason: "CPU builds one immutable native coordinate table; WebGPU performs exact packed-u32 nearest/bilinear resampling."
+};
+var AVS_GPU_ROTO_BLITTER_CAPABILITY = {
+  id: "classic-roto-blitter-affine-packed-u32",
+  backend: "webgpu",
+  lane: "exact",
+  byteExact: true,
+  reason: "Evaluates native 16.16 affine coordinates and packed nearest/bilinear sampling per destination pixel."
+};
+var AVS_GPU_BLITTER_FEEDBACK_CAPABILITY = {
+  id: "classic-blitter-feedback-affine-packed-u32",
+  backend: "webgpu",
+  lane: "exact",
+  byteExact: true,
+  reason: "Evaluates native static zoom coordinates, legacy group-of-four stepping, and packed sampling per destination pixel."
+};
+var AVS_EXACT_BLUR_WGSL = (
+  /* wgsl */
+  `
+struct Params { width: u32, height: u32, mode: u32, rounding: u32 };
+@group(0) @binding(0) var<storage, read> source: array<u32>;
+@group(0) @binding(1) var<storage, read_write> destination: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+fn shifted(pixel: u32, amount: u32) -> u32 {
+  let masks = array<u32, 5>(0u, 0x007f7f7fu, 0x003f3f3fu, 0x001f1f1fu, 0x000f0f0fu);
+  return (pixel >> amount) & masks[amount];
+}
+
+@compute @workgroup_size(256)
+fn blur_main(@builtin(global_invocation_id) id: vec3u) {
+  let index = id.x;
+  let count = params.width * params.height;
+  if (index >= count) { return; }
+  if (params.width < 2u || params.height < 2u) {
+    destination[index] = source[index] & 0x00ffffffu;
+    return;
+  }
+  let x = index % params.width;
+  let y = index / params.width;
+  let at_left = x == 0u;
+  let at_right = x + 1u == params.width;
+  let at_top = y == 0u;
+  let at_bottom = y + 1u == params.height;
+  let center = source[index];
+  var left = 0u; var right = 0u; var up = 0u; var down = 0u;
+  if (!at_left) { left = source[index - 1u]; }
+  if (!at_right) { right = source[index + 1u]; }
+  if (!at_top) { up = source[index - params.width]; }
+  if (!at_bottom) { down = source[index + params.width]; }
+  let corner = (at_left || at_right) && (at_top || at_bottom);
+  let edge = at_left || at_right || at_top || at_bottom;
+  var value = 0u;
+  var round = 0u;
+  if (params.mode == 3u) {
+    value += select(shifted(left, 2u) + shifted(right, 2u), shifted(select(left, right, at_left), 1u), at_left || at_right);
+    value += select(shifted(up, 2u) + shifted(down, 2u), shifted(select(up, down, at_top), 1u), at_top || at_bottom);
+    round = select(3u, select(2u, 1u, corner), at_left || at_right || at_top || at_bottom);
+  } else if (params.mode == 2u) {
+    value = shifted(center, 1u);
+    if (corner) {
+      value += shifted(center, 2u) + shifted(select(left, right, at_left), 3u) + shifted(select(up, down, at_top), 3u);
+      round = 3u;
+    } else if (edge) {
+      value += shifted(center, 3u);
+      if (at_top || at_bottom) {
+        value += shifted(left, 3u) + shifted(right, 3u) + shifted(select(up, down, at_top), 3u);
+      } else {
+        value += shifted(select(left, right, at_left), 3u) + shifted(up, 3u) + shifted(down, 3u);
+      }
+      round = 4u;
+    } else {
+      value += shifted(center, 2u) + shifted(left, 4u) + shifted(right, 4u) + shifted(up, 4u) + shifted(down, 4u);
+      round = 5u;
+    }
+  } else {
+    if (corner) {
+      value = shifted(center, 1u) + shifted(select(left, right, at_left), 2u) + shifted(select(up, down, at_top), 2u);
+      round = 2u;
+    } else if (at_top || at_bottom) {
+      value = shifted(center, 2u) + shifted(left, 2u) + shifted(right, 2u) + shifted(select(up, down, at_top), 2u);
+      round = 3u;
+    } else if (at_left || at_right) {
+      value = shifted(center, 2u) + shifted(select(left, right, at_left), 2u) + shifted(up, 2u) + shifted(down, 2u);
+      round = 3u;
+    } else {
+      value = shifted(center, 1u) + shifted(left, 3u) + shifted(right, 3u) + shifted(up, 3u) + shifted(down, 3u);
+      round = 4u;
+    }
+  }
+  let rounding = select(0u, round * 0x00010101u, params.rounding != 0u);
+  destination[index] = (value + rounding) & 0x00ffffffu;
+}
+`
+);
+var AVS_EXACT_POINTWISE_HELPERS_WGSL = (
+  /* wgsl */
+  `
+fn avs_approach(value: i32, target_value: i32, amount: i32) -> u32 {
+  if (value <= target_value - amount) { return u32(value + amount) & 255u; }
+  if (value >= target_value + amount) { return u32(value - amount) & 255u; }
+  return u32(target_value) & 255u;
+}
+fn avs_pack(low: u32, middle: u32, high: u32) -> u32 { return (low & 255u) | ((middle & 255u) << 8u) | ((high & 255u) << 16u); }
+fn avs_adjust(pixel: u32, red_multiplier: u32, green_multiplier: u32, blue_multiplier: u32) -> u32 {
+  return avs_pack(min(255u, ((pixel & 255u) * blue_multiplier) / 65536u), min(255u, (((pixel >> 8u) & 255u) * green_multiplier) / 65536u), min(255u, (((pixel >> 16u) & 255u) * red_multiplier) / 65536u));
+}
+fn avs_add(left: u32, right: u32) -> u32 { return avs_pack(min(255u, (left & 255u) + (right & 255u)), min(255u, ((left >> 8u) & 255u) + ((right >> 8u) & 255u)), min(255u, ((left >> 16u) & 255u) + ((right >> 16u) & 255u))); }
+fn avs_in_range(pixel: u32, reference: u32, distance: i32) -> bool {
+  return abs(i32(pixel & 255u) - i32(reference & 255u)) <= distance && abs(i32((pixel >> 8u) & 255u) - i32((reference >> 8u) & 255u)) <= distance && abs(i32((pixel >> 16u) & 255u) - i32((reference >> 16u) & 255u)) <= distance;
+}`
+);
+function buildExactAvsPointwiseBody(operations) {
+  if (!operations.length) throw new RangeError("Pointwise GPU fragment needs at least one operation");
+  return operations.map((operation, index) => pointwiseWgsl(operation, index)).join("\n");
+}
+function buildExactAvsPointwiseWgsl(operations) {
+  if (operations.length === 0) throw new RangeError("Pointwise GPU pass needs at least one operation");
+  const body = operations.map((operation, index) => pointwiseWgsl(operation, index)).join("\n");
+  return (
+    /* wgsl */
+    `
+@group(0) @binding(0) var<storage, read> source: array<u32>;
+@group(0) @binding(1) var<storage, read_write> destination: array<u32>;
+
+fn avs_approach(value: i32, target_value: i32, amount: i32) -> u32 {
+  if (value <= target_value - amount) { return u32(value + amount) & 255u; }
+  if (value >= target_value + amount) { return u32(value - amount) & 255u; }
+  return u32(target_value) & 255u;
+}
+
+fn avs_pack(low: u32, middle: u32, high: u32) -> u32 {
+  return (low & 255u) | ((middle & 255u) << 8u) | ((high & 255u) << 16u);
+}
+
+fn avs_adjust(pixel: u32, red_multiplier: u32, green_multiplier: u32, blue_multiplier: u32) -> u32 {
+  let low = min(255u, ((pixel & 255u) * blue_multiplier) / 65536u);
+  let middle = min(255u, (((pixel >> 8u) & 255u) * green_multiplier) / 65536u);
+  let high = min(255u, (((pixel >> 16u) & 255u) * red_multiplier) / 65536u);
+  return avs_pack(low, middle, high);
+}
+
+fn avs_add(left: u32, right: u32) -> u32 {
+  return avs_pack(
+    min(255u, (left & 255u) + (right & 255u)),
+    min(255u, ((left >> 8u) & 255u) + ((right >> 8u) & 255u)),
+    min(255u, ((left >> 16u) & 255u) + ((right >> 16u) & 255u)),
+  );
+}
+
+fn avs_in_range(pixel: u32, reference: u32, distance: i32) -> bool {
+  return abs(i32(pixel & 255u) - i32(reference & 255u)) <= distance
+    && abs(i32((pixel >> 8u) & 255u) - i32((reference >> 8u) & 255u)) <= distance
+    && abs(i32((pixel >> 16u) & 255u) - i32((reference >> 16u) & 255u)) <= distance;
+}
+
+@compute @workgroup_size(256)
+fn pointwise_main(@builtin(global_invocation_id) id: vec3u) {
+  let index = id.x;
+  if (index >= arrayLength(&source)) { return; }
+  var pixel = source[index] & 0x00ffffffu;
+${indentWgsl(body, 2)}
+  destination[index] = pixel & 0x00ffffffu;
+}
+`
+  );
+}
+function pointwiseWgsl(operation, index) {
+  switch (operation.kind) {
+    case "fade": {
+      assertIntegerRange(operation.fade, 1, 255, "Fade amount");
+      const target = operation.target & 16777215;
+      return `// fused ${index}: Fade Out
+pixel = avs_pack(avs_approach(i32(pixel & 255u), ${target & 255}i, ${operation.fade}i), avs_approach(i32((pixel >> 8u) & 255u), ${target >>> 8 & 255}i, ${operation.fade}i), avs_approach(i32((pixel >> 16u) & 255u), ${target >>> 16 & 255}i, ${operation.fade}i));`;
+    }
+    case "invert":
+      return `// fused ${index}: Invert
+pixel = pixel ^ 0x00ffffffu;`;
+    case "fast-brightness":
+      if (operation.direction !== 0 && operation.direction !== 1) {
+        throw new RangeError(`Fast Brightness direction ${String(operation.direction)} is not exact-GPU eligible`);
+      }
+      return operation.direction === 0 ? `// fused ${index}: Fast Brightness double
+pixel = avs_pack(min(255u, (pixel & 255u) * 2u), min(255u, ((pixel >> 8u) & 255u) * 2u), min(255u, ((pixel >> 16u) & 255u) * 2u));` : `// fused ${index}: Fast Brightness half
+pixel = (pixel >> 1u) & 0x007f7f7fu;`;
+    case "channel-shift": {
+      assertIntegerRange(operation.mode, -2147483648, 2147483647, "Channel Shift mode");
+      const low = "pixel & 255u", middle = "(pixel >> 8u) & 255u", high = "(pixel >> 16u) & 255u";
+      const packed = operation.mode === 1020 ? `avs_pack(${middle}, ${low}, ${high})` : operation.mode === 1018 ? `avs_pack(${high}, ${low}, ${middle})` : operation.mode === 1022 ? `avs_pack(${low}, ${high}, ${middle})` : operation.mode === 1019 ? `avs_pack(${middle}, ${high}, ${low})` : operation.mode === 1021 ? `avs_pack(${high}, ${middle}, ${low})` : null;
+      return packed ? `// fused ${index}: Channel Shift ${operation.mode}
+pixel = ${packed};` : `// fused ${index}: Channel Shift ${operation.mode} native no-op`;
+    }
+    case "color-reduction":
+      assertIntegerRange(operation.mask, 0, 16777215, "Color Reduction mask");
+      return `// fused ${index}: Color Reduction
+if (index >= 4u) { pixel &= ${operation.mask}u; }`;
+    case "multiplier": {
+      assertIntegerRange(operation.mode, -2147483648, 2147483647, "Multiplier mode");
+      if (operation.mode === 0) return `// fused ${index}: Multiplier infinite root
+if (index > 0u) { pixel = select(0xffffffu, 0u, pixel == 0u); }`;
+      if (operation.mode === 7) return `// fused ${index}: Multiplier infinite square
+if (index > 0u) { pixel = select(0u, 0xffffffu, pixel == 0xffffffu); }`;
+      if (operation.mode >= 1 && operation.mode <= 3) {
+        const factor = 1 << 4 - operation.mode;
+        return `// fused ${index}: Multiplier x${factor}
+if (index < arrayLength(&source) - (arrayLength(&source) & 1u)) { pixel = avs_pack(min(255u, (pixel & 255u) * ${factor}u), min(255u, ((pixel >> 8u) & 255u) * ${factor}u), min(255u, ((pixel >> 16u) & 255u) * ${factor}u)); }`;
+      }
+      if (operation.mode >= 4 && operation.mode <= 6) {
+        const shift = operation.mode - 3;
+        return `// fused ${index}: Multiplier divide ${1 << shift}
+if (index < arrayLength(&source) - (arrayLength(&source) & 1u)) { pixel = avs_pack((pixel & 255u) >> ${shift}u, ((pixel >> 8u) & 255u) >> ${shift}u, ((pixel >> 16u) & 255u) >> ${shift}u); }`;
+      }
+      return `// fused ${index}: Multiplier ${operation.mode} native no-op`;
+    }
+    case "color-clip": {
+      assertIntegerRange(operation.mode, 1, 3, "Color Clip mode");
+      assertIntegerRange(operation.distanceSquared, 0, 195075, "Color Clip distance squared");
+      const source = operation.source & 16777215;
+      const low = source & 255;
+      const middle = source >>> 8 & 255;
+      const high = source >>> 16 & 255;
+      const condition = operation.mode === 1 ? `(pixel & 255u) <= ${low}u && ((pixel >> 8u) & 255u) <= ${middle}u && ((pixel >> 16u) & 255u) <= ${high}u` : operation.mode === 2 ? `(pixel & 255u) >= ${low}u && ((pixel >> 8u) & 255u) >= ${middle}u && ((pixel >> 16u) & 255u) >= ${high}u` : `u32((i32(pixel & 255u) - ${low}i) * (i32(pixel & 255u) - ${low}i) + (i32((pixel >> 8u) & 255u) - ${middle}i) * (i32((pixel >> 8u) & 255u) - ${middle}i) + (i32((pixel >> 16u) & 255u) - ${high}i) * (i32((pixel >> 16u) & 255u) - ${high}i)) <= ${operation.distanceSquared}u`;
+      return `// fused ${index}: Color Clip
+if (${condition}) { pixel = ${operation.replacement & 16777215}u; }`;
+    }
+    case "brightness": {
+      for (const [name, value] of [
+        ["red", operation.redMultiplier],
+        ["green", operation.greenMultiplier],
+        ["blue", operation.blueMultiplier]
+      ]) assertIntegerRange(value, 0, Math.floor(4294967295 / 255), `Brightness ${name} multiplier`);
+      assertIntegerRange(operation.distance, -2147483647, 2147483647, "Brightness exclusion distance");
+      const adjusted = `adjusted_${index}`;
+      const excluded = operation.exclude ? `if (!avs_in_range(pixel, ${operation.reference & 16777215}u, ${operation.distance}i)) {
+` : "";
+      const close2 = operation.exclude ? "\n}" : "";
+      const combine = operation.additive ? `pixel = avs_add(pixel, ${adjusted});` : operation.average ? `pixel = ((pixel >> 1u) & 0x007f7f7fu) + ((${adjusted} >> 1u) & 0x007f7f7fu);` : `pixel = ${adjusted};`;
+      return `// fused ${index}: Brightness
+${excluded}  let ${adjusted} = avs_adjust(pixel, ${operation.redMultiplier}u, ${operation.greenMultiplier}u, ${operation.blueMultiplier}u);
+  ${combine}${close2}`;
+    }
+  }
+}
+function assertIntegerRange(value, minimum, maximum, label) {
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new RangeError(`${label} ${String(value)} is outside ${minimum}..${maximum}`);
+  }
+}
+function indentWgsl(source, spaces) {
+  const prefix = " ".repeat(spaces);
+  return source.split("\n").map((line) => `${prefix}${line}`).join("\n");
+}
+var AVS_EXACT_MOVEMENT_WGSL = (
+  /* wgsl */
+  `
+struct Params { width: u32, pixels: u32, bilinear: u32, blend: u32 };
+@group(0) @binding(0) var<storage, read> source: array<u32>;
+@group(0) @binding(1) var<storage, read_write> destination: array<u32>;
+@group(0) @binding(2) var<storage, read> coordinate_map: array<u32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+fn avs_table(first: u32, second: u32) -> u32 {
+  var result = (first * second) / 255u;
+  // The compatibility oracle builds native g_blendtable in JS as
+  // trunc((first / 255) * second). Binary64 lands just below the exact integer
+  // for these twelve ordered pairs, so preserve that established byte result.
+  let correction = (first == 147u && (second == 85u || second == 170u))
+    || (first == 155u && (second == 51u || second == 102u || second == 153u || second == 204u))
+    || (first == 171u && (second == 85u || second == 170u))
+    || (first == 187u && (second == 75u || second == 150u || second == 165u))
+    || (first == 195u && second == 153u);
+  if (correction) { result -= 1u; }
+  return result;
+}
+fn avs_average(first: u32, second: u32) -> u32 {
+  return ((first >> 1u) & 0x007f7f7fu) + ((second >> 1u) & 0x007f7f7fu);
+}
+fn avs_bilinear(offset: u32, key: u32) -> u32 {
+  let x_part = (key >> 5u) << 3u;
+  let y_part = (key & 31u) << 3u;
+  let inverse_x = 255u - x_part;
+  let inverse_y = 255u - y_part;
+  let weights = array<u32, 4>(
+    avs_table(inverse_x, inverse_y), avs_table(x_part, inverse_y),
+    avs_table(inverse_x, y_part), avs_table(x_part, y_part),
+  );
+  let samples = array<u32, 4>(
+    source[offset], source[offset + 1u],
+    source[offset + params.width], source[offset + params.width + 1u],
+  );
+  var low = 0u; var middle = 0u; var high = 0u;
+  for (var sample_index = 0u; sample_index < 4u; sample_index++) {
+    let pixel = samples[sample_index]; let weight = weights[sample_index];
+    low += avs_table(pixel & 255u, weight);
+    middle += avs_table((pixel >> 8u) & 255u, weight);
+    high += avs_table((pixel >> 16u) & 255u, weight);
+  }
+  return (low & 255u) | ((middle & 255u) << 8u) | ((high & 255u) << 16u);
+}
+@compute @workgroup_size(256)
+fn movement_main(@builtin(global_invocation_id) id: vec3u) {
+  let index = id.x;
+  if (index >= params.pixels) { return; }
+  let packed = coordinate_map[index];
+  let offset = packed & 0x003fffffu;
+  var sampled = source[offset];
+  if (params.bilinear != 0u) { sampled = avs_bilinear(offset, packed >> 22u); }
+  destination[index] = select(sampled, avs_average(source[index], sampled), params.blend != 0u);
+}
+`
+);
+var AVS_EXACT_ROTO_BLITTER_WGSL = (
+  /* wgsl */
+  `
+struct Params {
+  width: i32, height: i32, pixels: i32, ds: i32,
+  dt: i32, ds_dx: i32, ds_dy: i32, dt_dx: i32,
+  dt_dy: i32, s_start: i32, t_start: i32, subpixel: i32,
+  blend: i32,
+};
+@group(0) @binding(0) var<storage, read> source: array<u32>;
+@group(0) @binding(1) var<storage, read_write> destination: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+fn positive_mod(value: i32, divisor: i32) -> i32 {
+  let remainder = value % divisor;
+  return select(remainder, remainder + divisor, remainder < 0);
+}
+fn avs_table(first: u32, second: u32) -> u32 {
+  var result = (first * second) / 255u;
+  let correction = (first == 147u && (second == 85u || second == 170u))
+    || (first == 155u && (second == 51u || second == 102u || second == 153u || second == 204u))
+    || (first == 171u && (second == 85u || second == 170u))
+    || (first == 187u && (second == 75u || second == 150u || second == 165u))
+    || (first == 195u && second == 153u);
+  if (correction) { result -= 1u; }
+  return result;
+}
+fn avs_average(first: u32, second: u32) -> u32 {
+  return ((first >> 1u) & 0x007f7f7fu) + ((second >> 1u) & 0x007f7f7fu);
+}
+fn avs_bilinear(offset: u32, fx: u32, fy: u32) -> u32 {
+  let inverse_x = 255u - fx;
+  let inverse_y = 255u - fy;
+  let weights = array<u32, 4>(
+    avs_table(inverse_x, inverse_y), avs_table(fx, inverse_y),
+    avs_table(inverse_x, fy), avs_table(fx, fy),
+  );
+  let width = u32(params.width);
+  let samples = array<u32, 4>(
+    source[offset], source[offset + 1u],
+    source[offset + width], source[offset + width + 1u],
+  );
+  var low = 0u; var middle = 0u; var high = 0u;
+  for (var sample_index = 0u; sample_index < 4u; sample_index++) {
+    let pixel = samples[sample_index]; let weight = weights[sample_index];
+    low += avs_table(pixel & 255u, weight);
+    middle += avs_table((pixel >> 8u) & 255u, weight);
+    high += avs_table((pixel >> 16u) & 255u, weight);
+  }
+  return (low & 255u) | ((middle & 255u) << 8u) | ((high & 255u) << 16u);
+}
+@compute @workgroup_size(256)
+fn roto_blitter_main(@builtin(global_invocation_id) id: vec3u) {
+  let index = i32(id.x);
+  if (index >= params.pixels) { return; }
+  let x = index % params.width;
+  let y = index / params.width;
+  let s = positive_mod(params.s_start + y * params.ds_dy + x * params.ds_dx, params.ds);
+  let t = positive_mod(params.t_start + y * params.dt_dy + x * params.dt_dx, params.dt);
+  let source_x = s >> 16;
+  let source_y = t >> 16;
+  let offset = u32(source_x + source_y * params.width);
+  var sampled = source[offset];
+  if (params.subpixel != 0) {
+    sampled = avs_bilinear(offset, u32((s >> 8) & 255), u32((t >> 8) & 255));
+  }
+  destination[u32(index)] = select(sampled, avs_average(source[u32(index)], sampled), params.blend != 0);
+}
+`
+);
+var AVS_EXACT_BLITTER_FEEDBACK_WGSL = (
+  /* wgsl */
+  `
+struct Params {
+  width: i32, height: i32, pixels: i32, mode: i32,
+  step: i32, start_x: i32, start_y: i32, region_width: i32,
+  region_height: i32, blend: i32, subpixel: i32, padding: i32,
+};
+@group(0) @binding(0) var<storage, read> source: array<u32>;
+@group(0) @binding(1) var<storage, read_write> destination: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+fn avs_average(first: u32, second: u32) -> u32 {
+  return ((first >> 1u) & 0x007f7f7fu) + ((second >> 1u) & 0x007f7f7fu);
+}
+fn channel_bilinear(a: u32, b: u32, c: u32, d: u32, fx: u32, fy: u32) -> u32 {
+  let top = (a * (255u - fx) + b * fx) >> 8u;
+  let bottom = (c * (255u - fx) + d * fx) >> 8u;
+  return (top * (255u - fy) + bottom * fy) >> 8u;
+}
+fn bilinear(offset: u32, source_x: i32, source_y: i32, fx: u32, fy: u32) -> u32 {
+  let x1 = min(params.width - 1, source_x + 1);
+  let y1 = min(params.height - 1, source_y + 1);
+  let b = u32(source_y * params.width + x1);
+  let c = u32(y1 * params.width + source_x);
+  let d = u32(y1 * params.width + x1);
+  let pa = source[offset]; let pb = source[b]; let pc = source[c]; let pd = source[d];
+  return channel_bilinear(pa & 255u, pb & 255u, pc & 255u, pd & 255u, fx, fy)
+    | (channel_bilinear((pa >> 8u) & 255u, (pb >> 8u) & 255u, (pc >> 8u) & 255u, (pd >> 8u) & 255u, fx, fy) << 8u)
+    | (channel_bilinear((pa >> 16u) & 255u, (pb >> 16u) & 255u, (pc >> 16u) & 255u, (pd >> 16u) & 255u, fx, fy) << 16u);
+}
+fn nearest_or_black(linear: i32) -> u32 {
+  if (linear < 0 || linear >= params.pixels) { return 0u; }
+  return source[u32(linear)];
+}
+@compute @workgroup_size(256)
+fn blitter_feedback_main(@builtin(global_invocation_id) id: vec3u) {
+  let index = i32(id.x);
+  if (index >= params.pixels) { return; }
+  let x = index % params.width;
+  let y = index / params.width;
+  if (params.mode == 1) {
+    let extra = select(0, (x / 4) * params.step, params.blend != 0 && params.subpixel == 0);
+    let fixed_x = params.start_x + x * params.step + extra;
+    let fixed_y = params.start_y + y * params.step;
+    let source_x = fixed_x >> 16;
+    let source_y = fixed_y >> 16;
+    var sampled = nearest_or_black(source_y * params.width + source_x);
+    if (params.subpixel != 0) {
+      sampled = bilinear(u32(source_y * params.width + source_x), source_x, source_y,
+        u32((fixed_x >> 8) & 255), u32((fixed_y >> 8) & 255));
+    }
+    destination[u32(index)] = select(sampled, avs_average(source[u32(index)], sampled), params.blend != 0);
+    return;
+  }
+  let local_x = x - params.start_x;
+  let local_y = y - params.start_y;
+  if (local_x < 0 || local_y < 0 || local_x >= params.region_width || local_y >= params.region_height) {
+    destination[u32(index)] = source[u32(index)];
+    return;
+  }
+  let extra = select(0, (local_x / 4) * params.step, params.blend != 0);
+  let source_x = (32768 + local_x * params.step + extra) >> 16;
+  let source_y = (32768 + local_y * params.step) >> 16;
+  let sampled = nearest_or_black(source_y * params.width + source_x);
+  destination[u32(index)] = select(sampled, avs_average(source[u32(index)], sampled), params.blend != 0);
+}
+`
+);
+var AVS_PACKED_PRESENT_WGSL = (
+  /* wgsl */
+  `
+@group(0) @binding(0) var<storage, read> avs_pixels: array<u32>;
+@group(0) @binding(1) var<uniform> frame_width: u32;
+
+struct VertexOutput {
+  @builtin(position) position: vec4f,
+};
+
+@vertex fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
+  var positions = array<vec2f, 3>(
+    vec2f(-1.0, -1.0),
+    vec2f( 3.0, -1.0),
+    vec2f(-1.0,  3.0),
+  );
+  var output: VertexOutput;
+  output.position = vec4f(positions[vertex_index], 0.0, 1.0);
+  return output;
+}
+
+@fragment fn fragment_main(@builtin(position) position: vec4f) -> @location(0) vec4f {
+  let coordinate = vec2u(position.xy);
+  let pixel = avs_pixels[coordinate.y * frame_width + coordinate.x];
+  return vec4f(
+    f32((pixel >> 16u) & 255u),
+    f32((pixel >> 8u) & 255u),
+    f32(pixel & 255u),
+    255.0,
+  ) / 255.0;
+}
+`
+);
+function planPackedAvsFrameGraph(width, height, maxStorageBufferBindingSize = Number.MAX_SAFE_INTEGER) {
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+    throw new RangeError(`Invalid AVS frame-graph size ${width}x${height}`);
+  }
+  const pixels = width * height;
+  const framebufferBytes = pixels * Uint32Array.BYTES_PER_ELEMENT;
+  if (!Number.isSafeInteger(framebufferBytes)) throw new RangeError("AVS framebuffer byte size is unsafe");
+  if (framebufferBytes > maxStorageBufferBindingSize) {
+    throw new RangeError(
+      `AVS framebuffer needs ${framebufferBytes} bytes; adapter limit is ${maxStorageBufferBindingSize}`
+    );
+  }
+  return { width, height, pixels, framebufferBytes, residentBytes: framebufferBytes * 2 };
+}
+function assertPackedAvsFrame(pixels, expectedPixels) {
+  if (pixels.length !== expectedPixels) {
+    throw new RangeError(`Packed AVS frame has ${pixels.length} pixels, expected ${expectedPixels}`);
+  }
+  if (!(pixels.buffer instanceof ArrayBuffer)) {
+    throw new TypeError("Packed AVS frame must use transferable ArrayBuffer storage");
+  }
+}
+function assertAvsPassCompatible(lane, capability) {
+  if (lane === "exact" && (!capability.byteExact || capability.lane !== "exact")) {
+    throw new Error(`Frame pass ${capability.id} requires the explicit 120 lane: ${capability.reason}`);
+  }
+}
+var PackedAvsGpuFrameGraph = class _PackedAvsGpuFrameGraph {
+  capability = AVS_GPU_TERMINAL_CAPABILITY;
+  plan;
+  lane;
+  device;
+  context;
+  canvas;
+  format;
+  buffers;
+  widthBuffer;
+  bindGroups;
+  pipeline;
+  onTiming;
+  frame = 0;
+  destroyed = false;
+  constructor(device, context2, format, options) {
+    this.device = device;
+    this.context = context2;
+    this.canvas = options.canvas;
+    this.format = format;
+    this.onTiming = options.onTiming;
+    this.lane = options.lane ?? "exact";
+    this.plan = planPackedAvsFrameGraph(
+      options.width,
+      options.height,
+      Number(device.limits.maxStorageBufferBindingSize)
+    );
+    this.canvas.width = options.width;
+    this.canvas.height = options.height;
+    this.context.configure({ device, format, alphaMode: "opaque" });
+    const createFramebuffer = (label) => device.createBuffer({
+      label,
+      size: this.plan.framebufferBytes,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+    });
+    this.buffers = {
+      primary: createFramebuffer("AVS frame graph primary"),
+      secondary: createFramebuffer("AVS frame graph secondary")
+    };
+    this.widthBuffer = device.createBuffer({
+      label: "AVS frame graph width",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    device.queue.writeBuffer(this.widthBuffer, 0, new Uint32Array([options.width]));
+    const module = device.createShaderModule({
+      label: "AVS exact packed-u32 terminal",
+      code: AVS_PACKED_PRESENT_WGSL
+    });
+    this.pipeline = device.createRenderPipeline({
+      label: "AVS exact packed-u32 terminal",
+      layout: "auto",
+      vertex: { module, entryPoint: "vertex_main" },
+      fragment: { module, entryPoint: "fragment_main", targets: [{ format }] },
+      primitive: { topology: "triangle-list" }
+    });
+    const layout = this.pipeline.getBindGroupLayout(0);
+    const bind = (slot) => device.createBindGroup({
+      label: `AVS exact terminal ${slot}`,
+      layout,
+      entries: [
+        { binding: 0, resource: { buffer: this.buffers[slot] } },
+        { binding: 1, resource: { buffer: this.widthBuffer } }
+      ]
+    });
+    this.bindGroups = { primary: bind("primary"), secondary: bind("secondary") };
+  }
+  static async create(options) {
+    const navigation = globalThis.navigator;
+    const gpu = navigation?.gpu;
+    if (!gpu) return null;
+    const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
+    if (!adapter) return null;
+    const device = await adapter.requestDevice();
+    const context2 = options.canvas.getContext("webgpu");
+    if (!context2) {
+      device.destroy();
+      return null;
+    }
+    try {
+      return new _PackedAvsGpuFrameGraph(device, context2, gpu.getPreferredCanvasFormat(), options);
+    } catch (error) {
+      context2.unconfigure();
+      device.destroy();
+      throw error;
+    }
+  }
+  buffer(slot) {
+    this.assertActive();
+    return this.buffers[slot];
+  }
+  compileExactBlur(config) {
+    this.assertActive();
+    return new ExactAvsBlurPass(this.device, this.plan, config);
+  }
+  compileExactPointwise(operations) {
+    this.assertActive();
+    return new ExactAvsPointwisePass(this.device, operations);
+  }
+  compileExactMovement(config) {
+    this.assertActive();
+    return new ExactAvsMovementPass(this.device, this.plan, config);
+  }
+  compileExactRotoBlitter(config) {
+    this.assertActive();
+    return new ExactAvsRotoBlitterPass(this.device, this.plan, config);
+  }
+  compileExactBlitterFeedback(config) {
+    this.assertActive();
+    return new ExactAvsBlitterFeedbackPass(this.device, this.plan, config);
+  }
+  /** Compile an independently owned resident pass without exposing the device. */
+  compileExternalPass(factory) {
+    this.assertActive();
+    return factory(this.device);
+  }
+  compileExactPass(config) {
+    switch (config.kind) {
+      case "blur":
+        return this.compileExactBlur(config.config);
+      case "pointwise":
+        return this.compileExactPointwise(config.operations);
+      case "movement":
+        return this.compileExactMovement(config.config);
+      case "roto-blitter":
+        return this.compileExactRotoBlitter(config.config);
+      case "blitter-feedback":
+        return this.compileExactBlitterFeedback(config.config);
+    }
+  }
+  upload(slot, pixels) {
+    this.assertActive();
+    assertPackedAvsFrame(pixels, this.plan.pixels);
+    const started = performance.now();
+    this.device.queue.writeBuffer(
+      this.buffers[slot],
+      0,
+      pixels.buffer,
+      pixels.byteOffset,
+      pixels.byteLength
+    );
+    return performance.now() - started;
+  }
+  present(slot, uploadMs = 0) {
+    return this.executeAndPresent([], slot, uploadMs);
+  }
+  /**
+   * Records the compiled pass chain and terminal presentation in one encoder.
+   * Every pass alternates the two resident buffers; no pass may read back.
+   */
+  executeAndPresent(passes, inputSlot = "primary", uploadMs = 0) {
+    this.assertActive();
+    const started = performance.now();
+    const encoder = this.device.createCommandEncoder({ label: "AVS frame graph encoder" });
+    let sourceSlot = inputSlot;
+    for (const framePass of passes) {
+      assertAvsPassCompatible(this.lane, framePass.capability);
+      const targetSlot = sourceSlot === "primary" ? "secondary" : "primary";
+      framePass.encode({
+        device: this.device,
+        encoder,
+        width: this.plan.width,
+        height: this.plan.height,
+        source: this.buffers[sourceSlot],
+        target: this.buffers[targetSlot]
+      });
+      sourceSlot = targetSlot;
+    }
+    const pass = encoder.beginRenderPass({
+      label: "AVS exact terminal pass",
+      colorAttachments: [{
+        view: this.context.getCurrentTexture().createView(),
+        loadOp: "clear",
+        storeOp: "store",
+        clearValue: { r: 0, g: 0, b: 0, a: 1 }
+      }]
+    });
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, this.bindGroups[sourceSlot]);
+    pass.draw(3);
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+    const encodeSubmitMs = performance.now() - started;
+    const frame = ++this.frame;
+    this.onTiming?.({ frame, uploadMs, encodeSubmitMs });
+    if (this.onTiming) {
+      const gpuStarted = performance.now();
+      void this.device.queue.onSubmittedWorkDone().then(() => {
+        if (!this.destroyed) {
+          this.onTiming?.({ frame, uploadMs, encodeSubmitMs, gpuCompleteMs: performance.now() - gpuStarted });
+        }
+      });
+    }
+    return { uploadMs, encodeSubmitMs };
+  }
+  uploadAndPresent(pixels, slot = "primary") {
+    const uploadMs = this.upload(slot, pixels);
+    return this.present(slot, uploadMs);
+  }
+  uploadExecuteAndPresent(pixels, passes, slot = "primary") {
+    const uploadMs = this.upload(slot, pixels);
+    return this.executeAndPresent(passes, slot, uploadMs);
+  }
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.context.unconfigure();
+    this.buffers.primary.destroy();
+    this.buffers.secondary.destroy();
+    this.widthBuffer.destroy();
+    this.device.destroy();
+  }
+  assertActive() {
+    if (this.destroyed) throw new Error("AVS GPU frame graph is destroyed");
+  }
+};
+var ExactAvsBlurPass = class {
+  capability = AVS_GPU_BLUR_CAPABILITY;
+  pipeline;
+  params;
+  groups = /* @__PURE__ */ new WeakMap();
+  constructor(device, plan, config) {
+    if (config.mode !== 1 && config.mode !== 2 && config.mode !== 3) {
+      throw new RangeError(`Invalid AVS Blur mode ${String(config.mode)}`);
+    }
+    const module = device.createShaderModule({ label: "AVS exact Blur", code: AVS_EXACT_BLUR_WGSL });
+    this.pipeline = device.createComputePipeline({
+      label: `AVS exact Blur mode ${config.mode}`,
+      layout: "auto",
+      compute: { module, entryPoint: "blur_main" }
+    });
+    this.params = device.createBuffer({
+      label: "AVS exact Blur parameters",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true
+    });
+    new Uint32Array(this.params.getMappedRange()).set([
+      plan.width,
+      plan.height,
+      config.mode,
+      config.roundUp ? 1 : 0
+    ]);
+    this.params.unmap();
+  }
+  encode(context2) {
+    let targets = this.groups.get(context2.source);
+    if (!targets) {
+      targets = /* @__PURE__ */ new WeakMap();
+      this.groups.set(context2.source, targets);
+    }
+    let group = targets.get(context2.target);
+    if (!group) {
+      group = context2.device.createBindGroup({
+        label: "AVS exact Blur buffers",
+        layout: this.pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: context2.source } },
+          { binding: 1, resource: { buffer: context2.target } },
+          { binding: 2, resource: { buffer: this.params } }
+        ]
+      });
+      targets.set(context2.target, group);
+    }
+    const pass = context2.encoder.beginComputePass({ label: "AVS exact Blur" });
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(Math.ceil(context2.width * context2.height / 256));
+    pass.end();
+  }
+};
+var ExactAvsPointwisePass = class {
+  capability = AVS_GPU_POINTWISE_CAPABILITY;
+  pipeline;
+  groups = /* @__PURE__ */ new WeakMap();
+  constructor(device, operations) {
+    const module = device.createShaderModule({
+      label: `AVS exact fused pointwise (${operations.length})`,
+      code: buildExactAvsPointwiseWgsl(operations)
+    });
+    this.pipeline = device.createComputePipeline({
+      label: `AVS exact fused pointwise (${operations.length})`,
+      layout: "auto",
+      compute: { module, entryPoint: "pointwise_main" }
+    });
+  }
+  encode(context2) {
+    let targets = this.groups.get(context2.source);
+    if (!targets) {
+      targets = /* @__PURE__ */ new WeakMap();
+      this.groups.set(context2.source, targets);
+    }
+    let group = targets.get(context2.target);
+    if (!group) {
+      group = context2.device.createBindGroup({
+        label: "AVS exact fused pointwise buffers",
+        layout: this.pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: context2.source } },
+          { binding: 1, resource: { buffer: context2.target } }
+        ]
+      });
+      targets.set(context2.target, group);
+    }
+    const pass = context2.encoder.beginComputePass({ label: "AVS exact fused pointwise" });
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(Math.ceil(context2.width * context2.height / 256));
+    pass.end();
+  }
+};
+var ExactAvsMovementPass = class {
+  capability = AVS_GPU_MOVEMENT_CAPABILITY;
+  pipeline;
+  coordinateMap;
+  params;
+  groups = /* @__PURE__ */ new WeakMap();
+  constructor(device, plan, config) {
+    const movement = buildStaticAvsMovementGpuMap(config, plan.width, plan.height);
+    if (!movement) throw new Error("Movement configuration is not exact-GPU eligible");
+    const module = device.createShaderModule({ label: "AVS exact static Movement", code: AVS_EXACT_MOVEMENT_WGSL });
+    this.pipeline = device.createComputePipeline({
+      label: `AVS exact Movement ${config.effect}`,
+      layout: "auto",
+      compute: { module, entryPoint: "movement_main" }
+    });
+    this.coordinateMap = device.createBuffer({
+      label: `AVS Movement ${config.effect} coordinate map`,
+      size: movement.packedCoordinates.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true
+    });
+    new Uint32Array(this.coordinateMap.getMappedRange()).set(movement.packedCoordinates);
+    this.coordinateMap.unmap();
+    this.params = device.createBuffer({
+      label: `AVS Movement ${config.effect} parameters`,
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true
+    });
+    new Uint32Array(this.params.getMappedRange()).set([
+      plan.width,
+      plan.pixels,
+      movement.bilinear ? 1 : 0,
+      movement.blend ? 1 : 0
+    ]);
+    this.params.unmap();
+  }
+  encode(context2) {
+    let targets = this.groups.get(context2.source);
+    if (!targets) {
+      targets = /* @__PURE__ */ new WeakMap();
+      this.groups.set(context2.source, targets);
+    }
+    let group = targets.get(context2.target);
+    if (!group) {
+      group = context2.device.createBindGroup({
+        label: "AVS exact Movement buffers",
+        layout: this.pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: context2.source } },
+          { binding: 1, resource: { buffer: context2.target } },
+          { binding: 2, resource: { buffer: this.coordinateMap } },
+          { binding: 3, resource: { buffer: this.params } }
+        ]
+      });
+      targets.set(context2.target, group);
+    }
+    const pass = context2.encoder.beginComputePass({ label: "AVS exact Movement" });
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(Math.ceil(context2.width * context2.height / 256));
+    pass.end();
+  }
+};
+var ExactAvsRotoBlitterPass = class {
+  capability = AVS_GPU_ROTO_BLITTER_CAPABILITY;
+  pipeline;
+  params;
+  groups = /* @__PURE__ */ new WeakMap();
+  constructor(device, plan, config) {
+    const values = buildStaticAvsRotoBlitterGpuParams(config, plan.width, plan.height);
+    if (!values) throw new Error("Roto Blitter configuration is not exact-GPU eligible");
+    const module = device.createShaderModule({ label: "AVS exact static Roto Blitter", code: AVS_EXACT_ROTO_BLITTER_WGSL });
+    this.pipeline = device.createComputePipeline({
+      label: "AVS exact static Roto Blitter",
+      layout: "auto",
+      compute: { module, entryPoint: "roto_blitter_main" }
+    });
+    this.params = device.createBuffer({
+      label: "AVS exact Roto Blitter parameters",
+      size: 64,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true
+    });
+    new Int32Array(this.params.getMappedRange()).set([
+      values.width,
+      values.height,
+      values.pixels,
+      values.ds,
+      values.dt,
+      values.dsDx,
+      values.dsDy,
+      values.dtDx,
+      values.dtDy,
+      values.sStart,
+      values.tStart,
+      values.subpixel ? 1 : 0,
+      values.blend ? 1 : 0
+    ]);
+    this.params.unmap();
+  }
+  encode(context2) {
+    let targets = this.groups.get(context2.source);
+    if (!targets) {
+      targets = /* @__PURE__ */ new WeakMap();
+      this.groups.set(context2.source, targets);
+    }
+    let group = targets.get(context2.target);
+    if (!group) {
+      group = context2.device.createBindGroup({
+        label: "AVS exact Roto Blitter buffers",
+        layout: this.pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: context2.source } },
+          { binding: 1, resource: { buffer: context2.target } },
+          { binding: 2, resource: { buffer: this.params } }
+        ]
+      });
+      targets.set(context2.target, group);
+    }
+    const pass = context2.encoder.beginComputePass({ label: "AVS exact Roto Blitter" });
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(Math.ceil(context2.width * context2.height / 256));
+    pass.end();
+  }
+};
+var ExactAvsBlitterFeedbackPass = class {
+  capability = AVS_GPU_BLITTER_FEEDBACK_CAPABILITY;
+  pipeline;
+  params;
+  groups = /* @__PURE__ */ new WeakMap();
+  constructor(device, plan, config) {
+    const values = buildStaticAvsBlitterFeedbackGpuParams(config, plan.width, plan.height);
+    if (!values) throw new Error("Blitter Feedback configuration is not exact-GPU eligible");
+    const module = device.createShaderModule({ label: "AVS exact static Blitter Feedback", code: AVS_EXACT_BLITTER_FEEDBACK_WGSL });
+    this.pipeline = device.createComputePipeline({
+      label: "AVS exact static Blitter Feedback",
+      layout: "auto",
+      compute: { module, entryPoint: "blitter_feedback_main" }
+    });
+    this.params = device.createBuffer({
+      label: "AVS exact Blitter Feedback parameters",
+      size: 48,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true
+    });
+    new Int32Array(this.params.getMappedRange()).set([
+      values.width,
+      values.height,
+      values.pixels,
+      values.mode,
+      values.step,
+      values.startX,
+      values.startY,
+      values.regionWidth,
+      values.regionHeight,
+      values.blend ? 1 : 0,
+      values.subpixel ? 1 : 0,
+      0
+    ]);
+    this.params.unmap();
+  }
+  encode(context2) {
+    let targets = this.groups.get(context2.source);
+    if (!targets) {
+      targets = /* @__PURE__ */ new WeakMap();
+      this.groups.set(context2.source, targets);
+    }
+    let group = targets.get(context2.target);
+    if (!group) {
+      group = context2.device.createBindGroup({
+        label: "AVS exact Blitter Feedback buffers",
+        layout: this.pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: context2.source } },
+          { binding: 1, resource: { buffer: context2.target } },
+          { binding: 2, resource: { buffer: this.params } }
+        ]
+      });
+      targets.set(context2.target, group);
+    }
+    const pass = context2.encoder.beginComputePass({ label: "AVS exact Blitter Feedback" });
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(Math.ceil(context2.width * context2.height / 256));
+    pass.end();
+  }
+};
+
+// src/avs/effects/convolution-gpu.ts
+var AVS_GPU_CONVOLUTION_CAPABILITY = {
+  id: "holden03-convolution-packed-u32",
+  backend: "webgpu",
+  lane: "exact",
+  byteExact: true,
+  reason: "Parallelizes independent output pixels while preserving native 16-bit integer accumulation; an optional workgroup-tiled kernel is benchmark-only."
+};
+function assessExactGpuConvolution(config) {
+  if (!config.enabled) return { eligible: false, reason: "convolution is disabled" };
+  const first = config.kernel.findIndex((value) => value !== 0);
+  if (first < 0 || first >= 24) {
+    return { eligible: false, reason: "native center/right kernel uses ordered in-place raster feedback" };
+  }
+  return { eligible: true, reason: "native APE selects a separate output buffer; pixels are independent" };
+}
+var ExactAvsConvolutionGpuPass = class {
+  capability = AVS_GPU_CONVOLUTION_CAPABILITY;
+  pipeline;
+  groups = /* @__PURE__ */ new WeakMap();
+  constructor(device, config, width, height, tiled = false, pointwise = []) {
+    const eligibility = assessExactGpuConvolution(config);
+    if (!eligibility.eligible) throw new Error(eligibility.reason);
+    const module = device.createShaderModule({
+      label: "AVS exact tiled Convolution",
+      code: buildExactAvsConvolutionWgsl(config, width, height, tiled, pointwise)
+    });
+    this.pipeline = device.createComputePipeline({
+      label: "AVS exact tiled Convolution",
+      layout: "auto",
+      compute: { module, entryPoint: "main" }
+    });
+  }
+  encode(context2) {
+    let targets = this.groups.get(context2.source);
+    if (!targets) {
+      targets = /* @__PURE__ */ new WeakMap();
+      this.groups.set(context2.source, targets);
+    }
+    let group = targets.get(context2.target);
+    if (!group) {
+      group = context2.device.createBindGroup({
+        label: "AVS exact tiled Convolution buffers",
+        layout: this.pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: context2.source } },
+          { binding: 1, resource: { buffer: context2.target } }
+        ]
+      });
+      targets.set(context2.target, group);
+    }
+    const pass = context2.encoder.beginComputePass({ label: "AVS exact tiled Convolution" });
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(Math.ceil(context2.width / 16), Math.ceil(context2.height / 16));
+    pass.end();
+  }
+};
+function buildExactAvsConvolutionWgsl(config, width, height, tiled = true, pointwise = []) {
+  if (!assessExactGpuConvolution(config).eligible) throw new Error(assessExactGpuConvolution(config).reason);
+  if (!Number.isInteger(width) || width < 1 || !Number.isInteger(height) || height < 1) {
+    throw new RangeError("Convolution dimensions must be positive integers");
+  }
+  const sign = config.scale < 0 ? -1 : 1;
+  const kernel = config.kernel.map((value) => Math.imul(value, sign));
+  const divisor = Math.abs(config.scale) || 1;
+  const reciprocal = Math.floor(65536 / divisor) & 65535;
+  const bias = Math.imul(config.bias, sign);
+  const biasProduct = Math.imul(Math.abs(bias) & 65535, 256) & 65535;
+  const sums = coefficientSums2(config.kernel, config.bias);
+  const fused = pointwise.length ? { helpers: AVS_EXACT_POINTWISE_HELPERS_WGSL, body: buildExactAvsPointwiseBody(pointwise) } : null;
+  const combine = config.absolute ? "return u32(clamp(signed16(p) - signed16(n), -32768, 32767)) & 0x7fffu;" : config.wrap ? "return (p - n) & 0xffffu;" : "return select(0u, p - n, p > n);";
+  const scale = divisor <= 1 ? "return value & 0xffffu;" : divisor <= 32768 && (divisor & divisor - 1) === 0 ? `return value >> ${Math.log2(divisor)}u;` : `return ((value * ${reciprocal}u) >> 16u) & 0xffffu;`;
+  const sample = tiled ? "let pixel = tile[u32(sy) * 22u + u32(sx)];" : "let gx = u32(clamp(i32(origin.x) + sx - 3, 0, i32(WIDTH) - 1)); let gy = u32(clamp(i32(origin.y) + sy - 3, 0, i32(HEIGHT) - 1)); let pixel = source[gy * WIDTH + gx];";
+  return (
+    /* wgsl */
+    `
+const WIDTH = ${width}u; const HEIGHT = ${height}u;
+const KERNEL = array<i32, 49>(${kernel.map((value) => `${value}i`).join(",")});
+@group(0) @binding(0) var<storage, read> source: array<u32>;
+@group(0) @binding(1) var<storage, read_write> destination: array<u32>;
+var<workgroup> tile: array<u32, 484>;
+${fused?.helpers ?? ""}
+
+fn add_word(a: u32, b: u32, saturate: bool) -> u32 { return select((a + b) & 0xffffu, min(0xffffu, a + b), saturate); }
+fn signed16(v: u32) -> i32 { let low = v & 0xffffu; return select(i32(low), i32(low) - 65536, (low & 0x8000u) != 0u); }
+fn combine(p: u32, n: u32) -> u32 { ${combine} }
+fn scale_word(value: u32) -> u32 { ${scale} }
+fn byte(value: u32) -> u32 { return u32(clamp(signed16(value), 0, 255)); }
+
+fn convolve(origin: vec2u, local: vec2u, rotated: bool) -> vec4u {
+  var positive = vec4u(0u); var negative = vec4u(0u);
+  for (var tap = 0u; tap < 49u; tap++) {
+    let coefficient = KERNEL[tap];
+    if (coefficient == 0i) { continue; }
+    let dx = i32(tap % 7u) - 3; let dy = i32(tap / 7u) - 3;
+    let sx = i32(local.x) + 3 + select(dx, -dy, rotated);
+    let sy = i32(local.y) + 3 + select(dy, dx, rotated);
+    ${sample}
+    let magnitude = select(u32(coefficient), 0u - u32(coefficient), coefficient < 0i) & 0xffffu;
+    let product = (vec4u(pixel & 255u, (pixel >> 8u) & 255u, (pixel >> 16u) & 255u, pixel >> 24u) * magnitude) & vec4u(0xffffu);
+    if (coefficient > 0i) {
+      positive = vec4u(add_word(positive.x, product.x, ${sums.positive}), add_word(positive.y, product.y, ${sums.positive}), add_word(positive.z, product.z, ${sums.positive}), add_word(positive.w, product.w, ${sums.positive}));
+    } else {
+      negative = vec4u(add_word(negative.x, product.x, ${sums.negative}), add_word(negative.y, product.y, ${sums.negative}), add_word(negative.z, product.z, ${sums.negative}), add_word(negative.w, product.w, ${sums.negative}));
+    }
+  }
+  ${bias > 0 ? `positive = min(vec4u(0xffffu), positive + vec4u(${biasProduct}u));` : ""}
+  ${bias < 0 ? `negative = min(vec4u(0xffffu), negative + vec4u(${biasProduct}u));` : ""}
+  return vec4u(combine(positive.x, negative.x), combine(positive.y, negative.y), combine(positive.z, negative.z), combine(positive.w, negative.w));
+}
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_id) local3: vec3u, @builtin(local_invocation_index) lane: u32) {
+  let origin = vec2u(group.xy) * 16u;
+  ${tiled ? `
+  for (var offset = lane; offset < 484u; offset += 256u) {
+    let tx = offset % 22u; let ty = offset / 22u;
+    let gx = u32(clamp(i32(origin.x) + i32(tx) - 3, 0, i32(WIDTH) - 1));
+    let gy = u32(clamp(i32(origin.y) + i32(ty) - 3, 0, i32(HEIGHT) - 1));
+    tile[offset] = source[gy * WIDTH + gx];
+  }
+  workgroupBarrier();` : ""}
+  let local = local3.xy; let global = origin + local;
+  if (global.x >= WIDTH || global.y >= HEIGHT) { return; }
+  var value = convolve(origin, local, false);
+  ${config.twoPass ? "value = min(vec4u(0xffffu), value + convolve(origin, local, true));" : ""}
+  value = vec4u(scale_word(value.x), scale_word(value.y), scale_word(value.z), scale_word(value.w));
+  var pixel = byte(value.x) | (byte(value.y) << 8u) | (byte(value.z) << 16u) | (byte(value.w) << 24u);
+  let index = global.y * WIDTH + global.x;
+  ${fused ? `pixel = pixel & 0x00ffffffu;
+${fused.body}` : ""}
+  destination[index] = pixel${fused ? " & 0x00ffffffu" : ""};
+}`
+  );
+}
+function coefficientSums2(kernel, bias) {
+  let positive = 0;
+  let negative = 0;
+  for (const coefficient of [...kernel, bias]) {
+    if (coefficient > 0) positive = positive + coefficient >>> 0;
+    else if (coefficient < 0) negative = negative + (-coefficient >>> 0) >>> 0;
+  }
+  return { positive: positive >= 256, negative: negative >= 256 };
+}
+
 // src/avs/effects/basic-transforms.ts
 function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
   const clears = /* @__PURE__ */ new Map();
@@ -3169,9 +5130,9 @@ function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
   const waterFrames = /* @__PURE__ */ new Map();
   registry.registerBuiltin(5, (context2) => {
     if (context2.preinit) return;
-    const color = int3(context2, 0, 16777215) & 16777215;
-    const average = int3(context2, 4, 0) !== 0;
-    const every = int3(context2, 8, 1);
+    const color = int4(context2, 0, 16777215) & 16777215;
+    const average = int4(context2, 4, 0) !== 0;
+    const every = int4(context2, 8, 1);
     let state = clears.get(context2.component.path);
     if (!state) {
       state = { beats: 0, quiet: 0 };
@@ -3190,13 +5151,13 @@ function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
   });
   registry.registerBuiltin(11, (context2) => {
     if (context2.preinit) return;
-    const enabled = int3(context2, 0, 1);
+    const enabled = int4(context2, 0, 1);
     if (enabled === 0) return;
-    const normal = [int3(context2, 4, 8), int3(context2, 8, -8), int3(context2, 12, -8)];
-    const beat = [int3(context2, 16, normal[0]), int3(context2, 20, normal[1]), int3(context2, 24, normal[2])];
+    const normal = [int4(context2, 4, 8), int4(context2, 8, -8), int4(context2, 12, -8)];
+    const beat = [int4(context2, 16, normal[0]), int4(context2, 20, normal[1]), int4(context2, 24, normal[2])];
     let state = colorFades.get(context2.component.path);
     if (!state) {
-      state = { position: [...normal], random: hashPath3(context2.component.path) };
+      state = { position: [...normal], random: hashPath4(context2.component.path) };
       colorFades.set(context2.component.path, state);
     }
     state.position[0] += Math.sign(normal[0] - state.position[0]);
@@ -3204,31 +5165,31 @@ function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
     state.position[2] += Math.sign(normal[1] - state.position[2]);
     if ((enabled & 4) === 0) state.position = [...normal];
     else if (context2.beat && (enabled & 2) !== 0) {
-      state.position[0] = nextRandom(state, 32) - 6;
-      state.position[1] = nextRandom(state, 64) - 32;
+      state.position[0] = nextRandom2(state, 32) - 6;
+      state.position[1] = nextRandom2(state, 64) - 32;
       if (state.position[1] < 0 && state.position[1] > -16) state.position[1] = -32;
       if (state.position[1] >= 0 && state.position[1] < 16) state.position[1] = 32;
-      state.position[2] = nextRandom(state, 32) - 6;
+      state.position[2] = nextRandom2(state, 32) - 6;
     } else if (context2.beat) state.position = [...beat];
     const [first, second, third] = state.position;
-    const table6 = [[third, second, first], [second, first, third], [first, third, second], [third, third, third]];
+    const table5 = [[third, second, first], [second, first, third], [first, third, second], [third, third, third]];
     for (let i = 0; i < context2.input.pixels.length; i++) {
       const pixel = context2.input.pixels[i];
       const low = pixel & 255, middle = pixel >>> 8 & 255, high = pixel >>> 16 & 255;
       const x = middle - high;
       const y = high - low;
       const category = x > 0 && x > -y ? 0 : y < 0 && x < -y ? 1 : x < 0 && y > 0 ? 2 : 3;
-      const offsets = table6[category];
+      const offsets = table5[category];
       context2.input.pixels[i] = clampByte3(low + offsets[0]) | clampByte3(middle + offsets[1]) << 8 | clampByte3(high + offsets[2]) << 16;
     }
   });
   registry.registerBuiltin(12, (context2) => {
     if (context2.preinit) return;
-    const mode = int3(context2, 0, 1);
+    const mode = int4(context2, 0, 1);
     if (mode === 0) return;
-    const source = int3(context2, 4, 2105376) & 16777215;
-    const replacement = int3(context2, 8, source) & 16777215;
-    const distanceSquared = Math.pow(int3(context2, 12, 10) * 2, 2);
+    const source = int4(context2, 4, 2105376) & 16777215;
+    const replacement = int4(context2, 8, source) & 16777215;
+    const distanceSquared = Math.pow(int4(context2, 12, 10) * 2, 2);
     const sr = source & 255, sg = source >>> 8 & 255, sb = source >>> 16 & 255;
     for (let i = 0; i < context2.input.pixels.length; i++) {
       const pixel = context2.input.pixels[i];
@@ -3238,44 +5199,69 @@ function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
     }
   });
   registry.registerBuiltin(20, (context2) => {
-    if (context2.preinit || int3(context2, 0, 1) === 0) return;
+    if (context2.preinit || int4(context2, 0, 1) === 0) return;
     const { width, height } = context2.input;
+    const source = context2.input.pixels;
+    const destination = context2.output.pixels;
     let previous = waterFrames.get(context2.component.path);
-    if (!previous || previous.length !== context2.input.pixels.length) {
-      previous = new Uint32Array(context2.input.pixels.length);
+    if (!previous || previous.length !== source.length) {
+      previous = new Uint32Array(source.length);
       waterFrames.set(context2.component.path, previous);
     }
-    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
-      const neighbors = [];
-      if (x > 0) neighbors.push(context2.input.pixels[x - 1 + y * width]);
-      if (x + 1 < width) neighbors.push(context2.input.pixels[x + 1 + y * width]);
-      if (y > 0) neighbors.push(context2.input.pixels[x + (y - 1) * width]);
-      if (y + 1 < height) neighbors.push(context2.input.pixels[x + (y + 1) * width]);
-      const index = x + y * width;
-      let result = 0;
-      for (let shift = 0; shift <= 16; shift += 8) {
-        let total = 0;
-        for (const pixel of neighbors) total += pixel >>> shift & 255;
-        if (neighbors.length > 2) total = Math.trunc(total / 2);
-        const value = clampByte3(total - (previous[index] >>> shift & 255));
-        result |= value << shift;
-      }
-      context2.output.pixels[index] = result;
+    destination[0] = water2(source[1], source[width], previous[0]);
+    for (let x = 1; x < width - 1; x++) {
+      destination[x] = water3(source[x - 1], source[x + 1], source[width + x], previous[x]);
     }
-    previous.set(context2.input.pixels);
+    const topRight = width - 1;
+    destination[topRight] = water2(source[topRight - 1], source[topRight + width], previous[topRight]);
+    for (let y = 1; y < height - 1; y++) {
+      const row = y * width;
+      destination[row] = water3(source[row + 1], source[row - width], source[row + width], previous[row]);
+      for (let x = 1; x < width - 1; x++) {
+        const index = row + x;
+        destination[index] = water4(
+          source[index - 1],
+          source[index + 1],
+          source[index - width],
+          source[index + width],
+          previous[index]
+        );
+      }
+      const right = row + width - 1;
+      destination[right] = water3(
+        source[right - 1],
+        source[right - width],
+        source[right + width],
+        previous[right]
+      );
+    }
+    const bottom = (height - 1) * width;
+    destination[bottom] = water2(source[bottom + 1], source[bottom - width], previous[bottom]);
+    for (let x = 1; x < width - 1; x++) {
+      const index = bottom + x;
+      destination[index] = water3(
+        source[index - 1],
+        source[index + 1],
+        source[index - width],
+        previous[index]
+      );
+    }
+    const final = source.length - 1;
+    destination[final] = water2(source[final - 1], source[final - width], previous[final]);
+    previous.set(source);
     return { swap: true };
   });
   registry.registerBuiltin(23, (context2) => {
-    if (context2.preinit || int3(context2, 0, 1) === 0) return;
-    const normalX = int3(context2, 4, 1);
-    const normalY = int3(context2, 8, 1);
-    const color = int3(context2, 12, 0) & 16777215;
-    const additive = int3(context2, 16, 0) !== 0;
-    const average = int3(context2, 20, 0) !== 0;
-    const onBeat = int3(context2, 24, 0) !== 0;
-    const beatX = int3(context2, 28, normalX);
-    const beatY = int3(context2, 32, normalY);
-    const duration = int3(context2, 36, 4);
+    if (context2.preinit || int4(context2, 0, 1) === 0) return;
+    const normalX = int4(context2, 4, 1);
+    const normalY = int4(context2, 8, 1);
+    const color = int4(context2, 12, 0) & 16777215;
+    const additive = int4(context2, 16, 0) !== 0;
+    const average = int4(context2, 20, 0) !== 0;
+    const onBeat = int4(context2, 24, 0) !== 0;
+    const beatX = int4(context2, 28, normalX);
+    const beatY = int4(context2, 32, normalY);
+    const duration = int4(context2, 36, 4);
     let state = interleaves.get(context2.component.path);
     if (!state) {
       state = { x: normalX, y: normalY };
@@ -3312,13 +5298,13 @@ function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
     }
   });
   registry.registerBuiltin(30, (context2) => {
-    if (context2.preinit || int3(context2, 0, 1) === 0) return;
-    const quality = int3(context2, 4, 50);
-    const beatQuality = int3(context2, 8, quality);
-    const additive = int3(context2, 12, 0) !== 0;
-    const average = int3(context2, 16, 0) !== 0;
-    const onBeat = int3(context2, 20, 0) !== 0;
-    const duration = Math.max(1, int3(context2, 24, 15));
+    if (context2.preinit || int4(context2, 0, 1) === 0) return;
+    const quality = int4(context2, 4, 50);
+    const beatQuality = int4(context2, 8, quality);
+    const additive = int4(context2, 12, 0) !== 0;
+    const average = int4(context2, 16, 0) !== 0;
+    const onBeat = int4(context2, 20, 0) !== 0;
+    const duration = Math.max(1, int4(context2, 24, 15));
     let state = mosaics.get(context2.component.path);
     if (!state) {
       state = { quality, remaining: 0 };
@@ -3342,6 +5328,33 @@ function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
     if (state.remaining > 0) state.remaining--;
   });
   return registry;
+}
+function water2(a, b, previous) {
+  return waterChannels(
+    (a & 255) + (b & 255),
+    (a >>> 8 & 255) + (b >>> 8 & 255),
+    (a >>> 16 & 255) + (b >>> 16 & 255),
+    previous
+  );
+}
+function water3(a, b, c, previous) {
+  return waterChannels(
+    (a & 255) + (b & 255) + (c & 255) >> 1,
+    (a >>> 8 & 255) + (b >>> 8 & 255) + (c >>> 8 & 255) >> 1,
+    (a >>> 16 & 255) + (b >>> 16 & 255) + (c >>> 16 & 255) >> 1,
+    previous
+  );
+}
+function water4(a, b, c, d, previous) {
+  return waterChannels(
+    (a & 255) + (b & 255) + (c & 255) + (d & 255) >> 1,
+    (a >>> 8 & 255) + (b >>> 8 & 255) + (c >>> 8 & 255) + (d >>> 8 & 255) >> 1,
+    (a >>> 16 & 255) + (b >>> 16 & 255) + (c >>> 16 & 255) + (d >>> 16 & 255) >> 1,
+    previous
+  );
+}
+function waterChannels(low, middle, high, previous) {
+  return clampByte3(low - (previous & 255)) | clampByte3(middle - (previous >>> 8 & 255)) << 8 | clampByte3(high - (previous >>> 16 & 255)) << 16;
 }
 function mosaic(context2, quality, additive, average) {
   const { width, height } = context2.input;
@@ -3370,8 +5383,8 @@ function mosaic(context2, quality, additive, average) {
     }
   }
 }
-function int3(context2, offset, fallback) {
-  if (offset + 4 > context2.component.payload.length) return fallback;
+function int4(context2, offset, fallback2) {
+  if (offset + 4 > context2.component.payload.length) return fallback2;
   return new DataView(
     context2.component.payload.buffer,
     context2.component.payload.byteOffset,
@@ -3381,7 +5394,7 @@ function int3(context2, offset, fallback) {
 function clampByte3(value) {
   return value < 0 ? 0 : value > 255 ? 255 : Math.trunc(value);
 }
-function nextRandom(state, bound) {
+function nextRandom2(state, bound) {
   let value = state.random || 1831565813;
   value ^= value << 13;
   value ^= value >>> 17;
@@ -3389,7 +5402,7 @@ function nextRandom(state, bound) {
   state.random = value >>> 0;
   return state.random % bound;
 }
-function hashPath3(path) {
+function hashPath4(path) {
   let hash = 2166136261;
   for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
   return hash >>> 0;
@@ -3607,7 +5620,7 @@ function registerStarfield(registry, options) {
         currentSpeed: Math.fround(config.speed),
         beatIncrement: 0,
         beatFrames: 0,
-        randomState: hashPath4(context2.component.path)
+        randomState: hashPath5(context2.component.path)
       };
       states.set(context2.component.path, state);
     }
@@ -3686,7 +5699,7 @@ function registerMovingParticle(registry, options) {
         velocity: [-0.01551, 0],
         position: [-0.6, 0.3],
         size: config.size,
-        randomState: hashPath4(context2.component.path)
+        randomState: hashPath5(context2.component.path)
       };
       states.set(context2.component.path, state);
     }
@@ -3769,7 +5782,7 @@ function registerCustomBpm(registry, options) {
   });
 }
 function randomModulo33(state, hook) {
-  const value = hook ? Math.trunc(hook()) >>> 0 : nextRandom2(state);
+  const value = hook ? Math.trunc(hook()) >>> 0 : nextRandom3(state);
   return value % 33;
 }
 function randomBound(state, hook, bound) {
@@ -3777,7 +5790,7 @@ function randomBound(state, hook, bound) {
   const value = hook ? Math.trunc(hook()) >>> 0 : nextStarRandom(state);
   return value % bound;
 }
-function nextRandom2(state) {
+function nextRandom3(state) {
   let value = state.randomState || 1831565813;
   value ^= value << 13;
   value ^= value >>> 17;
@@ -3796,24 +5809,24 @@ function nextStarRandom(state) {
 function defaultNow() {
   return typeof performance === "undefined" ? Date.now() : performance.now();
 }
-function i324(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+function i324(payload, offset, fallback2) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback2;
 }
-function f32(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getFloat32(offset, true) : fallback;
+function f32(payload, offset, fallback2) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getFloat32(offset, true) : fallback2;
 }
-function hashPath4(path) {
+function hashPath5(path) {
   let hash = 2166136261;
   for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
   return hash >>> 0;
 }
 
 // src/avs/effects/bump.ts
-var TEXT2 = new TextDecoder("windows-1252");
+var TEXT3 = new TextDecoder("windows-1252");
 function decodeAvsBump(payload) {
   let offset = 0;
-  const read = (fallback) => {
-    const value = i325(payload, offset, fallback);
+  const read = (fallback2) => {
+    const value = i325(payload, offset, fallback2);
     offset += 4;
     return value;
   };
@@ -3858,7 +5871,7 @@ function registerAvsBump(registry) {
     if (!config.enabled) return;
     let state = states.get(context2.component.path);
     if (!state) {
-      const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath5(context2.component.path) });
+      const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath6(context2.component.path) });
       vm.set("bi", 1);
       state = {
         vm,
@@ -3888,12 +5901,12 @@ function registerAvsBump(registry) {
       state.beatFrames = config.beatDurationFrames;
     } else if (!state.beatFrames) state.currentDepth = config.depth;
     context2.output.clear();
-    const lightX = clamp5(Math.trunc(state.vm.get("x") * context2.input.width / (config.oldStyle ? 100 : 1)), 0, context2.input.width);
-    const lightY = clamp5(Math.trunc(state.vm.get("y") * context2.input.height / (config.oldStyle ? 100 : 1)), 0, context2.input.height);
+    const lightX = clamp6(Math.trunc(state.vm.get("x") * context2.input.width / (config.oldStyle ? 100 : 1)), 0, context2.input.width);
+    const lightY = clamp6(Math.trunc(state.vm.get("y") * context2.input.height / (config.oldStyle ? 100 : 1)), 0, context2.input.height);
     if (config.showLight && lightX < context2.input.width && lightY < context2.input.height) {
       context2.output.pixels[lightX + lightY * context2.input.width] = 16777215;
     }
-    const intensity = clamp5(state.vm.get("bi"), 0, 1);
+    const intensity = clamp6(state.vm.get("bi"), 0, 1);
     state.vm.set("bi", intensity);
     state.currentDepth = Math.trunc(state.currentDepth * intensity);
     shadeBump(context2, depthSurface.pixels, config, state.currentDepth, lightX, lightY);
@@ -3954,7 +5967,7 @@ function readString(payload, offset) {
   const length = i325(payload, offset, 0);
   const start = offset + 4;
   if (length <= 0 || start + length > payload.length) return { value: "", next: start };
-  return { value: nulText3(payload.subarray(start, start + length)), next: start + length };
+  return { value: nulText4(payload.subarray(start, start + length)), next: start + length };
 }
 function compileOrNull2(source) {
   if (!source.trim()) return null;
@@ -3967,24 +5980,24 @@ function compileOrNull2(source) {
 function execute2(program, vm) {
   return program ? vm.execute(program) : 0;
 }
-function i325(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+function i325(payload, offset, fallback2) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback2;
 }
-function nulText3(bytes) {
+function nulText4(bytes) {
   const end = bytes.indexOf(0);
-  return TEXT2.decode(end < 0 ? bytes : bytes.subarray(0, end));
+  return TEXT3.decode(end < 0 ? bytes : bytes.subarray(0, end));
 }
-function clamp5(value, minimum, maximum) {
+function clamp6(value, minimum, maximum) {
   return value < minimum ? minimum : value > maximum ? maximum : value;
 }
-function hashPath5(path) {
+function hashPath6(path) {
   let hash = 2166136261;
   for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
   return hash >>> 0;
 }
 
 // src/avs/effects/dynamic-movement.ts
-var TEXT3 = new TextDecoder("windows-1252");
+var TEXT4 = new TextDecoder("windows-1252");
 function decodeAvsDynamicMovement(payload) {
   let offset = 0;
   let scripts = ["", "", "", ""];
@@ -3996,11 +6009,11 @@ function decodeAvsDynamicMovement(payload) {
       offset = value.next;
     }
   } else if (payload.length >= 1024) {
-    scripts = [0, 256, 512, 768].map((start) => nulText4(payload.subarray(start, start + 256)));
+    scripts = [0, 256, 512, 768].map((start) => nulText5(payload.subarray(start, start + 256)));
     offset = 1024;
   }
-  const read = (fallback) => {
-    const value = i326(payload, offset, fallback);
+  const read = (fallback2) => {
+    const value = i326(payload, offset, fallback2);
     offset += 4;
     return value;
   };
@@ -4025,7 +6038,7 @@ function registerAvsDynamicMovement(registry) {
     let state = states.get(context2.component.path);
     if (!state) {
       const config = decodeAvsDynamicMovement(context2.component.payload);
-      const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath6(context2.component.path) });
+      const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath7(context2.component.path) });
       state = {
         config,
         vm,
@@ -4069,8 +6082,8 @@ function renderDynamicMovement(context2, config, state) {
   }
   execute3(state.programs[1], vm);
   if (context2.beat) execute3(state.programs[2], vm);
-  const columns = clamp6(Math.trunc(config.gridWidth) + 1, 2, 256);
-  const rows = clamp6(Math.trunc(config.gridHeight) + 1, 2, 256);
+  const columns = clamp7(Math.trunc(config.gridWidth) + 1, 2, 256);
+  const rows = clamp7(Math.trunc(config.gridHeight) + 1, 2, 256);
   const gridSize = columns * rows;
   if (state.gridX.length !== gridSize) {
     state.gridX = new Float64Array(gridSize);
@@ -4109,7 +6122,7 @@ function renderDynamicMovement(context2, config, state) {
       const index = gx + gy * columns;
       gridX[index] = x;
       gridY[index] = y;
-      gridAlpha[index] = clamp6(vm.get("alpha"), 0, 1);
+      gridAlpha[index] = clamp7(vm.get("alpha"), 0, 1);
     }
   }
   const cellXs = state.cellX;
@@ -4132,37 +6145,199 @@ function renderDynamicMovement(context2, config, state) {
     );
     return { swap: true };
   }
+  if (!config.noMove) {
+    if (config.blend) {
+      renderBilinearBlendGrid(
+        context2,
+        source.pixels,
+        gridX,
+        gridY,
+        gridAlpha,
+        cellXs,
+        fractionXs,
+        cellYs,
+        fractionYs,
+        columns,
+        config.wrap
+      );
+    } else {
+      renderBilinearReplaceGrid(
+        context2,
+        source.pixels,
+        gridX,
+        gridY,
+        cellXs,
+        fractionXs,
+        cellYs,
+        fractionYs,
+        columns,
+        config.wrap
+      );
+    }
+    return { swap: true };
+  }
+  renderNoMoveGrid(
+    context2,
+    config.buffer === 0 ? null : source.pixels,
+    gridAlpha,
+    cellXs,
+    fractionXs,
+    cellYs,
+    fractionYs,
+    columns
+  );
+  return;
+}
+function renderNoMoveGrid(context2, maskSource, gridAlpha, cellXs, fractionXs, cellYs, fractionYs, columns) {
+  const width = context2.input.width;
+  const height = context2.input.height;
+  const input = context2.input.pixels;
+  const blendTable = AVS_BLEND_TABLE;
+  let index = 0;
   for (let y = 0; y < height; y++) {
     const cellY = cellYs[y];
     const fy = fractionYs[y];
-    for (let x = 0; x < width; x++) {
-      const cellX = cellXs[x];
+    const inverseY = 1 - fy;
+    const row = cellY * columns;
+    for (let x = 0; x < width; x++, index++) {
       const fx = fractionXs[x];
-      const topLeft = cellX + cellY * columns;
+      const topLeft = cellXs[x] + row;
       const topRight = topLeft + 1;
       const bottomLeft = topLeft + columns;
       const bottomRight = bottomLeft + 1;
-      const mappedX = bilerp(gridX[topLeft], gridX[topRight], gridX[bottomLeft], gridX[bottomRight], fx, fy);
-      const mappedY = bilerp(gridY[topLeft], gridY[topRight], gridY[bottomLeft], gridY[bottomRight], fx, fy);
-      const alpha = config.noMove || config.blend ? Math.trunc(clamp6(bilerp(
-        gridAlpha[topLeft],
-        gridAlpha[topRight],
-        gridAlpha[bottomLeft],
-        gridAlpha[bottomRight],
-        fx,
-        fy
-      ), 0, 1) * 255) : 0;
-      const index = x + y * width;
-      if (config.noMove) {
-        const maskSource = config.buffer === 0 ? 0 : source.pixels[index];
-        context2.input.pixels[index] = blendPixel(maskSource, context2.input.pixels[index], "adjustable", alpha);
-        continue;
-      }
-      const sampled = sample(source.pixels, width, height, mappedX, mappedY, config.wrap, config.bilinear);
-      context2.output.pixels[index] = config.blend ? blendPixel(sampled, context2.input.pixels[index], "adjustable", alpha) : sampled;
+      const rawAlpha = (gridAlpha[topLeft] + (gridAlpha[topRight] - gridAlpha[topLeft]) * fx) * inverseY + (gridAlpha[bottomLeft] + (gridAlpha[bottomRight] - gridAlpha[bottomLeft]) * fx) * fy;
+      const alpha = Math.trunc(clamp7(rawAlpha, 0, 1) * 255);
+      const inverseAlpha = 255 - alpha;
+      const source = maskSource?.[index] ?? 0;
+      const current = input[index];
+      const low = blendTable[(source & 255) << 8 | alpha] + blendTable[(current & 255) << 8 | inverseAlpha];
+      const middle = blendTable[(source >>> 8 & 255) << 8 | alpha] + blendTable[(current >>> 8 & 255) << 8 | inverseAlpha];
+      const high = blendTable[(source >>> 16 & 255) << 8 | alpha] + blendTable[(current >>> 16 & 255) << 8 | inverseAlpha];
+      input[index] = low | middle << 8 | high << 16;
     }
   }
-  return config.noMove ? void 0 : { swap: true };
+}
+function renderBilinearReplaceGrid(context2, source, gridX, gridY, cellXs, fractionXs, cellYs, fractionYs, columns, wrap) {
+  const width = context2.input.width;
+  const height = context2.input.height;
+  const destination = context2.output.pixels;
+  const maxX = Math.max(0, width - 2);
+  const maxY = Math.max(0, height - 2);
+  const spanX = Math.max(1, maxX);
+  const spanY = Math.max(1, maxY);
+  const blendTable = AVS_BLEND_TABLE;
+  let index = 0;
+  for (let y = 0; y < height; y++) {
+    const cellY = cellYs[y];
+    const fy = fractionYs[y];
+    const inverseY = 1 - fy;
+    const row = cellY * columns;
+    for (let x = 0; x < width; x++, index++) {
+      const fx = fractionXs[x];
+      const topLeft = cellXs[x] + row;
+      const topRight = topLeft + 1;
+      const bottomLeft = topLeft + columns;
+      const bottomRight = bottomLeft + 1;
+      let mappedX = (gridX[topLeft] + (gridX[topRight] - gridX[topLeft]) * fx) * inverseY + (gridX[bottomLeft] + (gridX[bottomRight] - gridX[bottomLeft]) * fx) * fy;
+      let mappedY = (gridY[topLeft] + (gridY[topRight] - gridY[topLeft]) * fx) * inverseY + (gridY[bottomLeft] + (gridY[bottomRight] - gridY[bottomLeft]) * fx) * fy;
+      if (wrap) {
+        mappedX = (mappedX % spanX + spanX) % spanX;
+        mappedY = (mappedY % spanY + spanY) % spanY;
+      } else {
+        mappedX = clamp7(mappedX, 0, maxX);
+        mappedY = clamp7(mappedY, 0, maxY);
+      }
+      const ix = Math.trunc(mappedX);
+      const iy = Math.trunc(mappedY);
+      if (width < 2 || height < 2) {
+        destination[index] = source[ix + iy * width];
+        continue;
+      }
+      const sampleX = Math.trunc((mappedX - ix) * 256) & 255;
+      const sampleY = Math.trunc((mappedY - iy) * 256) & 255;
+      const inverseX = 255 - sampleX;
+      const inverseSampleY = 255 - sampleY;
+      const weight0 = blendTable[inverseX << 8 | inverseSampleY];
+      const weight1 = blendTable[sampleX << 8 | inverseSampleY];
+      const weight2 = blendTable[inverseX << 8 | sampleY];
+      const weight3 = blendTable[sampleX << 8 | sampleY];
+      const offset = ix + iy * width;
+      const pixel0 = source[offset];
+      const pixel1 = source[offset + 1];
+      const pixel2 = source[offset + width];
+      const pixel3 = source[offset + width + 1];
+      const low = blendTable[(pixel0 & 255) << 8 | weight0] + blendTable[(pixel1 & 255) << 8 | weight1] + blendTable[(pixel2 & 255) << 8 | weight2] + blendTable[(pixel3 & 255) << 8 | weight3];
+      const middle = blendTable[(pixel0 >>> 8 & 255) << 8 | weight0] + blendTable[(pixel1 >>> 8 & 255) << 8 | weight1] + blendTable[(pixel2 >>> 8 & 255) << 8 | weight2] + blendTable[(pixel3 >>> 8 & 255) << 8 | weight3];
+      const high = blendTable[(pixel0 >>> 16 & 255) << 8 | weight0] + blendTable[(pixel1 >>> 16 & 255) << 8 | weight1] + blendTable[(pixel2 >>> 16 & 255) << 8 | weight2] + blendTable[(pixel3 >>> 16 & 255) << 8 | weight3];
+      destination[index] = low & 255 | (middle & 255) << 8 | (high & 255) << 16;
+    }
+  }
+}
+function renderBilinearBlendGrid(context2, source, gridX, gridY, gridAlpha, cellXs, fractionXs, cellYs, fractionYs, columns, wrap) {
+  const width = context2.input.width;
+  const height = context2.input.height;
+  const input = context2.input.pixels;
+  const destination = context2.output.pixels;
+  const maxX = Math.max(0, width - 2);
+  const maxY = Math.max(0, height - 2);
+  const spanX = Math.max(1, maxX);
+  const spanY = Math.max(1, maxY);
+  const blendTable = AVS_BLEND_TABLE;
+  let index = 0;
+  for (let y = 0; y < height; y++) {
+    const cellY = cellYs[y];
+    const fy = fractionYs[y];
+    const inverseY = 1 - fy;
+    const row = cellY * columns;
+    for (let x = 0; x < width; x++, index++) {
+      const fx = fractionXs[x];
+      const topLeft = cellXs[x] + row;
+      const topRight = topLeft + 1;
+      const bottomLeft = topLeft + columns;
+      const bottomRight = bottomLeft + 1;
+      let mappedX = (gridX[topLeft] + (gridX[topRight] - gridX[topLeft]) * fx) * inverseY + (gridX[bottomLeft] + (gridX[bottomRight] - gridX[bottomLeft]) * fx) * fy;
+      let mappedY = (gridY[topLeft] + (gridY[topRight] - gridY[topLeft]) * fx) * inverseY + (gridY[bottomLeft] + (gridY[bottomRight] - gridY[bottomLeft]) * fx) * fy;
+      if (wrap) {
+        mappedX = (mappedX % spanX + spanX) % spanX;
+        mappedY = (mappedY % spanY + spanY) % spanY;
+      } else {
+        mappedX = clamp7(mappedX, 0, maxX);
+        mappedY = clamp7(mappedY, 0, maxY);
+      }
+      const ix = Math.trunc(mappedX);
+      const iy = Math.trunc(mappedY);
+      let sampled;
+      if (width < 2 || height < 2) {
+        sampled = source[ix + iy * width];
+      } else {
+        const sampleX = Math.trunc((mappedX - ix) * 256) & 255;
+        const sampleY = Math.trunc((mappedY - iy) * 256) & 255;
+        const inverseX = 255 - sampleX;
+        const inverseSampleY = 255 - sampleY;
+        const weight0 = blendTable[inverseX << 8 | inverseSampleY];
+        const weight1 = blendTable[sampleX << 8 | inverseSampleY];
+        const weight2 = blendTable[inverseX << 8 | sampleY];
+        const weight3 = blendTable[sampleX << 8 | sampleY];
+        const offset = ix + iy * width;
+        const pixel0 = source[offset];
+        const pixel1 = source[offset + 1];
+        const pixel2 = source[offset + width];
+        const pixel3 = source[offset + width + 1];
+        const low2 = blendTable[(pixel0 & 255) << 8 | weight0] + blendTable[(pixel1 & 255) << 8 | weight1] + blendTable[(pixel2 & 255) << 8 | weight2] + blendTable[(pixel3 & 255) << 8 | weight3];
+        const middle2 = blendTable[(pixel0 >>> 8 & 255) << 8 | weight0] + blendTable[(pixel1 >>> 8 & 255) << 8 | weight1] + blendTable[(pixel2 >>> 8 & 255) << 8 | weight2] + blendTable[(pixel3 >>> 8 & 255) << 8 | weight3];
+        const high2 = blendTable[(pixel0 >>> 16 & 255) << 8 | weight0] + blendTable[(pixel1 >>> 16 & 255) << 8 | weight1] + blendTable[(pixel2 >>> 16 & 255) << 8 | weight2] + blendTable[(pixel3 >>> 16 & 255) << 8 | weight3];
+        sampled = low2 & 255 | (middle2 & 255) << 8 | (high2 & 255) << 16;
+      }
+      const rawAlpha = (gridAlpha[topLeft] + (gridAlpha[topRight] - gridAlpha[topLeft]) * fx) * inverseY + (gridAlpha[bottomLeft] + (gridAlpha[bottomRight] - gridAlpha[bottomLeft]) * fx) * fy;
+      const alpha = Math.trunc(clamp7(rawAlpha, 0, 1) * 255);
+      const inverseAlpha = 255 - alpha;
+      const current = input[index];
+      const low = blendTable[(sampled & 255) << 8 | alpha] + blendTable[(current & 255) << 8 | inverseAlpha];
+      const middle = blendTable[(sampled >>> 8 & 255) << 8 | alpha] + blendTable[(current >>> 8 & 255) << 8 | inverseAlpha];
+      const high = blendTable[(sampled >>> 16 & 255) << 8 | alpha] + blendTable[(current >>> 16 & 255) << 8 | inverseAlpha];
+      destination[index] = low | middle << 8 | high << 16;
+    }
+  }
 }
 function renderNearestGrid(context2, config, source, gridX, gridY, gridAlpha, cellXs, fractionXs, cellYs, fractionYs, columns) {
   const width = context2.input.width;
@@ -4189,11 +6364,15 @@ function renderNearestGrid(context2, config, source, gridX, gridY, gridAlpha, ce
       let mappedX = (gridX[topLeft] + (gridX[topRight] - gridX[topLeft]) * fx) * inverseY + (gridX[bottomLeft] + (gridX[bottomRight] - gridX[bottomLeft]) * fx) * fy;
       let mappedY = (gridY[topLeft] + (gridY[topRight] - gridY[topLeft]) * fx) * inverseY + (gridY[bottomLeft] + (gridY[bottomRight] - gridY[bottomLeft]) * fx) * fy;
       if (config.wrap) {
-        mappedX = (mappedX % spanX + spanX) % spanX;
-        mappedY = (mappedY % spanY + spanY) % spanY;
+        if (!(mappedX >= 0 && mappedX < spanX && Number.isInteger(mappedX))) {
+          mappedX = (mappedX % spanX + spanX) % spanX;
+        }
+        if (!(mappedY >= 0 && mappedY < spanY && Number.isInteger(mappedY))) {
+          mappedY = (mappedY % spanY + spanY) % spanY;
+        }
       } else {
-        mappedX = clamp6(mappedX, 0, maxX);
-        mappedY = clamp6(mappedY, 0, maxY);
+        mappedX = clamp7(mappedX, 0, maxX);
+        mappedY = clamp7(mappedY, 0, maxY);
       }
       const sampled = source[Math.trunc(mappedX) + Math.trunc(mappedY) * width];
       if (!config.blend) {
@@ -4201,7 +6380,7 @@ function renderNearestGrid(context2, config, source, gridX, gridY, gridAlpha, ce
         continue;
       }
       const rawAlpha = (gridAlpha[topLeft] + (gridAlpha[topRight] - gridAlpha[topLeft]) * fx) * inverseY + (gridAlpha[bottomLeft] + (gridAlpha[bottomRight] - gridAlpha[bottomLeft]) * fx) * fy;
-      const alpha = Math.trunc(clamp6(rawAlpha, 0, 1) * 255);
+      const alpha = Math.trunc(clamp7(rawAlpha, 0, 1) * 255);
       const inverse = 255 - alpha;
       const current = input[index];
       const low = blendTable[(sampled & 255) << 8 | alpha] + blendTable[(current & 255) << 8 | inverse];
@@ -4241,47 +6420,12 @@ function prepareInterpolationAxis(state, width, height, columns, rows) {
     }
   }
 }
-function sample(pixels, width, height, rawX, rawY, wrap, bilinear3) {
-  const maxX = bilinear3 ? Math.max(0, width - 2) : width - 1;
-  const maxY = bilinear3 ? Math.max(0, height - 2) : height - 1;
-  let x = rawX;
-  let y = rawY;
-  if (wrap) {
-    const spanX = Math.max(1, maxX);
-    const spanY = Math.max(1, maxY);
-    x = (x % spanX + spanX) % spanX;
-    y = (y % spanY + spanY) % spanY;
-  } else {
-    x = clamp6(x, 0, maxX);
-    y = clamp6(y, 0, maxY);
-  }
-  const ix = Math.trunc(x);
-  const iy = Math.trunc(y);
-  if (!bilinear3 || width < 2 || height < 2) return pixels[ix + iy * width];
-  const fx = Math.trunc((x - ix) * 256) & 255;
-  const fy = Math.trunc((y - iy) * 256) & 255;
-  const inverseX = 255 - fx;
-  const inverseY = 255 - fy;
-  const w0 = table3(inverseX, inverseY);
-  const w1 = table3(fx, inverseY);
-  const w2 = table3(inverseX, fy);
-  const w3 = table3(fx, fy);
-  const offset = ix + iy * width;
-  const p0 = pixels[offset];
-  const p1 = pixels[offset + 1];
-  const p2 = pixels[offset + width];
-  const p3 = pixels[offset + width + 1];
-  const low = table3(p0 & 255, w0) + table3(p1 & 255, w1) + table3(p2 & 255, w2) + table3(p3 & 255, w3);
-  const middle = table3(p0 >>> 8 & 255, w0) + table3(p1 >>> 8 & 255, w1) + table3(p2 >>> 8 & 255, w2) + table3(p3 >>> 8 & 255, w3);
-  const high = table3(p0 >>> 16 & 255, w0) + table3(p1 >>> 16 & 255, w1) + table3(p2 >>> 16 & 255, w2) + table3(p3 >>> 16 & 255, w3);
-  return low & 255 | (middle & 255) << 8 | (high & 255) << 16;
-}
 function readString2(payload, offset) {
   if (offset + 4 > payload.length) return { value: "", next: payload.length };
   const length = u323(payload, offset, 0);
   const start = offset + 4;
   const end = Math.min(payload.length, start + length);
-  return { value: nulText4(payload.subarray(start, end)), next: end };
+  return { value: nulText5(payload.subarray(start, end)), next: end };
 }
 function compileOrNull3(source) {
   if (!source.trim()) return null;
@@ -4294,26 +6438,20 @@ function compileOrNull3(source) {
 function execute3(program, vm) {
   return program ? vm.execute(program) : 0;
 }
-function i326(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+function i326(payload, offset, fallback2) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback2;
 }
-function u323(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(offset, true) : fallback;
+function u323(payload, offset, fallback2) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(offset, true) : fallback2;
 }
-function nulText4(bytes) {
+function nulText5(bytes) {
   const end = bytes.indexOf(0);
-  return TEXT3.decode(end < 0 ? bytes : bytes.subarray(0, end));
+  return TEXT4.decode(end < 0 ? bytes : bytes.subarray(0, end));
 }
-function bilerp(a, b, c, d, x, y) {
-  return (a + (b - a) * x) * (1 - y) + (c + (d - c) * x) * y;
-}
-function table3(x, y) {
-  return AVS_BLEND_TABLE[x << 8 | y];
-}
-function clamp6(value, minimum, maximum) {
+function clamp7(value, minimum, maximum) {
   return value < minimum ? minimum : value > maximum ? maximum : value;
 }
-function hashPath6(path) {
+function hashPath7(path) {
   let hash = 2166136261;
   for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
   return hash >>> 0;
@@ -4326,9 +6464,9 @@ function registerAvsFinalLowCountBuiltins(registry = new AvsEffectRegistry()) {
   const fountainStates = /* @__PURE__ */ new Map();
   registry.registerBuiltin(9, (context2) => {
     if (context2.preinit) return;
-    const zoom = int4(context2, 0, 31), direction = int4(context2, 4, 31), blend2 = int4(context2, 8, 0) !== 0;
-    const beatReverse = int4(context2, 12, 0) !== 0, beatSpeed = int4(context2, 16, 0);
-    const beatZoom = int4(context2, 20, 31), beatScale = int4(context2, 24, 0) !== 0, subpixel = int4(context2, 28, 0) !== 0;
+    const zoom = int5(context2, 0, 31), direction = int5(context2, 4, 31), blend2 = int5(context2, 8, 0) !== 0;
+    const beatReverse = int5(context2, 12, 0) !== 0, beatSpeed = int5(context2, 16, 0);
+    const beatZoom = int5(context2, 20, 31), beatScale = int5(context2, 24, 0) !== 0, subpixel = int5(context2, 28, 0) !== 0;
     let state = rotoStates.get(context2.component.path);
     if (!state) {
       state = { reverse: 1, reversePosition: 1, scalePosition: zoom };
@@ -4355,36 +6493,36 @@ function registerAvsFinalLowCountBuiltins(registry = new AvsEffectRegistry()) {
     if (context2.preinit) return;
     let state = fountainStates.get(context2.component.path);
     if (!state) {
-      state = createFountain(int4(context2, 28, 0) / 32);
+      state = createFountain(int5(context2, 28, 0) / 32);
       fountainStates.set(context2.component.path, state);
     }
-    renderFountain(context2, state, int4(context2, 0, 16), readFiveColors(context2), int4(context2, 24, -20));
+    renderFountain(context2, state, int5(context2, 0, 16), readFiveColors(context2), int5(context2, 24, -20));
   });
   registry.registerBuiltin(41, (context2) => {
-    if (context2.preinit || int4(context2, 0, 1) === 0) return;
-    const count = Math.max(0, Math.min(8, int4(context2, 4, 2)));
+    if (context2.preinit || int5(context2, 0, 1) === 0) return;
+    const count = Math.max(0, Math.min(8, int5(context2, 4, 2)));
     if (count === 0) return;
     let state = interferenceStates.get(context2.component.path);
     if (!state) {
-      state = { rotation: int4(context2, 8, 0), status: Math.PI };
+      state = { rotation: int5(context2, 8, 0), status: Math.PI };
       interferenceStates.set(context2.component.path, state);
     }
-    const onBeat = int4(context2, 48, 1) !== 0;
+    const onBeat = int5(context2, 48, 1) !== 0;
     if (onBeat && context2.beat && state.status >= Math.PI) state.status = 0;
     const wave = Math.sin(state.status);
-    const rotationIncrement = int4(context2, 20, 0) + Math.trunc((int4(context2, 40, 25) - int4(context2, 20, 0)) * wave);
-    const alpha = int4(context2, 16, 128) + Math.trunc((int4(context2, 36, 192) - int4(context2, 16, 128)) * wave);
-    const distance = int4(context2, 12, 10) + Math.trunc((int4(context2, 32, 32) - int4(context2, 12, 10)) * wave);
+    const rotationIncrement = int5(context2, 20, 0) + Math.trunc((int5(context2, 40, 25) - int5(context2, 20, 0)) * wave);
+    const alpha = int5(context2, 16, 128) + Math.trunc((int5(context2, 36, 192) - int5(context2, 16, 128)) * wave);
+    const distance = int5(context2, 12, 10) + Math.trunc((int5(context2, 32, 32) - int5(context2, 12, 10)) * wave);
     const points = Array.from({ length: count }, (_, index) => {
       const angle = state.rotation / 255 * Math.PI * 2 + Math.PI * 2 * index / count;
       return [Math.trunc(Math.cos(angle) * distance), Math.trunc(Math.sin(angle) * distance)];
     });
-    interference(context2, points, alpha, int4(context2, 44, 1) !== 0);
+    interference(context2, points, alpha, int5(context2, 44, 1) !== 0);
     state.rotation += rotationIncrement;
     state.rotation = state.rotation > 255 ? state.rotation - 255 : state.rotation < -255 ? state.rotation + 255 : state.rotation;
     state.status = Math.min(Math.PI, state.status + float(context2, 52, 0.2));
     if (state.status < -Math.PI) state.status = Math.PI;
-    const additive = int4(context2, 24, 0) !== 0, average = int4(context2, 28, 0) !== 0;
+    const additive = int5(context2, 24, 0) !== 0, average = int5(context2, 28, 0) !== 0;
     if (!additive && !average) return { swap: true };
     const blockLength = Math.trunc(context2.input.pixels.length / 4) * 4;
     for (let i = 0; i < blockLength; i++) context2.input.pixels[i] = blendPixel(context2.output.pixels[i], context2.input.pixels[i], average ? "average" : "additive");
@@ -4406,13 +6544,13 @@ function rotoBlit(context2, zoom, degrees, blend2, subpixel) {
   let tStart = -Math.trunc((width - 1) / 2) * dtDx - Math.trunc((height - 1) / 2) * dtDy + (height - 1) * (32768 + (1 << 20));
   let output = 0;
   for (let row = height; row > 0; row--) {
-    let s = modulo3(sStart, ds), t = modulo3(tStart, dt);
+    let s = modulo5(sStart, ds), t = modulo5(tStart, dt);
     for (let x = width; x > 0; x--) {
-      const sample2 = subpixel ? bilinear2(context2, s, t) : context2.input.pixels[(s >> 16) + (t >> 16) * width];
-      context2.output.pixels[output] = blend2 ? blendPixel(sample2, context2.input.pixels[output], "average") : sample2;
+      const sample = subpixel ? bilinear2(context2, s, t) : context2.input.pixels[(s >> 16) + (t >> 16) * width];
+      context2.output.pixels[output] = blend2 ? blendPixel(sample, context2.input.pixels[output], "average") : sample;
       output++;
-      s = modulo3(s + dsDx, ds);
-      t = modulo3(t + dtDx, dt);
+      s = modulo5(s + dsDx, ds);
+      t = modulo5(t + dtDx, dt);
     }
     sStart += dsDy;
     tStart += dtDy;
@@ -4421,7 +6559,7 @@ function rotoBlit(context2, zoom, degrees, blend2, subpixel) {
 function bilinear2(context2, s, t) {
   const x = s >> 16, y = t >> 16, fx = s >> 8 & 255, fy = t >> 8 & 255, width = context2.input.width;
   const pixels = context2.input.pixels, base = x + y * width;
-  const weights = [table4(255 - fx, 255 - fy), table4(fx, 255 - fy), table4(255 - fx, fy), table4(fx, fy)];
+  const weights = [table3(255 - fx, 255 - fy), table3(fx, 255 - fy), table3(255 - fx, fy), table3(fx, fy)];
   const samples = [pixels[base], pixels[base + 1], pixels[base + width], pixels[base + width + 1]];
   return channels(samples, weights);
 }
@@ -4433,16 +6571,16 @@ function interference(context2, points, alpha, rgb2) {
       for (let index = 0; index < points.length; index++) {
         const pixel = displaced(context2, x, y, points[index]);
         const channel = index % 3;
-        values[channel] = Math.min(255, values[channel] + table4(pixel >>> channel * 8 & 255, alpha));
+        values[channel] = Math.min(255, values[channel] + table3(pixel >>> channel * 8 & 255, alpha));
       }
       context2.output.pixels[x + y * width] = values[0] | values[1] << 8 | values[2] << 16;
     } else {
       let red = 0, green = 0, blue = 0;
       for (const point of points) {
         const pixel = displaced(context2, x, y, point);
-        blue += table4(pixel & 255, alpha);
-        green += table4(pixel >>> 8 & 255, alpha);
-        red += table4(pixel >>> 16 & 255, alpha);
+        blue += table3(pixel & 255, alpha);
+        green += table3(pixel >>> 8 & 255, alpha);
+        red += table3(pixel >>> 16 & 255, alpha);
       }
       context2.output.pixels[x + y * width] = Math.min(255, blue) | Math.min(255, green) << 8 | Math.min(255, red) << 16;
     }
@@ -4507,7 +6645,7 @@ function fountainColors(colors) {
 }
 function readFiveColors(context2) {
   const defaults = [1862424, 16714275, 2760052, 9451225, 7047423];
-  return defaults.map((fallback, index) => int4(context2, 4 + index * 4, fallback) & 16777215);
+  return defaults.map((fallback2, index) => int5(context2, 4 + index * 4, fallback2) & 16777215);
 }
 function rotationMatrix(axis, degrees) {
   const m = new Array(16).fill(0), m1 = axis % 3, m2 = (m1 + 1) % 3, c = Math.cos(degrees * Math.PI / 180), s = Math.sin(degrees * Math.PI / 180);
@@ -4534,7 +6672,7 @@ function channels(samples, weights) {
   let out = 0;
   for (let channel = 0; channel < 3; channel++) {
     let value = 0;
-    for (let i = 0; i < 4; i++) value += table4(samples[i] >>> channel * 8 & 255, weights[i]);
+    for (let i = 0; i < 4; i++) value += table3(samples[i] >>> channel * 8 & 255, weights[i]);
     out |= (value & 255) << channel * 8;
   }
   return out;
@@ -4544,433 +6682,459 @@ function mixColor(a, b, numerator, denominator) {
   for (let channel = 0; channel < 3; channel++) out |= Math.trunc(((a >>> channel * 8 & 255) * (denominator - numerator) + (b >>> channel * 8 & 255) * numerator) / denominator) << channel * 8;
   return out;
 }
-function table4(x, y) {
+function table3(x, y) {
   return Math.trunc(x / 255 * y);
 }
-function modulo3(value, divisor) {
+function modulo5(value, divisor) {
   const result = value % divisor;
   return result < 0 ? result + divisor : result;
 }
-function int4(context2, offset, fallback) {
-  return offset + 4 <= context2.component.payload.length ? new DataView(context2.component.payload.buffer, context2.component.payload.byteOffset, context2.component.payload.byteLength).getInt32(offset, true) : fallback;
+function int5(context2, offset, fallback2) {
+  return offset + 4 <= context2.component.payload.length ? new DataView(context2.component.payload.buffer, context2.component.payload.byteOffset, context2.component.payload.byteLength).getInt32(offset, true) : fallback2;
 }
-function float(context2, offset, fallback) {
-  return offset + 4 <= context2.component.payload.length ? new DataView(context2.component.payload.buffer, context2.component.payload.byteOffset, context2.component.payload.byteLength).getFloat32(offset, true) : fallback;
+function float(context2, offset, fallback2) {
+  return offset + 4 <= context2.component.payload.length ? new DataView(context2.component.payload.buffer, context2.component.payload.byteOffset, context2.component.payload.byteLength).getFloat32(offset, true) : fallback2;
 }
 
-// src/avs/effects/movement.ts
-var TEXT4 = new TextDecoder("windows-1252");
-var CUSTOM_EFFECT = 32767;
-var LAST_BUILTIN_EFFECT = 23;
-var OFFSET_MASK = (1 << 22) - 1;
-var EVALUATED_BUILTINS = {
-  18: {
-    source: "d=d*(1-(sin((r-$pi*.5)*7)*.03));r=r+(cos(d*12)*.03)",
-    rectangular: false
-  },
-  19: {
-    source: "d=d*(1-(sin((r-$pi*.5)*12)*.05));r=r+(cos(d*18)*.05);d=d*(1-((d-.4)*.03));r=r+((d-.4)*.13)",
-    rectangular: false
-  },
-  20: { source: "x=x+(cos(y*18)*.02);y=y+(sin(x*14)*.03)", rectangular: true },
-  21: {
-    source: "x=x+(cos(abs(y-.5)*8)*.02);y=y+(sin(abs(x-.5)*8)*.05);x=x*.95;y=y*.95",
-    rectangular: true
-  },
-  22: {
-    source: "y=y*(1+(sin(r+$pi/2)*.3));x=x*(1+(cos(r+$pi/2)*.3));x=x*.995;y=y*.995",
-    rectangular: true
-  },
-  23: { source: "y=(r*6)/$pi;x=d", rectangular: true }
+// src/avs/effects/movement-eel-gpu.ts
+var CUSTOM_MOVEMENT = 32767;
+var WORKGROUP_SIZE = 256;
+var POINT_INPUTS = /* @__PURE__ */ new Set(["x", "y", "d", "r"]);
+var DIMENSIONS = /* @__PURE__ */ new Set(["sw", "sh"]);
+var AVS_ENHANCED_MOVEMENT_EEL_GPU_CAPABILITY = {
+  id: "movement-pure-eel-resident-map",
+  backend: "webgpu",
+  lane: "120",
+  byteExact: false,
+  reason: "Pure inverse custom Movement EEL builds its coordinate/weight map resident with f32, then uses exact packed-u32 AVS sampling."
 };
-function decodeAvsMovement(payload) {
-  let offset = 0;
-  let effect = readI322(payload, offset, 1);
-  offset += 4;
-  let expression = "";
-  let rectangular = false;
-  if (effect === CUSTOM_EFFECT) {
-    if (asciiEquals(payload, offset, "!rect ")) {
-      offset += 6;
-      rectangular = true;
-    }
-    if (payload[offset] === 1) {
-      offset++;
-      const length = readI322(payload, offset, 0);
-      offset += 4;
-      if (length > 0 && offset + length <= payload.length) {
-        expression = nulText5(payload.subarray(offset, offset + length));
-        offset += length;
-      }
-    } else {
-      const length = 256 - (rectangular ? 6 : 0);
-      if (offset + length <= payload.length) {
-        expression = nulText5(payload.subarray(offset, offset + length));
-        offset += length;
-      }
-    }
-  }
-  const blend2 = readI322(payload, offset, 0) !== 0;
-  offset += 4;
-  const sourceMapped = readI322(payload, offset, 0);
-  offset += 4;
-  rectangular = readI322(payload, offset, rectangular ? 1 : 0) !== 0;
-  offset += 4;
-  const subpixel = readI322(payload, offset, 0) !== 0;
-  offset += 4;
-  const wrap = readI322(payload, offset, 0) !== 0;
-  offset += 4;
-  if (effect === 0 && offset + 4 <= payload.length) effect = readI322(payload, offset, 0);
-  if (effect !== CUSTOM_EFFECT && effect > LAST_BUILTIN_EFFECT || effect < 0) effect = 0;
-  return { effect, expression, blend: blend2, sourceMapped, rectangular, subpixel, wrap };
-}
-function registerAvsMovement(registry, global = new AvsEelGlobalState()) {
-  const states = /* @__PURE__ */ new Map();
-  registry.registerBuiltin(15, (context2) => {
-    let state = states.get(context2.component.path);
-    if (!state) {
-      const config = decodeAvsMovement(context2.component.payload);
-      state = {
-        config,
-        program: movementProgram(config),
-        sourceMapped: config.sourceMapped,
-        width: 0,
-        height: 0,
-        table: null,
-        randomState: hashPath7(context2.component.path)
-      };
-      states.set(context2.component.path, state);
-    }
-    if (state.config.effect === 0) return;
-    if (!state.table || state.width !== context2.input.width || state.height !== context2.input.height) {
-      state.table = buildMovementTable(context2, state, global);
-      state.width = context2.input.width;
-      state.height = context2.input.height;
-    }
-    if (context2.preinit) return;
-    if ((state.sourceMapped & 2) !== 0 && context2.beat) state.sourceMapped ^= 1;
-    if ((state.sourceMapped & 1) !== 0) renderForward(context2, state.table, state.config.blend);
-    else renderInverse(context2, state.table, state.config.blend);
-    return { swap: true };
-  });
-  return registry;
-}
-function movementProgram(config) {
-  const source = config.effect === CUSTOM_EFFECT ? config.expression : EVALUATED_BUILTINS[config.effect]?.source;
-  if (!source?.trim()) return null;
+function compileEnhancedMovementEelGpu(config) {
+  if (config.effect !== CUSTOM_MOVEMENT) return { eligible: false, reason: "only custom Movement EEL is eligible" };
+  if (config.sourceMapped !== 0) return { eligible: false, reason: "forward or beat-toggled source mapping is order-sensitive" };
+  let ast;
   try {
-    return compileAvsEel(source);
-  } catch {
+    compileAvsEel(config.expression);
+    ast = parseAvsEel(config.expression);
+  } catch (error) {
+    return rejected(error);
+  }
+  const analysis = analyse(ast.body);
+  if (!analysis.ok) return { eligible: false, reason: analysis.reason };
+  try {
+    const builder = new MovementWgslBuilder(analysis.uniformNames);
+    const body = builder.program(ast.body);
+    return {
+      eligible: true,
+      program: {
+        source: config.expression,
+        wgsl: shaderSource(body, analysis.uniformNames, builder.localNames),
+        uniformNames: analysis.uniformNames,
+        workgroupSize: WORKGROUP_SIZE
+      }
+    };
+  } catch (error) {
+    return rejected(error);
+  }
+}
+function analyse(root) {
+  const values = root.kind === "sequence" ? root.values : [root];
+  const written = /* @__PURE__ */ new Set();
+  collectWrites(root, written);
+  for (const name of written) {
+    if (isRegister(name)) return { ok: false, reason: `${name} is shared register state` };
+    if (DIMENSIONS.has(name)) return { ok: false, reason: `${name} is loop-carried dimension state` };
+  }
+  const initialized = new Set(POINT_INPUTS), reads = /* @__PURE__ */ new Set();
+  for (const node of values) {
+    const assignment2 = directAssignment(node);
+    if (assignment2) {
+      const target = normalize(assignment2.target);
+      const failure2 = validatePure(assignment2.value, written, initialized, reads);
+      if (failure2) return { ok: false, reason: failure2 };
+      if (assignment2.operator !== "=" && !initialized.has(target)) return { ok: false, reason: `${target}${assignment2.operator} carries point-to-point state` };
+      initialized.add(target);
+      continue;
+    }
+    const failure = validatePure(node, written, initialized, reads);
+    if (failure) return { ok: false, reason: failure };
+  }
+  const uniformNames = [...reads].filter((name) => !POINT_INPUTS.has(name) && !DIMENSIONS.has(name) && !written.has(name) && !["$pi", "$e", "$phi"].includes(name)).sort();
+  return { ok: true, uniformNames };
+}
+function validatePure(node, written, initialized, reads) {
+  if (node.kind === "variable") {
+    const name = normalize(node.name);
+    if (written.has(name) && !initialized.has(name)) return `${name} is read before per-point initialization`;
+    reads.add(name);
     return null;
   }
-}
-function buildMovementTable(context2, state, global) {
-  const { width, height } = context2.input;
-  const count = width * height;
-  const config = state.config;
-  const bilinear3 = config.subpixel && width > 1 && height > 1 && count < 1 << 22 && (config.effect === CUSTOM_EFFECT || config.effect >= 3 && config.effect <= 23 && config.effect !== 7);
-  const table6 = {
-    offsets: new Uint32Array(count),
-    xWeights: new Uint8Array(count),
-    yWeights: new Uint8Array(count),
-    bilinear: bilinear3
-  };
-  if (config.effect === 1) {
-    for (let i = 0; i < count; i++) {
-      const dx = nextRandom3(state) % 3 - 1;
-      const dy = nextRandom3(state) % 3 - 1;
-      table6.offsets[i] = clamp7(i + dx + dy * width, 0, count - 1);
-    }
-    return table6;
+  if (node.kind === "assign" || node.kind === "call" && node.name === "assign") return "nested or conditional mutation is order-sensitive";
+  if (node.kind === "call" && ["loop", "rand", "megabuf", "gmegabuf", "getosc", "getspec", "gettime", "getkbmouse"].includes(node.name)) {
+    return `${node.name} is not a safe independent point operation`;
   }
-  if (config.effect === 2) {
-    const shift = Math.trunc(width / 64);
-    for (let y = 0; y < height; y++) {
-      let sourceX = shift;
-      for (let x = 0; x < width; x++) {
-        table6.offsets[x + y * width] = sourceX + y * width;
-        sourceX++;
-        if (sourceX >= width) sourceX -= width;
+  for (const child of children(node)) {
+    const failure = validatePure(child, written, initialized, reads);
+    if (failure) return failure;
+  }
+  return null;
+}
+var EnhancedMovementEelGpuState = class {
+  constructor(config, program, global) {
+    this.config = config;
+    this.program = program;
+    this.vm = new AvsEelVm({ global });
+    this.values = new Float32Array(Math.max(4, program.uniformNames.length));
+  }
+  vm;
+  values;
+  capture() {
+    for (let index = 0; index < this.program.uniformNames.length; index++) {
+      const value = this.vm.get(this.program.uniformNames[index]);
+      this.values[index] = Number.isFinite(value) ? value : 0;
+    }
+    return this.values;
+  }
+};
+var EnhancedMovementEelGpuPass = class {
+  constructor(device, state, width, height) {
+    this.device = device;
+    this.state = state;
+    this.width = width;
+    this.height = height;
+    const { config, program } = state;
+    if (config.sourceMapped !== 0 || config.effect !== CUSTOM_MOVEMENT) throw new Error("Movement EEL GPU pass requires inverse custom mapping");
+    const pixels = width * height;
+    if (width <= 0 || height <= 0 || pixels >= 4194304) throw new RangeError("Movement EEL GPU dimensions unsupported");
+    const module = device.createShaderModule({ label: "AVS enhanced custom Movement EEL", code: program.wgsl });
+    this.layout = device.createBindGroupLayout({ label: "AVS custom Movement EEL layout", entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } }
+    ] });
+    const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [this.layout] });
+    this.mapPipeline = device.createComputePipeline({ layout: pipelineLayout, compute: { module, entryPoint: "movement_eel_map" } });
+    this.samplePipeline = device.createComputePipeline({ layout: pipelineLayout, compute: { module, entryPoint: "movement_eel_sample" } });
+    this.map = storage(device, "AVS custom Movement resident map", pixels * 4, 0);
+    this.variables = storage(device, "AVS custom Movement EEL uniforms", Math.max(4, program.uniformNames.length) * 4, GPUBufferUsage.COPY_DST);
+    this.params = device.createBuffer({ label: "AVS custom Movement params", size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  }
+  capability = AVS_ENHANCED_MOVEMENT_EEL_GPU_CAPABILITY;
+  lastEncodedPasses = 0;
+  mapPipeline;
+  samplePipeline;
+  layout;
+  map;
+  variables;
+  params;
+  paramsWords = new Uint32Array(8);
+  groups = /* @__PURE__ */ new WeakMap();
+  prepared = false;
+  mapEncoded = false;
+  destroyed = false;
+  /** Capture shared globals once, matching the classic resize-time table build. */
+  prepare() {
+    if (this.prepared) return;
+    this.assertActive();
+    const { config, program } = this.state;
+    const bilinear3 = config.subpixel && this.width > 1 && this.height > 1;
+    const values = this.state.capture();
+    this.paramsWords.set([this.width, this.height, this.width * this.height, bilinear3 ? 1 : 0, config.blend ? 1 : 0, config.wrap ? 1 : 0, config.rectangular ? 1 : 0, program.uniformNames.length]);
+    this.device.queue.writeBuffer(this.variables, 0, values.buffer, values.byteOffset, values.byteLength);
+    this.device.queue.writeBuffer(this.params, 0, this.paramsWords);
+    this.prepared = true;
+  }
+  update(_audio) {
+    this.prepare();
+  }
+  encode(context2) {
+    this.prepare();
+    let targets = this.groups.get(context2.source);
+    if (!targets) {
+      targets = /* @__PURE__ */ new WeakMap();
+      this.groups.set(context2.source, targets);
+    }
+    let group = targets.get(context2.target);
+    if (!group) {
+      group = context2.device.createBindGroup({ layout: this.layout, entries: [
+        { binding: 0, resource: { buffer: context2.source } },
+        { binding: 1, resource: { buffer: context2.target } },
+        { binding: 2, resource: { buffer: this.map } },
+        { binding: 3, resource: { buffer: this.variables } },
+        { binding: 4, resource: { buffer: this.params } }
+      ] });
+      targets.set(context2.target, group);
+    }
+    const generatedMap = !this.mapEncoded;
+    if (generatedMap) {
+      const mapPass = context2.encoder.beginComputePass({ label: "AVS custom Movement EEL resident map" });
+      mapPass.setPipeline(this.mapPipeline);
+      mapPass.setBindGroup(0, group);
+      mapPass.dispatchWorkgroups(Math.ceil(context2.width * context2.height / WORKGROUP_SIZE));
+      mapPass.end();
+      this.mapEncoded = true;
+    }
+    const samplePass = context2.encoder.beginComputePass({ label: "AVS custom Movement exact sample" });
+    samplePass.setPipeline(this.samplePipeline);
+    samplePass.setBindGroup(0, group);
+    samplePass.dispatchWorkgroups(Math.ceil(context2.width * context2.height / WORKGROUP_SIZE));
+    samplePass.end();
+    this.lastEncodedPasses = generatedMap ? 2 : 1;
+  }
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.map.destroy();
+    this.variables.destroy();
+    this.params.destroy();
+  }
+  assertActive() {
+    if (this.destroyed) throw new Error("AVS custom Movement EEL pass is destroyed");
+  }
+};
+function shaderSource(body, uniforms, locals) {
+  const declarations = [...locals].filter((name) => !["v_x", "v_y", "v_d", "v_r"].includes(name)).sort().map((name) => `var ${name}:f32=0.0;`).join("\n  ");
+  return (
+    /* wgsl */
+    `
+struct Params{width:u32,height:u32,pixels:u32,bilinear:u32,blend_enabled:u32,wrap_enabled:u32,rectangular:u32,variable_count:u32};
+@group(0)@binding(0)var<storage,read>source:array<u32>;@group(0)@binding(1)var<storage,read_write>destination:array<u32>;@group(0)@binding(2)var<storage,read_write>coordinate_map:array<u32>;@group(0)@binding(3)var<storage,read>initial:array<f32>;@group(0)@binding(4)var<uniform>params:Params;
+fn finite(v:f32)->f32{return select(0.0,v,v==v&&abs(v)<=3.402823e38);}fn truth(v:f32)->bool{return abs(v)>=0.00001;}fn close(a:f32,b:f32)->bool{return abs(a-b)<0.00001;}fn divide(a:f32,b:f32)->f32{return select(finite(a/b),0.0,abs(b)<1.1920929e-7);}fn modulo_f(a:f32,b:f32)->f32{return select(finite(a%b),0.0,abs(b)<1.1920929e-7);}fn positive_mod(v:i32,m:i32)->i32{let r=v%m;return select(r,r+m,r<0);}
+fn avs_table(a:u32,b:u32)->u32{var r=(a*b)/255u;let c=(a==147u&&(b==85u||b==170u))||(a==155u&&(b==51u||b==102u||b==153u||b==204u))||(a==171u&&(b==85u||b==170u))||(a==187u&&(b==75u||b==150u||b==165u))||(a==195u&&b==153u);if(c){r-=1u;}return r;}fn avs_average(a:u32,b:u32)->u32{return((a>>1u)&0x007f7f7fu)+((b>>1u)&0x007f7f7fu);}fn avs_bilinear(offset:u32,key:u32)->u32{let xp=(key>>5u)<<3u;let yp=(key&31u)<<3u;let ix=255u-xp;let iy=255u-yp;let w=array<u32,4>(avs_table(ix,iy),avs_table(xp,iy),avs_table(ix,yp),avs_table(xp,yp));let p=array<u32,4>(source[offset],source[offset+1u],source[offset+params.width],source[offset+params.width+1u]);var lo=0u;var mi=0u;var hi=0u;for(var i=0u;i<4u;i++){lo+=avs_table(p[i]&255u,w[i]);mi+=avs_table((p[i]>>8u)&255u,w[i]);hi+=avs_table((p[i]>>16u)&255u,w[i]);}return(lo&255u)|((mi&255u)<<8u)|((hi&255u)<<16u);}
+@compute @workgroup_size(${WORKGROUP_SIZE})fn movement_eel_map(@builtin(global_invocation_id)id:vec3u){let index=id.x;if(index>=params.pixels){return;}let px=index%params.width;let py=index/params.width;let hw=params.width/2u;let hh=params.height/2u;let xd=f32(i32(px)-i32(hw));let yd=f32(i32(py)-i32(hh));let md=sqrt(f32(params.width*params.width+params.height*params.height))*0.5;var v_x=select(xd/f32(hw),0.0,hw==0u);var v_y=select(yd/f32(hh),0.0,hh==0u);var v_d=select(sqrt(xd*xd+yd*yd)/md,0.0,md==0.0);var v_r=atan2(yd,xd)+3.14159265358979323846*0.5;${declarations}var _result=0.0;${body}var sx=0.0;var sy=0.0;if(params.rectangular!=0u){sx=(v_x+1.0)*f32(hw);sy=(v_y+1.0)*f32(hh);}else{let distance=v_d*md;let angle=v_r-3.14159265358979323846*0.5;sx=f32(hw)+cos(angle)*distance;sy=f32(hh)+sin(angle)*distance;}if(params.bilinear==0u){sx+=0.5;sy+=0.5;var ix=i32(trunc(sx));var iy=i32(trunc(sy));if(params.wrap_enabled!=0u){ix=positive_mod(ix,i32(params.width));iy=positive_mod(iy,i32(params.height));}else{ix=clamp(ix,0,i32(params.width)-1);iy=clamp(iy,0,i32(params.height)-1);}coordinate_map[index]=u32(ix+iy*i32(params.width));return;}var ix=i32(trunc(sx));var iy=i32(trunc(sy));var xp=i32(trunc(32.0*(sx-f32(ix))));var yp=i32(trunc(32.0*(sy-f32(iy))));if(params.wrap_enabled!=0u){ix=positive_mod(ix,i32(params.width)-1);iy=positive_mod(iy,i32(params.height)-1);}else{if(ix<0){ix=0;xp=0;}else if(ix>=i32(params.width)-1){ix=i32(params.width)-2;xp=31;}if(iy<0){iy=0;yp=0;}else if(iy>=i32(params.height)-1){iy=i32(params.height)-2;yp=31;}}let packed=bitcast<u32>((ix+iy*i32(params.width))|(yp<<22)|(xp<<27));let xw=(packed>>24u)&248u;let yw=(packed>>19u)&248u;let key=(xw<<2u)|(yw>>3u);coordinate_map[index]=(packed&0x003fffffu)|(key<<22u);}
+@compute @workgroup_size(${WORKGROUP_SIZE})fn movement_eel_sample(@builtin(global_invocation_id)id:vec3u){let i=id.x;if(i>=params.pixels){return;}let packed=coordinate_map[i];let offset=packed&0x003fffffu;var sampled=source[offset];if(params.bilinear!=0u){sampled=avs_bilinear(offset,packed>>22u);}destination[i]=select(sampled,avs_average(source[i],sampled),params.blend_enabled!=0u);}`
+  );
+}
+var MovementWgslBuilder = class {
+  localNames = /* @__PURE__ */ new Set();
+  uniformIndex = /* @__PURE__ */ new Map();
+  constructor(names) {
+    names.forEach((name, index) => this.uniformIndex.set(name, index));
+  }
+  program(root) {
+    const values = root.kind === "sequence" ? root.values : [root], lines = [];
+    for (const node of values) {
+      const a = directAssignment(node);
+      if (!a) {
+        lines.push(`_result=finite(${this.expression(node)});`);
+        continue;
       }
+      const target = this.name(a.target);
+      this.localNames.add(target);
+      lines.push(`${target}=${assignmentExpression(a.operator, target, this.expression(a.value))};`, `_result=${target};`);
     }
-    return table6;
+    return lines.join("");
   }
-  if (config.effect === 7) {
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        let sourceX = x;
-        let sourceY = y;
-        if ((x & 2) === 0 && (y & 2) === 0) {
-          sourceX = Math.trunc(width / 2 + ((x & ~1) - width / 2) * 7 / 8);
-          sourceY = Math.trunc(height / 2 + ((y & ~1) - height / 2) * 7 / 8);
-        }
-        table6.offsets[x + y * width] = clamp7(sourceX, 0, width - 1) + clamp7(sourceY, 0, height - 1) * width;
+  expression(node) {
+    switch (node.kind) {
+      case "number":
+        return numberLiteral2(node.value);
+      case "variable":
+        return this.variable(node.name);
+      case "unary": {
+        const v = this.expression(node.value);
+        if (node.operator === "+") return `finite(${v})`;
+        if (node.operator === "-") return `finite(-(${v}))`;
+        if (node.operator === "!") return `select(1.0,0.0,truth(${v}))`;
+        if (node.operator === "~") return `f32(~i32(${v}))`;
+        throw new Error(`Unsupported unary ${node.operator}`);
       }
-    }
-    return table6;
-  }
-  if (state.program) buildEvaluatedTable(context2, state, table6, global);
-  else if (config.effect >= 3 && config.effect <= 17) buildNativeTable(state, table6, width, height);
-  else fillIdentity(table6, width, height);
-  return table6;
-}
-function buildNativeTable(state, table6, width, height) {
-  const halfWidth = Math.trunc(width / 2);
-  const halfHeight = Math.trunc(height / 2);
-  const maxDistance = Math.sqrt(width * width + height * height) / 2;
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const xd = x - halfWidth;
-      const yd = y - halfHeight;
-      let distance = Math.hypot(xd, yd);
-      let angle = Math.atan2(yd, xd);
-      let xOffset = 0;
-      switch (state.config.effect) {
-        case 3:
-          angle += 0.1 - 0.2 * distance / maxDistance;
-          distance *= 0.96;
-          break;
-        case 4:
-          distance *= 0.99 * (1 - Math.sin(angle) / 32);
-          angle += 0.03 * Math.sin(distance / maxDistance * Math.PI * 4);
-          break;
-        case 5:
-          distance *= 0.94 + Math.cos(angle * 32) * 0.06;
-          break;
-        case 6:
-          distance *= 1.01 + Math.cos(angle * 4) * 0.04;
-          angle += 0.03 * Math.sin(distance / maxDistance * Math.PI * 4);
-          break;
-        case 8:
-          angle += 0.1 * Math.sin(distance / maxDistance * Math.PI * 5);
-          break;
-        case 9: {
-          const t = Math.sin(distance / maxDistance * Math.PI);
-          distance -= 8 * t ** 5;
-          break;
-        }
-        case 10: {
-          const t = Math.sin(distance / maxDistance * Math.PI);
-          distance -= 8 * t ** 5;
-          const swirl = Math.cos(distance / maxDistance * Math.PI / 2);
-          angle += 0.1 * swirl ** 3;
-          break;
-        }
-        case 11:
-          distance *= 0.95 + Math.cos(angle * 5 - Math.PI / 2.5) * 0.03;
-          break;
-        case 12:
-          angle += 0.04;
-          distance *= 0.96 + Math.cos(distance / maxDistance * Math.PI) * 0.05;
-          break;
-        case 13: {
-          const t = Math.cos(distance / maxDistance * Math.PI);
-          angle += 0.07 * t;
-          distance *= 0.98 + t * 0.1;
-          break;
-        }
-        case 14:
-          angle += 0.1 - 0.2 * distance / maxDistance;
-          distance *= 0.96;
-          xOffset = 8;
-          break;
-        case 15:
-          distance = maxDistance * 0.15;
-          break;
-        case 16:
-          angle = Math.cos(angle * 3);
-          break;
-        case 17:
-          distance *= 1 - (distance / maxDistance - 0.35) * 0.5;
-          angle += 0.1;
-          break;
-      }
-      const sampleX = halfWidth + Math.cos(angle) * distance + 0.5 + xOffset * width / 256;
-      const sampleY = halfHeight + Math.sin(angle) * distance + 0.5;
-      storeCoordinate(table6, x + y * width, sampleX, sampleY, width, height, state.config.wrap);
+      case "binary":
+        return this.binary(node.operator, node.left, node.right);
+      case "conditional":
+        return `select(${this.expression(node.no)},${this.expression(node.yes)},truth(${this.expression(node.condition)}))`;
+      case "call":
+        return this.call(node.name, node.args);
+      case "sequence":
+        if (node.values.length === 1) return this.expression(node.values[0]);
+        throw new Error("Nested sequence is not GPU-pure");
+      case "assign":
+        throw new Error("Nested assignment is not GPU-pure");
     }
   }
-}
-function buildEvaluatedTable(context2, state, table6, global) {
-  const { width, height } = context2.input;
-  const halfWidth = Math.trunc(width / 2);
-  const halfHeight = Math.trunc(height / 2);
-  const maxDistance = Math.sqrt(width * width + height * height) / 2;
-  const vm = new AvsEelVm({ global, seed: state.randomState });
-  vm.setHost({
-    getosc: (band, span, channel) => avsAudioSample(context2.audio, "osc", band, span, channel),
-    getspec: (band, span, channel) => avsAudioSample(context2.audio, "spec", band, span, channel)
-  });
-  vm.set("sw", width);
-  vm.set("sh", height);
-  const rectangular = state.config.effect === CUSTOM_EFFECT ? state.config.rectangular : EVALUATED_BUILTINS[state.config.effect]?.rectangular === true;
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const xd = x - halfWidth;
-      const yd = y - halfHeight;
-      vm.set("x", halfWidth === 0 ? 0 : xd / halfWidth);
-      vm.set("y", halfHeight === 0 ? 0 : yd / halfHeight);
-      vm.set("d", maxDistance === 0 ? 0 : Math.hypot(xd, yd) / maxDistance);
-      vm.set("r", Math.atan2(yd, xd) + Math.PI / 2);
-      vm.execute(state.program);
-      let sampleX;
-      let sampleY;
-      if (rectangular) {
-        sampleX = (vm.get("x") + 1) * halfWidth;
-        sampleY = (vm.get("y") + 1) * halfHeight;
-      } else {
-        const distance = vm.get("d") * maxDistance;
-        const angle = vm.get("r") - Math.PI / 2;
-        sampleX = halfWidth + Math.cos(angle) * distance;
-        sampleY = halfHeight + Math.sin(angle) * distance;
-      }
-      if (!table6.bilinear) {
-        sampleX += 0.5;
-        sampleY += 0.5;
-      }
-      storeCoordinate(table6, x + y * width, sampleX, sampleY, width, height, state.config.wrap);
+  binary(op, l, r) {
+    const a = this.expression(l), b = this.expression(r);
+    switch (op) {
+      case "+":
+        return `finite((${a})+(${b}))`;
+      case "-":
+        return `finite((${a})-(${b}))`;
+      case "*":
+        return `finite((${a})*(${b}))`;
+      case "/":
+        return `divide(${a},${b})`;
+      case "%":
+        return `modulo_f(${a},${b})`;
+      case "**":
+        return `finite(pow(${a},${b}))`;
+      case "|":
+        return `f32(i32(${a})|i32(${b}))`;
+      case "&":
+        return `f32(i32(${a})&i32(${b}))`;
+      case "^":
+        return `f32(i32(${a})^i32(${b}))`;
+      case "<<":
+        return `f32(i32(${a})<<(u32(i32(${b}))&31u))`;
+      case ">>":
+        return `f32(i32(${a})>>(u32(i32(${b}))&31u))`;
+      case "&&":
+        return `select(0.0,select(0.0,1.0,truth(${b})),truth(${a}))`;
+      case "||":
+        return `select(select(0.0,1.0,truth(${b})),1.0,truth(${a}))`;
+      case "==":
+        return `select(0.0,1.0,close(${a},${b}))`;
+      case "!=":
+        return `select(1.0,0.0,close(${a},${b}))`;
+      case "===":
+        return `select(0.0,1.0,(${a})==(${b}))`;
+      case "!==":
+        return `select(0.0,1.0,(${a})!=(${b}))`;
+      case "<":
+      case "<=":
+      case ">":
+      case ">=":
+        return `select(0.0,1.0,(${a})${op}(${b}))`;
+      default:
+        throw new Error(`Unsupported binary ${op}`);
     }
   }
-}
-function storeCoordinate(table6, destination, rawX, rawY, width, height, wrap) {
-  if (!table6.bilinear) {
-    let x2 = Math.trunc(rawX);
-    let y2 = Math.trunc(rawY);
-    if (wrap) {
-      x2 = modulo4(x2, width);
-      y2 = modulo4(y2, height);
-    } else {
-      x2 = clamp7(x2, 0, width - 1);
-      y2 = clamp7(y2, 0, height - 1);
+  call(name, nodes) {
+    if (name === "if") return `select(${this.expression(nodes[2])},${this.expression(nodes[1])},truth(${this.expression(nodes[0])}))`;
+    const a = nodes.map((n) => this.expression(n)), one = (f) => `finite(${f}(${a[0]}))`, two = (f) => `finite(${f}(${a[0]},${a[1]}))`;
+    switch (name) {
+      case "sin":
+      case "cos":
+      case "tan":
+      case "asin":
+      case "acos":
+      case "atan":
+      case "sqrt":
+      case "exp":
+      case "log":
+      case "abs":
+      case "floor":
+      case "ceil":
+        return one(name);
+      case "atan2":
+        return two("atan2");
+      case "sqr":
+        return `finite((${a[0]})*(${a[0]}))`;
+      case "invsqrt":
+        return `finite(inverseSqrt(${a[0]}))`;
+      case "pow":
+      case "min":
+      case "max":
+        return two(name);
+      case "log10":
+        return `finite(log2(${a[0]})/log2(10.0))`;
+      case "int":
+        return `finite(trunc(${a[0]}))`;
+      case "sign":
+        return `select(select(0.0,1.0,(${a[0]})>0.0),-1.0,(${a[0]})<0.0)`;
+      case "equal":
+        return `select(0.0,1.0,close(${a[0]},${a[1]}))`;
+      case "above":
+        return `select(0.0,1.0,(${a[0]})>(${a[1]}))`;
+      case "below":
+        return `select(0.0,1.0,(${a[0]})<(${a[1]}))`;
+      case "band":
+        return `select(0.0,1.0,truth(${a[0]})&&truth(${a[1]}))`;
+      case "bor":
+        return `select(0.0,1.0,truth(${a[0]})||truth(${a[1]}))`;
+      case "bnot":
+        return `select(1.0,0.0,truth(${a[0]}))`;
+      default:
+        throw new Error(`Function ${name} is not supported by enhanced Movement EEL`);
     }
-    table6.offsets[destination] = x2 + y2 * width;
-    return;
   }
-  let x = Math.trunc(rawX);
-  let y = Math.trunc(rawY);
-  let xPartial = Math.trunc(32 * (rawX - x));
-  let yPartial = Math.trunc(32 * (rawY - y));
-  if (wrap) {
-    x = modulo4(x, width - 1);
-    y = modulo4(y, height - 1);
-  } else {
-    if (x < 0) {
-      x = 0;
-      xPartial = 0;
-    } else if (x >= width - 1) {
-      x = width - 2;
-      xPartial = 31;
-    }
-    if (y < 0) {
-      y = 0;
-      yPartial = 0;
-    } else if (y >= height - 1) {
-      y = height - 2;
-      yPartial = 31;
-    }
+  variable(raw) {
+    const name = normalize(raw);
+    if (name === "$pi") return "3.14159265358979323846";
+    if (name === "$e") return "2.71828182845904523536";
+    if (name === "$phi") return "1.61803398874989484820";
+    if (name === "sw") return "f32(params.width)";
+    if (name === "sh") return "f32(params.height)";
+    const local = this.name(name);
+    if (POINT_INPUTS.has(name) || this.localNames.has(local)) return local;
+    const index = this.uniformIndex.get(name);
+    if (index === void 0) throw new Error(`Missing GPU input ${name}`);
+    return `initial[${index}u]`;
   }
-  const packed = (x + y * width | yPartial << 22 | xPartial << 27) >>> 0;
-  table6.offsets[destination] = packed & OFFSET_MASK;
-  table6.xWeights[destination] = packed >>> 24 & 31 << 3;
-  table6.yWeights[destination] = packed >>> 19 & 31 << 3;
+  name(raw) {
+    return `v_${normalize(raw).replace(/^\$/, "").replace(/[^a-z0-9_]/g, "_")}`;
+  }
+};
+function collectWrites(node, target) {
+  if (node.kind === "assign" && node.target.kind === "variable") target.add(normalize(node.target.name));
+  if (node.kind === "call" && node.name === "assign" && node.args[0]?.kind === "variable") target.add(normalize(node.args[0].name));
+  for (const child of children(node)) collectWrites(child, target);
 }
-function renderInverse(context2, table6, blend2) {
-  const source = context2.input.pixels;
-  const output = context2.output.pixels;
-  const width = context2.input.width;
-  if (table6.bilinear) {
-    if (blend2) {
-      for (let i = 0; i < output.length; i++) {
-        output[i] = averagePixel3(source[i], sampleBilinear(
-          source,
-          table6.offsets[i],
-          width,
-          table6.xWeights[i],
-          table6.yWeights[i]
-        ));
-      }
-    } else {
-      for (let i = 0; i < output.length; i++) {
-        output[i] = sampleBilinear(source, table6.offsets[i], width, table6.xWeights[i], table6.yWeights[i]);
-      }
-    }
-  } else if (blend2) {
-    for (let i = 0; i < output.length; i++) output[i] = averagePixel3(source[i], source[table6.offsets[i]]);
-  } else {
-    for (let i = 0; i < output.length; i++) output[i] = source[table6.offsets[i]];
+function directAssignment(node) {
+  if (node.kind === "assign" && node.target.kind === "variable") return { target: node.target.name, operator: node.operator, value: node.value };
+  if (node.kind === "call" && node.name === "assign" && node.args[0]?.kind === "variable" && node.args[1]) return { target: node.args[0].name, operator: "=", value: node.args[1] };
+  return null;
+}
+function children(node) {
+  switch (node.kind) {
+    case "number":
+    case "variable":
+      return [];
+    case "unary":
+      return [node.value];
+    case "binary":
+      return [node.left, node.right];
+    case "conditional":
+      return [node.condition, node.yes, node.no];
+    case "assign":
+      return [node.target, node.value];
+    case "call":
+      return node.args;
+    case "sequence":
+      return node.values;
   }
 }
-function renderForward(context2, table6, blend2) {
-  const source = context2.input.pixels;
-  const output = context2.output.pixels;
-  if (blend2) output.set(source);
-  else output.fill(0);
-  for (let i = 0; i < source.length; i++) {
-    const destination = table6.offsets[i];
-    output[destination] = maximumPixel2(source[i], output[destination]);
+function assignmentExpression(op, left, right) {
+  switch (op) {
+    case "=":
+      return `finite(${right})`;
+    case "+=":
+      return `finite(${left}+(${right}))`;
+    case "-=":
+      return `finite(${left}-(${right}))`;
+    case "*=":
+      return `finite(${left}*(${right}))`;
+    case "/=":
+      return `divide(${left},${right})`;
+    case "%=":
+      return `modulo_f(${left},${right})`;
+    case "|=":
+      return `f32(i32(${left})|i32(${right}))`;
+    case "&=":
+      return `f32(i32(${left})&i32(${right}))`;
+    case "^=":
+      return `f32(i32(${left})^i32(${right}))`;
+    case "**=":
+      return `finite(pow(${left},${right}))`;
+    default:
+      throw new Error(`Unsupported assignment ${op}`);
   }
-  if (blend2) {
-    for (let i = 0; i < output.length; i++) output[i] = averagePixel3(output[i], source[i]);
-  }
 }
-function sampleBilinear(source, offset, width, xp, yp) {
-  const blendTable = AVS_BLEND_TABLE;
-  const inverseX = 255 - xp;
-  const inverseY = 255 - yp;
-  const w0 = blendTable[inverseX << 8 | inverseY];
-  const w1 = blendTable[xp << 8 | inverseY];
-  const w2 = blendTable[inverseX << 8 | yp];
-  const w3 = blendTable[xp << 8 | yp];
-  const p0 = source[offset];
-  const p1 = source[offset + 1];
-  const p2 = source[offset + width];
-  const p3 = source[offset + width + 1];
-  const low = blendTable[(p0 & 255) << 8 | w0] + blendTable[(p1 & 255) << 8 | w1] + blendTable[(p2 & 255) << 8 | w2] + blendTable[(p3 & 255) << 8 | w3];
-  const middle = blendTable[(p0 >>> 8 & 255) << 8 | w0] + blendTable[(p1 >>> 8 & 255) << 8 | w1] + blendTable[(p2 >>> 8 & 255) << 8 | w2] + blendTable[(p3 >>> 8 & 255) << 8 | w3];
-  const high = blendTable[(p0 >>> 16 & 255) << 8 | w0] + blendTable[(p1 >>> 16 & 255) << 8 | w1] + blendTable[(p2 >>> 16 & 255) << 8 | w2] + blendTable[(p3 >>> 16 & 255) << 8 | w3];
-  return low & 255 | (middle & 255) << 8 | (high & 255) << 16;
+function storage(device, label, size, extra) {
+  return device.createBuffer({ label, size: Math.max(16, Math.ceil(size / 16) * 16), usage: GPUBufferUsage.STORAGE | extra });
 }
-function fillIdentity(table6, width, height) {
-  for (let i = 0; i < width * height; i++) table6.offsets[i] = i;
+function normalize(name) {
+  return name.toLowerCase().slice(0, 8);
 }
-function averagePixel3(a, b) {
-  return (a >>> 1 & 8355711) + (b >>> 1 & 8355711) & 16777215;
+function isRegister(name) {
+  return /^reg\d\d$/.test(name);
 }
-function maximumPixel2(a, b) {
-  return Math.max(a & 255, b & 255) | Math.max(a >>> 8 & 255, b >>> 8 & 255) << 8 | Math.max(a >>> 16 & 255, b >>> 16 & 255) << 16;
+function numberLiteral2(value) {
+  if (!Number.isFinite(value)) return "0.0";
+  return Number.isInteger(value) ? `${value}.0` : `${value}`;
 }
-function nextRandom3(state) {
-  let x = state.randomState || 1831565813;
-  x ^= x << 13;
-  x ^= x >>> 17;
-  x ^= x << 5;
-  state.randomState = x >>> 0;
-  return state.randomState;
-}
-function modulo4(value, modulus) {
-  if (modulus <= 0) return 0;
-  const result = value % modulus;
-  return result < 0 ? result + modulus : result;
-}
-function readI322(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
-}
-function asciiEquals(payload, offset, value) {
-  if (offset + value.length > payload.length) return false;
-  for (let i = 0; i < value.length; i++) if (payload[offset + i] !== value.charCodeAt(i)) return false;
-  return true;
-}
-function nulText5(bytes) {
-  const end = bytes.indexOf(0);
-  return TEXT4.decode(end < 0 ? bytes : bytes.subarray(0, end));
-}
-function clamp7(value, minimum, maximum) {
-  return value < minimum ? minimum : value > maximum ? maximum : value;
-}
-function hashPath7(path) {
-  let hash = 2166136261;
-  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
-  return hash >>> 0;
+function rejected(error) {
+  return { eligible: false, reason: error instanceof Error ? error.message : String(error) };
 }
 
 // src/avs/effects/low-count-builtins.ts
@@ -4986,17 +7150,17 @@ function registerAvsLowCountBuiltins(registry = new AvsEffectRegistry()) {
     const state = simpleStates.get(context2.component.path) ?? { colorPosition: 0 };
     simpleStates.set(context2.component.path, state);
     const color = cycleColor(colors, state);
-    renderSimple(context2, int5(context2, 0, 40), color);
+    renderSimple(context2, int6(context2, 0, 40), color);
   });
   registry.registerBuiltin(14, (context2) => {
     if (context2.preinit) return;
-    const count = int5(context2, 4, 1);
+    const count = int6(context2, 4, 1);
     const colors = readColors(context2, 8, count);
     if (colors.length === 0) return;
     const state = ringStates.get(context2.component.path) ?? { colorPosition: 0 };
     ringStates.set(context2.component.path, state);
     const tail = 8 + colors.length * 4;
-    renderRing(context2, int5(context2, 0, 40), cycleColor(colors, state), int5(context2, tail, 8), int5(context2, tail + 4, 0));
+    renderRing(context2, int6(context2, 0, 40), cycleColor(colors, state), int6(context2, tail, 8), int6(context2, tail + 4, 0));
   });
   registry.registerBuiltin(17, (context2) => {
     if (context2.preinit) return;
@@ -5008,23 +7172,23 @@ function registerAvsLowCountBuiltins(registry = new AvsEffectRegistry()) {
       gridStates.set(context2.component.path, state);
     }
     const tail = 4 + colors.length * 4;
-    const spacing = Math.max(2, int5(context2, tail, 8));
+    const spacing = Math.max(2, int6(context2, tail, 8));
     while (state.x < 0) state.x += spacing * 256;
     while (state.y < 0) state.y += spacing * 256;
     const sx = (state.x >>> 8) % spacing;
     const sy = (state.y >>> 8) % spacing;
     const color = cycleColor(colors, state);
-    const blend2 = int5(context2, tail + 12, 3);
+    const blend2 = int6(context2, tail + 12, 3);
     for (let y = sy; y < context2.input.height; y += spacing) for (let x = sx; x < context2.input.width; x += spacing) {
       const index = x + y * context2.input.width;
       const destination = context2.input.pixels[index];
       context2.input.pixels[index] = blend2 === 1 ? blendPixel(color, destination, "additive") : blend2 === 2 ? blendPixel(color, destination, "average") : blend2 === 3 ? blendLine(color, destination, context2.line.blendMode, context2.line.adjustableAlpha) : color;
     }
-    state.x += int5(context2, tail + 4, 128);
-    state.y += int5(context2, tail + 8, 128);
+    state.x += int6(context2, tail + 4, 128);
+    state.y += int6(context2, tail + 8, 128);
   });
   registry.registerBuiltin(24, (context2) => {
-    if (context2.preinit || int5(context2, 0, 1) === 0) return;
+    if (context2.preinit || int6(context2, 0, 1) === 0) return;
     let state = grainStates.get(context2.component.path);
     if (!state || state.width !== context2.input.width || state.height !== context2.input.height) {
       const random = hashPath8(context2.component.path);
@@ -5037,8 +7201,8 @@ function registerAvsLowCountBuiltins(registry = new AvsEffectRegistry()) {
       }
       grainStates.set(context2.component.path, state);
     }
-    const staticGrain = int5(context2, 16, 0) !== 0;
-    const threshold = Math.trunc(int5(context2, 12, 100) * 255 / 100);
+    const staticGrain = int6(context2, 16, 0) !== 0;
+    const threshold = Math.trunc(int6(context2, 12, 100) * 255 / 100);
     for (let i = 0; i < context2.input.pixels.length; i++) {
       const pixel = context2.input.pixels[i];
       if (pixel === 0) continue;
@@ -5054,7 +7218,7 @@ function registerAvsLowCountBuiltins(registry = new AvsEffectRegistry()) {
         scale = state.random & 255;
       }
       const grain = gate < threshold ? scalePixel(pixel, scale) : 0;
-      context2.input.pixels[i] = int5(context2, 4, 0) !== 0 ? blendPixel(grain, pixel, "additive") : int5(context2, 8, 0) !== 0 ? blendPixel(grain, pixel, "average") : grain;
+      context2.input.pixels[i] = int6(context2, 4, 0) !== 0 ? blendPixel(grain, pixel, "additive") : int6(context2, 8, 0) !== 0 ? blendPixel(grain, pixel, "average") : grain;
     }
   });
   return registry;
@@ -5139,12 +7303,12 @@ function renderRing(context2, effect, color, size, spectrumMode) {
   }
 }
 function colorList(context2, offset) {
-  return readColors(context2, offset + 4, int5(context2, offset, 1));
+  return readColors(context2, offset + 4, int6(context2, offset, 1));
 }
 function readColors(context2, offset, count) {
   if (count < 1 || count > 16) return [];
   const result = [];
-  for (let i = 0; i < count && offset + i * 4 + 4 <= context2.component.payload.length; i++) result.push(int5(context2, offset + i * 4, 0) & 16777215);
+  for (let i = 0; i < count && offset + i * 4 + 4 <= context2.component.payload.length; i++) result.push(int6(context2, offset + i * 4, 0) & 16777215);
   return result;
 }
 function cycleColor(colors, state) {
@@ -5212,8 +7376,8 @@ function scalePixel(pixel, scale) {
 function channels23(a, b, fn) {
   return fn(a & 255, b & 255) | fn(a >>> 8 & 255, b >>> 8 & 255) << 8 | fn(a >>> 16 & 255, b >>> 16 & 255) << 16;
 }
-function int5(context2, offset, fallback) {
-  return offset + 4 <= context2.component.payload.length ? new DataView(context2.component.payload.buffer, context2.component.payload.byteOffset, context2.component.payload.byteLength).getInt32(offset, true) : fallback;
+function int6(context2, offset, fallback2) {
+  return offset + 4 <= context2.component.payload.length ? new DataView(context2.component.payload.buffer, context2.component.payload.byteOffset, context2.component.payload.byteLength).getInt32(offset, true) : fallback2;
 }
 function hashPath8(path) {
   let hash = 2166136261;
@@ -5296,7 +7460,17 @@ function infiniteRootBorder(context2) {
 var AVS_CHANNEL_SHIFT_APE_ID = "Channel Shift";
 var AVS_COLOR_REDUCTION_APE_ID = "Color Reduction";
 var AVS_MULTIPLIER_APE_ID = "Multiplier";
-var CHANNEL_MODES = [1183, 1020, 1018, 1022, 1019, 1021];
+var AVS_CHANNEL_SHIFT_MODES = [1183, 1020, 1018, 1022, 1019, 1021];
+function createAvsChannelShiftState(config, path) {
+  return { mode: config.mode, randomState: hashPath9(path) };
+}
+function resolveAvsChannelShiftMode(state, config, beat) {
+  if (beat && config.randomizeOnBeat) {
+    state.randomState = xorshift323(state.randomState);
+    state.mode = AVS_CHANNEL_SHIFT_MODES[state.randomState % AVS_CHANNEL_SHIFT_MODES.length];
+  }
+  return state.mode;
+}
 function decodeAvsChannelShift(payload) {
   const native = new Uint8Array(8);
   const view = new DataView(native.buffer);
@@ -5325,14 +7499,10 @@ function registerAvsNamedApeEffects(registry = new AvsEffectRegistry()) {
     const config = decodeAvsChannelShift(context2.component.payload);
     let state = shifts.get(context2.component.path);
     if (!state) {
-      state = { mode: config.mode, randomState: hashPath9(context2.component.path) };
+      state = createAvsChannelShiftState(config, context2.component.path);
       shifts.set(context2.component.path, state);
     }
-    if (context2.beat && config.randomizeOnBeat) {
-      state.randomState = xorshift323(state.randomState);
-      state.mode = CHANNEL_MODES[state.randomState % CHANNEL_MODES.length];
-    }
-    shiftChannels(context2, state.mode);
+    shiftChannels(context2, resolveAvsChannelShiftMode(state, config, context2.beat));
   });
   registry.registerApe(AVS_COLOR_REDUCTION_APE_ID, (context2) => {
     if (context2.preinit) return;
@@ -5345,7 +7515,7 @@ function registerAvsNamedApeEffects(registry = new AvsEffectRegistry()) {
   return registry;
 }
 function shiftChannels(context2, mode) {
-  if (mode === 1183 || !CHANNEL_MODES.includes(mode)) return;
+  if (mode === 1183 || !AVS_CHANNEL_SHIFT_MODES.includes(mode)) return;
   for (let i = 0; i < context2.input.pixels.length; i++) {
     const pixel = context2.input.pixels[i];
     const red = pixel >>> 16 & 255;
@@ -5416,8 +7586,8 @@ function channels3(pixel, fn) {
   const red = fn(pixel >>> 16 & 255);
   return blue | green << 8 | red << 16;
 }
-function readI323(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+function readI323(payload, offset, fallback2) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback2;
 }
 function nulText6(bytes) {
   const end = bytes.indexOf(0);
@@ -5717,7 +7887,7 @@ function registerUniqueTone(registry) {
       const original = pixels[i];
       let depth = Math.max(original & 255, original >>> 8 & 255, original >>> 16 & 255);
       if (config.invert) depth = 255 - depth;
-      const tone = table5(depth, blue) | table5(depth, green) << 8 | table5(depth, red) << 16;
+      const tone = table4(depth, blue) | table4(depth, green) << 8 | table4(depth, red) << 16;
       pixels[i] = config.additive ? blendPixel(tone, original, "additive") : config.average ? averagePixel4(original, tone) : tone;
     }
   });
@@ -5784,12 +7954,12 @@ function avsIntegerSquareRoot(value) {
   return Math.trunc(Math.sqrt(n));
 }
 function sampleBilinear2(source, offset, width, xp, yp) {
-  const weights = [table5(255 - xp, 255 - yp), table5(xp, 255 - yp), table5(255 - xp, yp), table5(xp, yp)];
+  const weights = [table4(255 - xp, 255 - yp), table4(xp, 255 - yp), table4(255 - xp, yp), table4(xp, yp)];
   const pixels = [source[offset], source[offset + 1], source[offset + width], source[offset + width + 1]];
   let result = 0;
   for (let shift = 0; shift <= 16; shift += 8) {
     let value = 0;
-    for (let i = 0; i < 4; i++) value += table5(pixels[i] >>> shift & 255, weights[i]);
+    for (let i = 0; i < 4; i++) value += table4(pixels[i] >>> shift & 255, weights[i]);
     result |= (value & 255) << shift;
   }
   return result;
@@ -5800,11 +7970,11 @@ function eelChannel(value) {
 function averagePixel4(a, b) {
   return (a >>> 1 & 8355711) + (b >>> 1 & 8355711) & 16777215;
 }
-function table5(x, y) {
+function table4(x, y) {
   return Math.trunc(x / 255 * y);
 }
-function i327(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+function i327(payload, offset, fallback2) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback2;
 }
 function nulText7(bytes) {
   const end = bytes.indexOf(0);
@@ -5864,16 +8034,28 @@ function registerAvsSuperScope(registry, global = registry.eelGlobal) {
     if (!state) {
       const config = decodeAvsSuperScope(context2.component.payload);
       const vm = new AvsEelVm({ global, seed: hashPath11(context2.component.path) });
+      const host = { audio: context2.audio };
+      vm.setHost({
+        getosc: (band, width, channel) => avsAudioSample(host.audio, "osc", band, width, channel),
+        getspec: (band, width, channel) => avsAudioSample(host.audio, "spec", band, width, channel)
+      });
       vm.set("n", 100);
+      const programs = [
+        compileOrNull4(config.point),
+        compileOrNull4(config.frame),
+        compileOrNull4(config.beat),
+        compileOrNull4(config.init)
+      ];
       state = {
         config,
         vm,
-        programs: [
-          compileOrNull4(config.point),
-          compileOrNull4(config.frame),
-          compileOrNull4(config.beat),
-          compileOrNull4(config.init)
+        executors: [
+          programs[0]?.bind(vm) ?? null,
+          programs[1]?.bind(vm) ?? null,
+          programs[2]?.bind(vm) ?? null,
+          programs[3]?.bind(vm) ?? null
         ],
+        host,
         initialized: false,
         colorPosition: 0,
         centeredAudio: new Uint8Array(576),
@@ -5890,10 +8072,7 @@ function renderSuperScope(context2, config, state) {
   if (config.colors.length === 0) return;
   const { vm } = state;
   const variables = state.variables;
-  vm.setHost({
-    getosc: (band, width, channel) => avsAudioSample(context2.audio, "osc", band, width, channel),
-    getspec: (band, width, channel) => avsAudioSample(context2.audio, "spec", band, width, channel)
-  });
+  state.host.audio = context2.audio;
   state.colorPosition++;
   if (state.colorPosition >= config.colors.length * 64) state.colorPosition = 0;
   const color = interpolatedColor(config.colors, state.colorPosition);
@@ -5907,16 +8086,42 @@ function renderSuperScope(context2, config, state) {
   setBinding(variables.linesize, context2.line.lineWidth >>> 0 & 255);
   setBinding(variables.drawmode, config.lines ? 1 : 0);
   if (!state.initialized) {
-    execute5(state.programs[3], vm);
+    execute5(state.executors[3]);
     state.initialized = true;
   }
-  execute5(state.programs[1], vm);
-  if (context2.beat) execute5(state.programs[2], vm);
-  if (!state.programs[0]) return;
+  execute5(state.executors[1]);
+  if (context2.beat) execute5(state.executors[2]);
+  const executePoint = state.executors[0];
+  if (!executePoint) return;
   const count = Math.min(MAX_POINTS, Math.trunc(getBinding(variables.n)));
   if (count <= 0) return;
   const data = scopeChannel(context2, config.channel, state.centeredAudio);
   const xor = (config.channel & 4) !== 0 ? 0 : 128;
+  runSuperScopePoints(context2, variables, executePoint, data, xor, count);
+}
+function runSuperScopePoints(context2, variables, executePoint, data, xor, count) {
+  const vValues = variables.v.values;
+  const vIndex = variables.v.index;
+  const iValues = variables.i.values;
+  const iIndex = variables.i.index;
+  const skipValues = variables.skip.values;
+  const skipIndex = variables.skip.index;
+  const xValues = variables.x.values;
+  const xIndex = variables.x.index;
+  const yValues = variables.y.values;
+  const yIndex = variables.y.index;
+  const blueValues = variables.blue.values;
+  const blueIndex = variables.blue.index;
+  const greenValues = variables.green.values;
+  const greenIndex = variables.green.index;
+  const redValues = variables.red.values;
+  const redIndex = variables.red.index;
+  const drawmodeValues = variables.drawmode.values;
+  const drawmodeIndex = variables.drawmode.index;
+  const linesizeValues = variables.linesize.values;
+  const linesizeIndex = variables.linesize.index;
+  const inputWidth = context2.input.width;
+  const inputHeight = context2.input.height;
   let canDraw = false;
   let lastX = 0;
   let lastY = 0;
@@ -5926,18 +8131,18 @@ function renderSuperScope(context2, config, state) {
     const fraction = audioPosition - sourceIndex;
     const a = data[Math.min(575, sourceIndex)] ^ xor;
     const b = data[Math.min(575, sourceIndex + 1)] ^ xor;
-    setBinding(variables.v, (a * (1 - fraction) + b * fraction) / 128 - 1);
-    setBinding(variables.i, count === 1 ? 0 : index / (count - 1));
-    setBinding(variables.skip, 0);
-    state.programs[0].execute(vm);
-    const x = Math.trunc((getBinding(variables.x) + 1) * context2.input.width * 0.5);
-    const y = Math.trunc((getBinding(variables.y) + 1) * context2.input.height * 0.5);
-    if (getBinding(variables.skip) < 1e-5) {
-      const drawColor = makeByte(getBinding(variables.blue)) | makeByte(getBinding(variables.green)) << 8 | makeByte(getBinding(variables.red)) << 16;
-      if (getBinding(variables.drawmode) < 1e-5) {
+    vValues[vIndex] = (a * (1 - fraction) + b * fraction) / 128 - 1;
+    iValues[iIndex] = count === 1 ? 0 : index / (count - 1);
+    skipValues[skipIndex] = 0;
+    executePoint();
+    const x = Math.trunc(((xValues[xIndex] ?? 0) + 1) * inputWidth * 0.5);
+    const y = Math.trunc(((yValues[yIndex] ?? 0) + 1) * inputHeight * 0.5);
+    if ((skipValues[skipIndex] ?? 0) < 1e-5) {
+      const drawColor = makeByte(blueValues[blueIndex] ?? 0) | makeByte(greenValues[greenIndex] ?? 0) << 8 | makeByte(redValues[redIndex] ?? 0) << 16;
+      if ((drawmodeValues[drawmodeIndex] ?? 0) < 1e-5) {
         drawPoint(context2, x, y, drawColor);
       } else if (canDraw && (drawColor !== 0 || context2.line.blendMode !== 1)) {
-        drawLine2(context2, lastX, lastY, x, y, drawColor, Math.trunc(getBinding(variables.linesize) + 0.5));
+        drawLine2(context2, lastX, lastY, x, y, drawColor, Math.trunc((linesizeValues[linesizeIndex] ?? 0) + 0.5));
       }
     }
     canDraw = true;
@@ -6023,8 +8228,8 @@ function drawLine2(context2, x1, y1, x2, y2, color, requestedWidth) {
     }
   }
 }
-function execute5(program, vm) {
-  return program ? vm.execute(program) : 0;
+function execute5(executor) {
+  return executor ? executor() : 0;
 }
 function bindVariables(vm) {
   return {
@@ -6075,11 +8280,11 @@ function readString3(payload, offset) {
   const end = Math.min(payload.length, start + length);
   return { value: nulText8(payload.subarray(start, end)), next: end };
 }
-function readI324(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+function readI324(payload, offset, fallback2) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback2;
 }
-function readU32(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(offset, true) : fallback;
+function readU32(payload, offset, fallback2) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(offset, true) : fallback2;
 }
 function nulText8(bytes) {
   const end = bytes.indexOf(0);
@@ -6106,8 +8311,8 @@ var CHOOSEFONT32_BYTES = 60;
 var LOGFONTA_BYTES = 60;
 function decodeAvsText(payload) {
   let offset = 0;
-  const read = (fallback) => {
-    const value = i328(payload, offset, fallback);
+  const read = (fallback2) => {
+    const value = i328(payload, offset, fallback2);
     offset += 4;
     return value;
   };
@@ -6419,8 +8624,8 @@ function nextRandom4(state) {
   state.randomState = value >>> 0;
   return state.randomState;
 }
-function i328(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+function i328(payload, offset, fallback2) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback2;
 }
 function nulText9(bytes) {
   const end = bytes.indexOf(0);
@@ -6569,9 +8774,9 @@ function renderTexer2(context2, config, bitmap, state) {
     vm.set("i", progress);
     progress += step;
     vm.set("skip", 0);
-    const sample2 = Math.trunc(index * 575 / count);
-    const left = signedByte2(context2.audio.waveform[0][sample2]);
-    const right = signedByte2(context2.audio.waveform[1][sample2]);
+    const sample = Math.trunc(index * 575 / count);
+    const left = signedByte2(context2.audio.waveform[0][sample]);
+    const right = signedByte2(context2.audio.waveform[1][sample]);
     vm.set("v", (left + right) / 256);
     execute6(state.programs[3], vm);
     if (vm.get("skip") !== 0) continue;
@@ -6615,6 +8820,10 @@ function drawTexer2Particle(context2, config, bitmap, x, y, sizeX, sizeY, color,
   else drawUnscaledParticle(context2, bitmap, x, y, color, config.colorize, flipX, flipY);
 }
 function drawUnscaledParticle(context2, bitmap, x, y, color, colorize, flipX, flipY) {
+  const pixels = context2.input.pixels;
+  const width = context2.input.width;
+  const blendMode = context2.line.blendMode;
+  const adjustableAlpha = context2.line.adjustableAlpha;
   const screenMaxX = context2.input.width - 1;
   const screenMaxY = context2.input.height - 1;
   const imageMaxX = bitmap.width - 1;
@@ -6633,20 +8842,20 @@ function drawUnscaledParticle(context2, bitmap, x, y, color, colorize, flipX, fl
   if (right <= left || bottom <= top) return;
   for (let drawY = top; drawY <= bottom; drawY++, textureY++) {
     let tx = textureX;
+    let destination = drawY * width + left;
     for (let drawX = left; drawX <= right; drawX++, tx++) {
       let source = sampleBitmap(bitmap, tx, textureY, flipX, flipY);
       if (colorize) source = filterPixel(source, color);
-      const destination = drawY * context2.input.width + drawX;
-      context2.input.pixels[destination] = blendTexerPixel(
-        source,
-        context2.input.pixels[destination],
-        context2.line.blendMode,
-        context2.line.adjustableAlpha
-      );
+      pixels[destination] = blendMode === 0 ? source & 16777215 : blendTexerPixel(source, pixels[destination], blendMode, adjustableAlpha);
+      destination++;
     }
   }
 }
 function drawScaledParticle(context2, bitmap, x, y, sizeX, sizeY, color, flipX, flipY) {
+  const pixels = context2.input.pixels;
+  const width = context2.input.width;
+  const blendMode = context2.line.blendMode;
+  const adjustableAlpha = context2.line.adjustableAlpha;
   const screenMaxX = context2.input.width - 1;
   const screenMaxY = context2.input.height - 1;
   const imageMaxX = bitmap.width - 1;
@@ -6687,15 +8896,11 @@ function drawScaledParticle(context2, bitmap, x, y, sizeX, sizeY, color, flipX, 
   }
   if (right <= left || bottom <= top) return;
   for (let drawY = top, fy = cy; drawY <= bottom; drawY++, fy += stepY) {
+    let destination = drawY * width + left;
     for (let drawX = left, fx = cx; drawX <= right; drawX++, fx += stepX) {
       const source = filterPixel(sampleBilinearFixed(bitmap, fx, fy, flipX, flipY), color);
-      const destination = drawY * context2.input.width + drawX;
-      context2.input.pixels[destination] = blendTexerPixel(
-        source,
-        context2.input.pixels[destination],
-        context2.line.blendMode,
-        context2.line.adjustableAlpha
-      );
+      pixels[destination] = blendMode === 0 ? source & 16777215 : blendTexerPixel(source, pixels[destination], blendMode, adjustableAlpha);
+      destination++;
     }
   }
 }
@@ -6704,10 +8909,16 @@ function sampleBilinearFixed(bitmap, fx, fy, flipX, flipY) {
   const y = clamp12(fy >> 16, 0, Math.max(0, bitmap.height - 2));
   const dx = fx >>> 8 & 255;
   const dy = fy >>> 8 & 255;
-  const a = sampleBitmap(bitmap, x, y, flipX, flipY);
-  const b = sampleBitmap(bitmap, x + 1, y, flipX, flipY);
-  const c = sampleBitmap(bitmap, x, y + 1, flipX, flipY);
-  const d = sampleBitmap(bitmap, x + 1, y + 1, flipX, flipY);
+  const x1 = Math.min(x + 1, bitmap.width - 1);
+  const y1 = Math.min(y + 1, bitmap.height - 1);
+  const sx0 = flipX ? bitmap.width - x - 1 : x;
+  const sx1 = flipX ? bitmap.width - x1 - 1 : x1;
+  const row0 = (flipY ? bitmap.height - y - 1 : y) * bitmap.width;
+  const row1 = (flipY ? bitmap.height - y1 - 1 : y1) * bitmap.width;
+  const a = bitmap.pixels[row0 + sx0];
+  const b = bitmap.pixels[row0 + sx1];
+  const c = bitmap.pixels[row1 + sx0];
+  const d = bitmap.pixels[row1 + sx1];
   const inverseX = 255 - dx;
   const inverseY = 255 - dy;
   return interpolateByte(a, b, c, d, dx, dy, inverseX, inverseY) | interpolateByte(a >>> 8, b >>> 8, c >>> 8, d >>> 8, dx, dy, inverseX, inverseY) << 8 | interpolateByte(a >>> 16, b >>> 16, c >>> 16, d >>> 16, dx, dy, inverseX, inverseY) << 16;
@@ -6792,11 +9003,11 @@ function nulText10(bytes) {
   const end = bytes.indexOf(0);
   return TEXT7.decode(end < 0 ? bytes : bytes.subarray(0, end));
 }
-function readI325(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+function readI325(payload, offset, fallback2) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback2;
 }
-function readU322(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(offset, true) : fallback;
+function readU322(payload, offset, fallback2) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(offset, true) : fallback2;
 }
 function compileOrNull5(source) {
   if (!source.trim()) return null;
@@ -6862,6 +9073,723 @@ function createAvsCompatibilityRegistry(classicOptions = {}, texerOptions = {}) 
   return registry;
 }
 
+// src/avs/effects/superscope-gpu.ts
+var AVS_ENHANCED_SUPERSCOPE_GPU_CAPABILITY = {
+  id: "enhanced-superscope-f32-generator",
+  backend: "webgpu",
+  lane: "120",
+  byteExact: false,
+  reason: "Parallel f32 point evaluation changes classic AVS f64 rounding and cannot preserve point-to-point mutation."
+};
+var INPUTS = /* @__PURE__ */ new Set(["i", "v"]);
+var OUTPUTS = ["x", "y", "red", "green", "blue", "skip", "drawmode", "linesize"];
+var WORKGROUP_SIZE2 = 256;
+var OUTPUT_STRIDE = 16;
+function compileEnhancedSuperScopeGpu(source) {
+  let ast;
+  try {
+    ast = parseAvsEel(source);
+  } catch (error) {
+    return { eligible: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+  const analysis = analysePointProgram(ast.body);
+  if (!analysis.ok) return { eligible: false, reason: analysis.reason };
+  try {
+    const builder = new WgslBuilder(analysis.uniformNames);
+    const body = builder.program(ast.body);
+    return {
+      eligible: true,
+      program: {
+        source,
+        wgsl: shaderSource2(body, analysis.uniformNames, builder.localNames),
+        uniformNames: analysis.uniformNames,
+        workgroupSize: WORKGROUP_SIZE2,
+        outputStrideBytes: OUTPUT_STRIDE,
+        usesHostAudio: analysis.usesHostAudio
+      }
+    };
+  } catch (error) {
+    return { eligible: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+var EnhancedSuperScopeGpuGenerator = class {
+  capability = AVS_ENHANCED_SUPERSCOPE_GPU_CAPABILITY;
+  program;
+  maxPoints;
+  device;
+  pipeline;
+  audioBuffer;
+  hostAudioBuffer;
+  variableBuffer;
+  paramsBuffer;
+  outputBuffer;
+  bindGroup;
+  packedAudio = new Uint32Array(576);
+  packedHostAudio = new Uint32Array(576 * 4);
+  packedVariables;
+  packedParams = new Uint32Array(8);
+  destroyed = false;
+  constructor(device, program, maxPoints = 128 * 1024) {
+    if (!Number.isInteger(maxPoints) || maxPoints <= 0) throw new RangeError(`Invalid SuperScope point capacity ${maxPoints}`);
+    const outputBytes = maxPoints * OUTPUT_STRIDE;
+    if (outputBytes > Number(device.limits.maxStorageBufferBindingSize)) {
+      throw new RangeError(`SuperScope point buffer needs ${outputBytes} bytes; adapter limit is ${device.limits.maxStorageBufferBindingSize}`);
+    }
+    this.device = device;
+    this.program = program;
+    this.maxPoints = maxPoints;
+    this.packedVariables = new Float32Array(Math.max(4, program.uniformNames.length));
+    const module = device.createShaderModule({ label: "AVS enhanced f32 SuperScope generator", code: program.wgsl });
+    this.pipeline = device.createComputePipeline({
+      label: "AVS enhanced f32 SuperScope generator",
+      layout: "auto",
+      compute: { module, entryPoint: "superscope_points" }
+    });
+    this.audioBuffer = storageBuffer(device, "AVS SuperScope audio", this.packedAudio.byteLength, GPUBufferUsage.COPY_DST);
+    this.hostAudioBuffer = storageBuffer(device, "AVS SuperScope host audio", this.packedHostAudio.byteLength, GPUBufferUsage.COPY_DST);
+    this.variableBuffer = storageBuffer(device, "AVS SuperScope variables", this.packedVariables.byteLength, GPUBufferUsage.COPY_DST);
+    this.paramsBuffer = device.createBuffer({
+      label: "AVS SuperScope generator params",
+      size: this.packedParams.byteLength,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    this.outputBuffer = storageBuffer(device, "AVS SuperScope generated points", outputBytes, GPUBufferUsage.COPY_SRC);
+    this.bindGroup = device.createBindGroup({
+      label: "AVS enhanced SuperScope generator inputs",
+      layout: this.pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.audioBuffer } },
+        { binding: 1, resource: { buffer: this.hostAudioBuffer } },
+        { binding: 2, resource: { buffer: this.variableBuffer } },
+        { binding: 3, resource: { buffer: this.paramsBuffer } },
+        { binding: 4, resource: { buffer: this.outputBuffer } }
+      ]
+    });
+  }
+  /** Uploads only 2.3 KiB of audio plus scalar state; generated points stay resident. */
+  writeFrame(frame) {
+    this.assertActive();
+    if (frame.audio.length < 576) throw new RangeError(`SuperScope audio needs 576 samples, got ${frame.audio.length}`);
+    const count = clampInt(frame.count, 0, this.maxPoints);
+    for (let index = 0; index < 576; index++) this.packedAudio[index] = frame.audio[index];
+    for (let index = 0; index < this.program.uniformNames.length; index++) {
+      const value = frame.variables[this.program.uniformNames[index]] ?? 0;
+      this.packedVariables[index] = Number.isFinite(value) ? value : 0;
+    }
+    this.packedParams.set([count, frame.width >>> 0, frame.height >>> 0, frame.xor, this.program.uniformNames.length]);
+    this.device.queue.writeBuffer(this.audioBuffer, 0, this.packedAudio);
+    if (this.program.usesHostAudio) {
+      if (!frame.hostAudio) throw new Error("SuperScope GPU point script uses getosc/getspec but no hostAudio was supplied");
+      this.packHostAudio(frame.hostAudio);
+      this.device.queue.writeBuffer(this.hostAudioBuffer, 0, this.packedHostAudio);
+    }
+    this.device.queue.writeBuffer(
+      this.variableBuffer,
+      0,
+      this.packedVariables.buffer,
+      this.packedVariables.byteOffset,
+      this.packedVariables.byteLength
+    );
+    this.device.queue.writeBuffer(this.paramsBuffer, 0, this.packedParams);
+    return count;
+  }
+  encode(encoder, count) {
+    this.assertActive();
+    const bounded = clampInt(count, 0, this.maxPoints);
+    if (bounded !== 0) {
+      const pass = encoder.beginComputePass({ label: "AVS enhanced f32 SuperScope points" });
+      pass.setPipeline(this.pipeline);
+      pass.setBindGroup(0, this.bindGroup);
+      pass.dispatchWorkgroups(Math.ceil(bounded / WORKGROUP_SIZE2));
+      pass.end();
+    }
+    return { output: this.outputBuffer, count: bounded, outputStrideBytes: OUTPUT_STRIDE };
+  }
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.audioBuffer.destroy();
+    this.hostAudioBuffer.destroy();
+    this.variableBuffer.destroy();
+    this.paramsBuffer.destroy();
+    this.outputBuffer.destroy();
+  }
+  assertActive() {
+    if (this.destroyed) throw new Error("AVS enhanced SuperScope generator is destroyed");
+  }
+  packHostAudio(audio) {
+    const channels6 = [audio.waveform[0], audio.waveform[1], audio.spectrum[0], audio.spectrum[1]];
+    for (let channel = 0; channel < channels6.length; channel++) {
+      const source = channels6[channel];
+      for (let index = 0; index < 576; index++) this.packedHostAudio[channel * 576 + index] = source[index];
+    }
+  }
+};
+var ENHANCED_RASTER_WGSL = (
+  /* wgsl */
+  `
+struct ScopePoint { x: i32, y: i32, color: u32, flags: u32 };
+struct RasterParams { count: u32, width: u32, height: u32, _pad: u32 };
+@group(0) @binding(0) var<storage, read> points: array<ScopePoint>;
+@group(0) @binding(1) var<storage, read_write> pixels: array<atomic<u32>>;
+@group(0) @binding(2) var<uniform> params: RasterParams;
+
+@compute @workgroup_size(256)
+fn raster_points(@builtin(global_invocation_id) id: vec3u) {
+  let index = id.x;
+  if (index >= params.count) { return; }
+  let point = points[index];
+  if ((point.flags & 1u) != 0u || point.x < 0 || point.y < 0 || point.x >= i32(params.width) || point.y >= i32(params.height)) {
+    return;
+  }
+  atomicStore(&pixels[u32(point.y) * params.width + u32(point.x)], point.color);
+}`
+);
+var EnhancedSuperScopeGpuTerminalPass = class {
+  constructor(device, config, program, global, seed, maxPoints = 128 * 1024) {
+    this.device = device;
+    this.config = config;
+    this.generator = new EnhancedSuperScopeGpuGenerator(device, program, maxPoints);
+    this.pointUniforms = program.uniformNames;
+    this.vm = new AvsEelVm({ global, seed });
+    this.host = { audio: emptyAudioFrame() };
+    this.vm.setHost({
+      getosc: (band, width, channel) => avsAudioSample(this.host.audio, "osc", band, width, channel),
+      getspec: (band, width, channel) => avsAudioSample(this.host.audio, "spec", band, width, channel)
+    });
+    this.vm.set("n", 100);
+    this.init = bindOrNull(config.init, this.vm);
+    this.frame = bindOrNull(config.frame, this.vm);
+    this.beat = bindOrNull(config.beat, this.vm);
+    const module = device.createShaderModule({ label: "AVS enhanced SuperScope point raster", code: ENHANCED_RASTER_WGSL });
+    this.rasterPipeline = device.createComputePipeline({
+      label: "AVS enhanced SuperScope point raster",
+      layout: "auto",
+      compute: { module, entryPoint: "raster_points" }
+    });
+    this.rasterParams = device.createBuffer({
+      label: "AVS enhanced SuperScope raster params",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+  }
+  capability = AVS_ENHANCED_SUPERSCOPE_GPU_CAPABILITY;
+  generator;
+  vm;
+  pointUniforms;
+  init;
+  frame;
+  beat;
+  host;
+  rasterPipeline;
+  rasterParams;
+  rasterWords = new Uint32Array(4);
+  rasterGroups = /* @__PURE__ */ new WeakMap();
+  centeredAudio = new Uint8Array(576);
+  initialized = false;
+  colorPosition = 0;
+  count = 0;
+  destroyed = false;
+  /** Execute host/frame phases after the exact CPU prefix and stage GPU inputs. */
+  updateFrame(audio, width, height) {
+    this.assertActive();
+    this.host.audio = audio;
+    this.colorPosition++;
+    if (this.colorPosition >= this.config.colors.length * 64) this.colorPosition = 0;
+    const color = interpolatedScopeColor(this.config.colors, this.colorPosition);
+    this.vm.set("h", height);
+    this.vm.set("w", width);
+    this.vm.set("b", audio.beat ? 1 : 0);
+    this.vm.set("blue", (color & 255) / 255);
+    this.vm.set("green", (color >>> 8 & 255) / 255);
+    this.vm.set("red", (color >>> 16 & 255) / 255);
+    this.vm.set("skip", 0);
+    this.vm.set("linesize", 1);
+    this.vm.set("drawmode", 0);
+    if (!this.initialized) {
+      this.init?.();
+      this.initialized = true;
+    }
+    this.frame?.();
+    if (audio.beat) this.beat?.();
+    const requested = Math.trunc(this.vm.get("n"));
+    const selected = scopeGpuChannel(audio, this.config.channel, this.centeredAudio);
+    const variables = {};
+    for (const name of this.pointUniforms) variables[name] = this.vm.get(name);
+    this.count = this.generator.writeFrame({
+      count: requested,
+      width,
+      height,
+      xor: (this.config.channel & 4) !== 0 ? 0 : 128,
+      audio: selected,
+      hostAudio: audio,
+      variables
+    });
+    this.rasterWords.set([this.count, width, height, 0]);
+    this.device.queue.writeBuffer(this.rasterParams, 0, this.rasterWords);
+  }
+  encode(context2) {
+    this.assertActive();
+    context2.encoder.copyBufferToBuffer(context2.source, 0, context2.target, 0, context2.width * context2.height * 4);
+    const generated = this.generator.encode(context2.encoder, this.count);
+    if (generated.count === 0) return;
+    let group = this.rasterGroups.get(context2.target);
+    if (!group) {
+      group = context2.device.createBindGroup({
+        label: "AVS enhanced SuperScope raster target",
+        layout: this.rasterPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: generated.output } },
+          { binding: 1, resource: { buffer: context2.target } },
+          { binding: 2, resource: { buffer: this.rasterParams } }
+        ]
+      });
+      this.rasterGroups.set(context2.target, group);
+    }
+    const pass = context2.encoder.beginComputePass({ label: "AVS enhanced SuperScope point raster" });
+    pass.setPipeline(this.rasterPipeline);
+    pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(Math.ceil(generated.count / 256));
+    pass.end();
+  }
+  destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.generator.destroy();
+    this.rasterParams.destroy();
+  }
+  assertActive() {
+    if (this.destroyed) throw new Error("AVS enhanced SuperScope terminal pass is destroyed");
+  }
+};
+function analysePointProgram(root) {
+  const values = root.kind === "sequence" ? root.values : [root];
+  const written = /* @__PURE__ */ new Set();
+  collectWrites2(root, written);
+  const initialized = new Set(INPUTS);
+  const reads = /* @__PURE__ */ new Set();
+  for (const node of values) {
+    const assignment2 = directAssignment2(node);
+    if (assignment2) {
+      const target = normalize2(assignment2.target);
+      const failure2 = validatePure2(assignment2.value, written, initialized, reads);
+      if (failure2) return { ok: false, reason: failure2 };
+      if (assignment2.operator !== "=" && !initialized.has(target)) {
+        return { ok: false, reason: `${target}${assignment2.operator} carries point-to-point state` };
+      }
+      initialized.add(target);
+      continue;
+    }
+    const failure = validatePure2(node, written, initialized, reads);
+    if (failure) return { ok: false, reason: failure };
+  }
+  for (const name of OUTPUTS) {
+    if (written.has(name) && !initialized.has(name)) return { ok: false, reason: `${name} is not initialized on every point` };
+    if (!initialized.has(name)) reads.add(name);
+  }
+  const uniformNames = [...reads].filter((name) => !INPUTS.has(name)).sort();
+  return { ok: true, uniformNames, usesHostAudio: containsHostAudio(root) };
+}
+function collectWrites2(node, target) {
+  if (node.kind === "assign" && node.target.kind === "variable") target.add(normalize2(node.target.name));
+  if (node.kind === "call" && node.name === "assign" && node.args[0]?.kind === "variable") target.add(normalize2(node.args[0].name));
+  for (const child of children2(node)) collectWrites2(child, target);
+}
+function validatePure2(node, written, initialized, reads) {
+  if (node.kind === "variable") {
+    const name = normalize2(node.name);
+    if (written.has(name) && !initialized.has(name)) return `${name} is read before per-point initialization`;
+    reads.add(name);
+    return null;
+  }
+  if (node.kind === "assign" || node.kind === "call" && node.name === "assign") {
+    return "nested or conditional mutation is order-sensitive";
+  }
+  if (node.kind === "call" && ["loop", "rand", "megabuf", "gmegabuf", "gettime", "getkbmouse"].includes(node.name)) {
+    return `${node.name} is not point-independent`;
+  }
+  for (const child of children2(node)) {
+    const failure = validatePure2(child, written, initialized, reads);
+    if (failure) return failure;
+  }
+  return null;
+}
+function directAssignment2(node) {
+  if (node.kind === "assign" && node.target.kind === "variable") {
+    return { target: node.target.name, operator: node.operator, value: node.value };
+  }
+  if (node.kind === "call" && node.name === "assign" && node.args[0]?.kind === "variable" && node.args[1]) {
+    return { target: node.args[0].name, operator: "=", value: node.args[1] };
+  }
+  return null;
+}
+var WgslBuilder = class {
+  localNames = /* @__PURE__ */ new Set();
+  temporary = 0;
+  uniformIndex = /* @__PURE__ */ new Map();
+  constructor(uniformNames) {
+    uniformNames.forEach((name, index) => this.uniformIndex.set(name, index));
+  }
+  program(root) {
+    const values = root.kind === "sequence" ? root.values : [root];
+    const lines = [];
+    for (const node of values) {
+      const assignment2 = directAssignment2(node);
+      if (!assignment2) {
+        lines.push(`_result = finite(${this.expression(node)});`);
+        continue;
+      }
+      const target = this.name(assignment2.target);
+      this.localNames.add(target);
+      const right = this.expression(assignment2.value);
+      const next = assignmentExpression2(assignment2.operator, target, right);
+      lines.push(`${target} = ${next};`, `_result = ${target};`);
+    }
+    return lines.join("\n  ");
+  }
+  expression(node) {
+    switch (node.kind) {
+      case "number":
+        return numberLiteral3(node.value);
+      case "variable":
+        return this.variable(node.name);
+      case "unary": {
+        const value = this.expression(node.value);
+        if (node.operator === "+") return `finite(${value})`;
+        if (node.operator === "-") return `finite(-(${value}))`;
+        if (node.operator === "!") return `select(1.0,0.0,truth(${value}))`;
+        if (node.operator === "~") return `f32(~i32(${value}))`;
+        throw new Error(`Unsupported unary ${node.operator}`);
+      }
+      case "binary":
+        return this.binary(node.operator, node.left, node.right);
+      case "conditional":
+        return `select(${this.expression(node.no)},${this.expression(node.yes)},truth(${this.expression(node.condition)}))`;
+      case "call":
+        return this.call(node.name, node.args);
+      case "sequence": {
+        if (node.values.length !== 1) throw new Error("Nested sequence is not GPU-pure");
+        return this.expression(node.values[0]);
+      }
+      case "assign":
+        throw new Error("Nested assignment is not GPU-pure");
+    }
+  }
+  binary(operator, leftNode, rightNode) {
+    const left = this.expression(leftNode);
+    const right = this.expression(rightNode);
+    switch (operator) {
+      case "+":
+        return `finite((${left})+(${right}))`;
+      case "-":
+        return `finite((${left})-(${right}))`;
+      case "*":
+        return `finite((${left})*(${right}))`;
+      case "/":
+        return `divide(${left},${right})`;
+      case "%":
+        return `modulo(${left},${right})`;
+      case "**":
+        return `finite(pow(${left},${right}))`;
+      case "|":
+        return `f32(i32(${left})|i32(${right}))`;
+      case "&":
+        return `f32(i32(${left})&i32(${right}))`;
+      case "^":
+        return `f32(i32(${left})^i32(${right}))`;
+      case "<<":
+        return `f32(i32(${left})<<(u32(i32(${right}))&31u))`;
+      case ">>":
+        return `f32(i32(${left})>>(u32(i32(${right}))&31u))`;
+      case "&&":
+        return `select(0.0,select(0.0,1.0,truth(${right})),truth(${left}))`;
+      case "||":
+        return `select(select(0.0,1.0,truth(${right})),1.0,truth(${left}))`;
+      case "==":
+        return `select(0.0,1.0,close(${left},${right}))`;
+      case "!=":
+        return `select(1.0,0.0,close(${left},${right}))`;
+      case "===":
+        return `select(0.0,1.0,(${left})==(${right}))`;
+      case "!==":
+        return `select(0.0,1.0,(${left})!=(${right}))`;
+      case "<":
+      case "<=":
+      case ">":
+      case ">=":
+        return `select(0.0,1.0,(${left})${operator}(${right}))`;
+      default:
+        throw new Error(`Unsupported binary ${operator}`);
+    }
+  }
+  call(name, nodes) {
+    if (name === "if") return `select(${this.expression(nodes[2])},${this.expression(nodes[1])},truth(${this.expression(nodes[0])}))`;
+    const args = nodes.map((node) => this.expression(node));
+    const one = (fn) => `finite(${fn}(${args[0]}))`;
+    const two = (fn) => `finite(${fn}(${args[0]},${args[1]}))`;
+    switch (name) {
+      case "sin":
+      case "cos":
+      case "tan":
+      case "asin":
+      case "acos":
+      case "atan":
+      case "sqrt":
+      case "exp":
+      case "log":
+      case "log2":
+      case "abs":
+      case "floor":
+      case "ceil":
+        return one(name);
+      case "atan2":
+        return two("atan2");
+      case "sqr":
+        return `finite((${args[0]})*(${args[0]}))`;
+      case "invsqrt":
+        return `finite(inverseSqrt(${args[0]}))`;
+      case "pow":
+      case "min":
+      case "max":
+        return two(name);
+      case "log10":
+        return `finite(log2(${args[0]})/log2(10.0))`;
+      case "int":
+        return `finite(trunc(${args[0]}))`;
+      case "sign":
+        return `select(select(0.0,1.0,(${args[0]})>0.0),-1.0,(${args[0]})<0.0)`;
+      case "equal":
+        return `select(0.0,1.0,close(${args[0]},${args[1]}))`;
+      case "above":
+        return `select(0.0,1.0,(${args[0]})>(${args[1]}))`;
+      case "below":
+        return `select(0.0,1.0,(${args[0]})<(${args[1]}))`;
+      case "band":
+        return `select(0.0,1.0,truth(${args[0]})&&truth(${args[1]}))`;
+      case "bor":
+        return `select(0.0,1.0,truth(${args[0]})||truth(${args[1]}))`;
+      case "bnot":
+        return `select(1.0,0.0,truth(${args[0]}))`;
+      case "getosc":
+        return `avs_audio(0u,${args[0]},${args[1]},${args[2]})`;
+      case "getspec":
+        return `avs_audio(1u,${args[0]},${args[1]},${args[2]})`;
+      default:
+        throw new Error(`Function ${name} is not supported by enhanced GPU SuperScope`);
+    }
+  }
+  variable(rawName) {
+    const raw = normalize2(rawName);
+    if (raw === "$pi") return "3.14159265358979323846";
+    if (raw === "$e") return "2.71828182845904523536";
+    if (raw === "$phi") return "1.61803398874989484820";
+    const name = this.name(raw);
+    if (INPUTS.has(raw) || this.localNames.has(name)) return name;
+    const index = this.uniformIndex.get(raw);
+    if (index === void 0) throw new Error(`Missing GPU input ${raw}`);
+    return `initial[${index}u]`;
+  }
+  name(rawName) {
+    const normalized = normalize2(rawName).replace(/^\$/, "");
+    return `v_${normalized.replace(/[^a-z0-9_]/g, "_")}`;
+  }
+};
+function shaderSource2(body, uniformNames, localNames) {
+  const safeLocals = new Set(localNames);
+  safeLocals.add("v_x");
+  safeLocals.add("v_y");
+  safeLocals.add("v_red");
+  safeLocals.add("v_green");
+  safeLocals.add("v_blue");
+  safeLocals.add("v_skip");
+  safeLocals.add("v_drawmode");
+  safeLocals.add("v_linesize");
+  const declarations = [...safeLocals].sort().map((name) => {
+    const raw = name.slice(2);
+    const index = uniformNames.indexOf(raw);
+    return `var ${name}: f32 = ${index < 0 ? "0.0" : `initial[${index}u]`};`;
+  }).join("\n  ");
+  return (
+    /* wgsl */
+    `
+struct Params { count: u32, width: u32, height: u32, xor_mask: u32, variable_count: u32, _p0: u32, _p1: u32, _p2: u32 };
+struct ScopePoint { x: i32, y: i32, color: u32, flags: u32 };
+@group(0) @binding(0) var<storage, read> audio: array<u32>;
+@group(0) @binding(1) var<storage, read> host_audio: array<u32>;
+@group(0) @binding(2) var<storage, read> initial: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+@group(0) @binding(4) var<storage, read_write> points: array<ScopePoint>;
+
+fn finite(value: f32) -> f32 { return select(0.0, value, value == value && abs(value) <= 3.402823e38); }
+fn truth(value: f32) -> bool { return abs(value) >= 0.00001; }
+fn close(a: f32, b: f32) -> bool { return abs(a - b) < 0.00001; }
+fn divide(a: f32, b: f32) -> f32 { return select(finite(a / b), 0.0, abs(b) < 1.1920929e-7); }
+fn modulo(a: f32, b: f32) -> f32 { return select(finite(a % b), 0.0, abs(b) < 1.1920929e-7); }
+fn byte(value: f32) -> u32 { return u32(clamp(value, 0.0, 1.0) * 255.0); }
+fn avs_audio(kind: u32, band: f32, width: f32, channel_value: f32) -> f32 {
+  let channel = i32(floor(channel_value + 0.5));
+  if (channel < 0 || channel > 2) { return 0.0; }
+  var centre = i32(band * 576.0);
+  var span = max(1, i32(width * 576.0));
+  centre -= span / 2;
+  if (centre < 0) { span += centre; centre = 0; }
+  centre = min(centre, 575);
+  span = min(span, 576 - centre);
+  if (span <= 0) { return 0.0; }
+  var sum = 0.0;
+  for (var sample = centre; sample < centre + span; sample++) {
+    let base = kind * 1152u;
+    let left_byte = host_audio[base + u32(sample)];
+    let right_byte = host_audio[base + 576u + u32(sample)];
+    var left = f32(left_byte) / 255.0;
+    var right = f32(right_byte) / 255.0;
+    if (kind == 0u) {
+      left = f32(select(i32(left_byte), i32(left_byte) - 256, left_byte >= 128u)) / 127.5;
+      right = f32(select(i32(right_byte), i32(right_byte) - 256, right_byte >= 128u)) / 127.5;
+    }
+    sum += select(select(left, right, channel == 2), (left + right) * 0.5, channel == 0);
+  }
+  return sum / f32(span);
+}
+
+@compute @workgroup_size(${WORKGROUP_SIZE2})
+fn superscope_points(@builtin(global_invocation_id) id: vec3u) {
+  let index = id.x;
+  if (index >= params.count) { return; }
+  let audio_position = f32(index) * 576.0 / f32(params.count);
+  let source_index = min(575u, u32(audio_position));
+  let fraction = audio_position - f32(source_index);
+  let a = f32(audio[source_index] ^ params.xor_mask);
+  let b = f32(audio[min(575u, source_index + 1u)] ^ params.xor_mask);
+  var v_v = (a * (1.0 - fraction) + b * fraction) / 128.0 - 1.0;
+  var v_i = select(f32(index) / f32(params.count - 1u), 0.0, params.count == 1u);
+  ${declarations}
+  var _result = 0.0;
+  ${body}
+  let color = byte(v_blue) | (byte(v_green) << 8u) | (byte(v_red) << 16u);
+  let skipped = select(0u, 1u, v_skip >= 0.00001);
+  let line = select(0u, 2u, v_drawmode >= 0.00001);
+  let line_size = u32(clamp(trunc(v_linesize + 0.5), 1.0, 255.0));
+  points[index] = ScopePoint(
+    i32(trunc((v_x + 1.0) * f32(params.width) * 0.5)),
+    i32(trunc((v_y + 1.0) * f32(params.height) * 0.5)),
+    color,
+    skipped | line | (line_size << 8u),
+  );
+}`
+  );
+}
+function assignmentExpression2(operator, left, right) {
+  switch (operator) {
+    case "=":
+      return `finite(${right})`;
+    case "+=":
+      return `finite(${left}+(${right}))`;
+    case "-=":
+      return `finite(${left}-(${right}))`;
+    case "*=":
+      return `finite(${left}*(${right}))`;
+    case "/=":
+      return `divide(${left},${right})`;
+    case "%=":
+      return `modulo(${left},${right})`;
+    case "|=":
+      return `f32(i32(${left})|i32(${right}))`;
+    case "&=":
+      return `f32(i32(${left})&i32(${right}))`;
+    case "^=":
+      return `f32(i32(${left})^i32(${right}))`;
+    case "**=":
+      return `finite(pow(${left},${right}))`;
+    default:
+      throw new Error(`Unsupported assignment ${operator}`);
+  }
+}
+function containsHostAudio(node) {
+  if (node.kind === "call" && (node.name === "getosc" || node.name === "getspec")) return true;
+  return children2(node).some(containsHostAudio);
+}
+function children2(node) {
+  switch (node.kind) {
+    case "number":
+    case "variable":
+      return [];
+    case "unary":
+      return [node.value];
+    case "binary":
+      return [node.left, node.right];
+    case "conditional":
+      return [node.condition, node.yes, node.no];
+    case "assign":
+      return [node.target, node.value];
+    case "call":
+      return node.args;
+    case "sequence":
+      return node.values;
+  }
+}
+function storageBuffer(device, label, size, extra) {
+  return device.createBuffer({ label, size: Math.max(16, align(size, 16)), usage: GPUBufferUsage.STORAGE | extra });
+}
+function normalize2(name) {
+  return name.toLowerCase().slice(0, 8);
+}
+function numberLiteral3(value) {
+  if (!Number.isFinite(value)) return "0.0";
+  return Number.isInteger(value) ? `${value}.0` : `${value}`;
+}
+function clampInt(value, minimum, maximum) {
+  const integer2 = Number.isFinite(value) ? Math.trunc(value) : 0;
+  return integer2 < minimum ? minimum : integer2 > maximum ? maximum : integer2;
+}
+function align(value, alignment) {
+  return Math.ceil(value / alignment) * alignment;
+}
+function bindOrNull(source, vm) {
+  if (!source.trim()) return null;
+  let program;
+  try {
+    program = compileAvsEel(source);
+  } catch {
+    return null;
+  }
+  return program.bind(vm);
+}
+function interpolatedScopeColor(colors, position) {
+  const index = Math.trunc(position / 64);
+  const fraction = position & 63;
+  const first = colors[index];
+  const second = colors[(index + 1) % colors.length];
+  const channel = (shift) => Math.trunc(
+    ((first >>> shift & 255) * (63 - fraction) + (second >>> shift & 255) * fraction) / 64
+  );
+  return channel(0) | channel(8) << 8 | channel(16) << 16;
+}
+function scopeGpuChannel(audio, selection, centered) {
+  const source = (selection & 4) !== 0 ? audio.spectrum : audio.waveform;
+  const channel = selection & 3;
+  if (channel < 2) return source[channel];
+  for (let index = 0; index < centered.length; index++) {
+    centered[index] = Math.trunc(signedByte3(source[0][index]) / 2) + Math.trunc(signedByte3(source[1][index]) / 2) & 255;
+  }
+  return centered;
+}
+function signedByte3(value) {
+  return value < 128 ? value : value - 256;
+}
+function emptyAudioFrame() {
+  return {
+    waveform: [new Uint8Array(576), new Uint8Array(576)],
+    spectrum: [new Uint8Array(576), new Uint8Array(576)],
+    beat: false,
+    beatLevel: 0
+  };
+}
+
+// src/avs/gpu-ordered-draw.ts
+var DEFAULT_BUDGET = 64 * 1024 * 1024;
+var DEFAULT_MAX_RECORDS = 4 * 128 * 1024;
+
 // src/avs/runtime.ts
 var AvsCompatibilityRuntime = class {
   preset;
@@ -6878,6 +9806,15 @@ var AvsCompatibilityRuntime = class {
   }
   get framebuffer() {
     return this.surface;
+  }
+  get controls() {
+    return this.executor.controls;
+  }
+  setControls(controls) {
+    this.executor.setControls(controls);
+  }
+  setComponentControl(path, control) {
+    this.executor.setComponentControl(path, control);
   }
   resize(width, height) {
     if (this.surface.width === width && this.surface.height === height) return;
@@ -6923,6 +9860,68 @@ function emptyAudio() {
     beat: false,
     beatLevel: 0
   };
+}
+
+// src/avs/superscope-gpu-plan.ts
+function planTerminalEnhancedSuperScope(preset) {
+  if (!preset.clearEveryFrame) return fallback(preset, "root feedback requires ordered CPU SuperScope");
+  const component = preset.components.at(-1);
+  if (!component || component.list || component.apeId || component.effectId !== 36) {
+    return fallback(preset, "no root-level terminal SuperScope");
+  }
+  if (preset.components.slice(0, -1).some((value) => !value.list && !value.apeId && value.effectId === 40)) {
+    return fallback(preset, "root Set Render Mode makes SuperScope blending stateful");
+  }
+  const config = decodeAvsSuperScope(component.payload);
+  if (config.lines) return fallback(preset, "line-mode SuperScope requires ordered rasterization");
+  if (config.colors.length === 0) return fallback(preset, "SuperScope has no drawable colors");
+  if ([config.init, config.frame, config.beat].some((source) => /\b(?:drawmode|linesize)\b/i.test(source))) {
+    return fallback(preset, "frame code can switch point raster mode");
+  }
+  const compiled = compileEnhancedSuperScopeGpu(config.point);
+  if (!compiled.eligible) return fallback(preset, `point script requires CPU: ${compiled.reason}`);
+  if (!compiled.program.uniformNames.includes("drawmode")) {
+    return fallback(preset, "point code can switch raster mode");
+  }
+  return {
+    cpuPreset: { ...preset, components: preset.components.slice(0, -1) },
+    component,
+    config,
+    program: compiled.program,
+    reason: "1 terminal point-independent SuperScope moved to enhanced f32 WebGPU"
+  };
+}
+function fallback(preset, reason) {
+  return { cpuPreset: preset, component: null, config: null, program: null, reason };
+}
+
+// src/avs/convolution-gpu-plan.ts
+function planTerminalExactGpuConvolutions(preset) {
+  if (!preset.clearEveryFrame) return empty(preset, "root framebuffer feedback requires exact CPU convolution");
+  let split = preset.components.length;
+  const reverse = [];
+  while (split > 0) {
+    const config = configFor(preset.components[split - 1]);
+    if (!config) break;
+    reverse.push(config);
+    split--;
+  }
+  const configs = reverse.reverse();
+  if (!configs.length) return empty(preset, "no safe root-terminal exact GPU convolution");
+  return {
+    cpuPreset: { ...preset, components: preset.components.slice(0, split) },
+    configs,
+    extractedComponents: configs.length,
+    reason: `${configs.length} exact Holden03 convolution${configs.length === 1 ? "" : "s"} moved to resident WebGPU`
+  };
+}
+function configFor(component) {
+  if (component.list || component.children.length || component.apeId !== AVS_CONVOLUTION_APE_ID) return null;
+  const config = decodeAvsConvolutionConfig(component.payload);
+  return assessExactGpuConvolution(config).eligible ? config : null;
+}
+function empty(preset, reason) {
+  return { cpuPreset: preset, configs: [], extractedComponents: 0, reason };
 }
 
 // assets/avs/avsres_texer_circle_edgeonly_19x19.bmp
@@ -7027,247 +10026,970 @@ function copyAvsPixelsToRgba(source, rgba, rgbaWords) {
   }
 }
 
-// src/avs/gpu-frame-graph.ts
-var AVS_GPU_TERMINAL_CAPABILITY = {
-  id: "packed-u32-terminal",
-  backend: "webgpu",
-  lane: "exact",
-  byteExact: true,
-  reason: "Unpacks AVS 0x00RRGGBB channels with integer shifts; no filtering or blend approximation."
-};
-var AVS_PACKED_PRESENT_WGSL = (
-  /* wgsl */
-  `
-@group(0) @binding(0) var<storage, read> avs_pixels: array<u32>;
-@group(0) @binding(1) var<uniform> frame_width: u32;
-
-struct VertexOutput {
-  @builtin(position) position: vec4f,
-};
-
-@vertex fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
-  var positions = array<vec2f, 3>(
-    vec2f(-1.0, -1.0),
-    vec2f( 3.0, -1.0),
-    vec2f(-1.0,  3.0),
+// src/avs/gpu-preset-plan.ts
+function planTerminalExactGpuPasses(preset) {
+  if (!preset.clearEveryFrame) {
+    return emptyPlan(preset, "root framebuffer feedback requires the exact CPU graph");
+  }
+  let split = preset.components.length;
+  const reverse = [];
+  while (split > 0) {
+    const component = preset.components[split - 1];
+    const config = terminalExactConfig(component);
+    if (!config) break;
+    reverse.push(config);
+    split--;
+  }
+  if (reverse.length === 0) {
+    return emptyPlan(preset, "no safe root-level terminal exact-GPU suffix");
+  }
+  const components = reverse.reverse();
+  const passes = fusePointwise(components);
+  const blurPasses = passes.flatMap((pass) => pass.kind === "blur" ? [pass.config] : []);
+  const fusedPointwiseOperations = passes.reduce(
+    (total, pass) => total + (pass.kind === "pointwise" ? pass.operations.length : 0),
+    0
   );
-  var output: VertexOutput;
-  output.position = vec4f(positions[vertex_index], 0.0, 1.0);
-  return output;
+  const movementPasses = passes.filter((pass) => pass.kind === "movement").length;
+  const rotoBlitterPasses = passes.filter((pass) => pass.kind === "roto-blitter").length;
+  const blitterFeedbackPasses = passes.filter((pass) => pass.kind === "blitter-feedback").length;
+  return {
+    cpuPreset: { ...preset, components: preset.components.slice(0, split) },
+    passes,
+    blurPasses,
+    extractedComponents: components.length,
+    fusedPointwiseOperations,
+    movementPasses,
+    rotoBlitterPasses,
+    blitterFeedbackPasses,
+    reason: `${components.length} exact terminal component${components.length === 1 ? "" : "s"} moved to ${passes.length} resident WebGPU pass${passes.length === 1 ? "" : "es"}` + (fusedPointwiseOperations > 1 ? ` (${fusedPointwiseOperations} pointwise operations fused)` : "") + (movementPasses > 0 ? ` (${movementPasses} static Movement map${movementPasses === 1 ? "" : "s"})` : "") + (rotoBlitterPasses > 0 ? ` (${rotoBlitterPasses} static Roto Blitter affine pass${rotoBlitterPasses === 1 ? "" : "es"})` : "") + (blitterFeedbackPasses > 0 ? ` (${blitterFeedbackPasses} static Blitter Feedback affine pass${blitterFeedbackPasses === 1 ? "" : "es"})` : "")
+  };
+}
+function emptyPlan(preset, reason) {
+  return {
+    cpuPreset: preset,
+    passes: [],
+    blurPasses: [],
+    extractedComponents: 0,
+    fusedPointwiseOperations: 0,
+    movementPasses: 0,
+    rotoBlitterPasses: 0,
+    blitterFeedbackPasses: 0,
+    reason
+  };
+}
+function fusePointwise(components) {
+  const result = [];
+  let pending = [];
+  const flush = () => {
+    if (pending.length === 0) return;
+    result.push({ kind: "pointwise", operations: pending });
+    pending = [];
+  };
+  for (const component of components) {
+    if (component.kind === "pointwise") pending.push(...component.operations);
+    else {
+      flush();
+      result.push(component);
+    }
+  }
+  flush();
+  return result;
+}
+function terminalExactConfig(component) {
+  const blur2 = terminalBlurConfig(component);
+  if (blur2) return { kind: "blur", config: blur2 };
+  const pointwise = terminalPointwiseConfig(component);
+  if (pointwise) return { kind: "pointwise", operations: [pointwise] };
+  if (!component.list && !component.apeId && component.effectId === 15) {
+    const config = decodeAvsMovement(component.payload);
+    if (config.sourceMapped === 0 && config.effect >= 2 && config.effect <= 17) {
+      return { kind: "movement", config };
+    }
+  }
+  if (!component.list && !component.apeId && component.effectId === 9) {
+    const config = decodeAvsRotoBlitter(component.payload);
+    if (!config.beatReverse && !config.beatScale) return { kind: "roto-blitter", config };
+  }
+  if (!component.list && !component.apeId && component.effectId === 4) {
+    const config = decodeAvsBlitterFeedback(component.payload);
+    if (!config.changeOnBeat && config.scale !== 32) return { kind: "blitter-feedback", config };
+  }
+  return null;
+}
+function terminalBlurConfig(component) {
+  if (component.list || component.apeId || component.effectId !== 6) return null;
+  const view = new DataView(component.payload.buffer, component.payload.byteOffset, component.payload.byteLength);
+  const mode = component.payload.byteLength >= 4 ? view.getInt32(0, true) : 1;
+  if (mode !== 1 && mode !== 2 && mode !== 3) return null;
+  const roundUp = component.payload.byteLength >= 8 && view.getInt32(4, true) !== 0;
+  return { mode, roundUp };
+}
+function terminalPointwiseConfig(component) {
+  if (component.list) return null;
+  if (component.apeId) {
+    const ape = normalizedApe(component.apeId);
+    if (ape === normalizedApe(AVS_CHANNEL_SHIFT_APE_ID)) {
+      const config = decodeAvsChannelShift(component.payload);
+      return config.randomizeOnBeat ? null : { kind: "channel-shift", mode: config.mode };
+    }
+    if (ape === normalizedApe(AVS_COLOR_REDUCTION_APE_ID)) {
+      const levels = Math.max(0, Math.min(8, Math.trunc(decodeAvsColorReduction(component.payload).levels)));
+      const mask = levels === 0 ? 0 : 255 << 8 - levels & 255;
+      return { kind: "color-reduction", mask: mask | mask << 8 | mask << 16 };
+    }
+    if (ape === normalizedApe(AVS_MULTIPLIER_APE_ID)) return { kind: "multiplier", mode: decodeAvsMultiplier(component.payload).mode };
+    return null;
+  }
+  switch (component.effectId) {
+    case 3: {
+      const fade = int7(component, 0, 16);
+      if (fade < 1 || fade > 255) return null;
+      return { kind: "fade", fade, target: int7(component, 4, 0) & 16777215 };
+    }
+    case 12: {
+      const mode = int7(component, 0, 1);
+      if (mode === 0) return null;
+      const distance = int7(component, 12, 10) * 2;
+      const squared = distance * distance;
+      if (!Number.isSafeInteger(squared)) return null;
+      return {
+        kind: "color-clip",
+        mode: mode === 1 || mode === 2 ? mode : 3,
+        source: int7(component, 4, 2105376) & 16777215,
+        replacement: int7(component, 8, int7(component, 4, 2105376)) & 16777215,
+        distanceSquared: Math.min(195075, squared)
+      };
+    }
+    case 22: {
+      if (int7(component, 0, 1) === 0) return null;
+      const redMultiplier = brightnessMultiplier(int7(component, 12, 0));
+      const greenMultiplier = brightnessMultiplier(int7(component, 16, 0));
+      const blueMultiplier = brightnessMultiplier(int7(component, 20, 0));
+      const maximum = Math.floor(4294967295 / 255);
+      if (![redMultiplier, greenMultiplier, blueMultiplier].every(
+        (value) => Number.isInteger(value) && value >= 0 && value <= maximum
+      )) return null;
+      const distance = int7(component, 36, 16);
+      if (distance === -2147483648) return null;
+      return {
+        kind: "brightness",
+        additive: int7(component, 4, 0) !== 0,
+        average: int7(component, 8, 1) !== 0,
+        redMultiplier,
+        greenMultiplier,
+        blueMultiplier,
+        reference: int7(component, 28, 0) & 16777215,
+        exclude: int7(component, 32, 0) !== 0,
+        distance
+      };
+    }
+    case 37:
+      return int7(component, 0, 1) !== 0 ? { kind: "invert" } : null;
+    case 44: {
+      const direction = int7(component, 0, 0);
+      return direction === 0 || direction === 1 ? { kind: "fast-brightness", direction } : null;
+    }
+    default:
+      return null;
+  }
+}
+function normalizedApe(value) {
+  return (value ?? "").trim().toLowerCase();
+}
+function brightnessMultiplier(setting) {
+  return Math.trunc((1 + (setting < 0 ? 1 : 16) * (setting / 4096)) * 65536);
+}
+function int7(component, offset, fallback2) {
+  if (offset + 4 > component.payload.byteLength) return fallback2;
+  return new DataView(
+    component.payload.buffer,
+    component.payload.byteOffset,
+    component.payload.byteLength
+  ).getInt32(offset, true);
 }
 
-@fragment fn fragment_main(@builtin(position) position: vec4f) -> @location(0) vec4f {
-  let coordinate = vec2u(position.xy);
-  let pixel = avs_pixels[coordinate.y * frame_width + coordinate.x];
-  return vec4f(
-    f32((pixel >> 16u) & 255u),
-    f32((pixel >> 8u) & 255u),
-    f32(pixel & 255u),
-    255.0,
-  ) / 255.0;
-}
-`
-);
-function planPackedAvsFrameGraph(width, height, maxStorageBufferBindingSize = Number.MAX_SAFE_INTEGER) {
-  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
-    throw new RangeError(`Invalid AVS frame-graph size ${width}x${height}`);
+// src/avs/effects/dynamic-movement-eel-gpu.ts
+var AVS_ENHANCED_DYNAMIC_MOVEMENT_RESIDENT_CAPABILITY = {
+  id: "dynamic-movement-resident-f32-map",
+  backend: "webgpu",
+  lane: "120",
+  byteExact: false,
+  reason: "CPU preserves init/frame/beat state; pure point EEL generates the coarse grid and resamples resident packed-u32 surfaces on WebGPU."
+};
+var POINT_INPUTS2 = /* @__PURE__ */ new Set(["x", "y", "d", "r"]);
+var WORKGROUP_SIZE3 = 256;
+function compileEnhancedDynamicMovementResident(config) {
+  let point;
+  try {
+    compileAvsEel(config.point);
+    point = parseAvsEel(config.point);
+  } catch (error) {
+    return rejected2(error);
   }
-  const pixels = width * height;
-  const framebufferBytes = pixels * Uint32Array.BYTES_PER_ELEMENT;
-  if (!Number.isSafeInteger(framebufferBytes)) throw new RangeError("AVS framebuffer byte size is unsafe");
-  if (framebufferBytes > maxStorageBufferBindingSize) {
-    throw new RangeError(
-      `AVS framebuffer needs ${framebufferBytes} bytes; adapter limit is ${maxStorageBufferBindingSize}`
-    );
+  const phaseReferences = /* @__PURE__ */ new Set();
+  for (const source of [config.init, config.frame, config.beat]) {
+    if (!source.trim()) continue;
+    try {
+      collectVariables(parseAvsEel(source).body, phaseReferences);
+    } catch (error) {
+      return rejected2(error);
+    }
   }
-  return { width, height, pixels, framebufferBytes, residentBytes: framebufferBytes * 2 };
-}
-function assertPackedAvsFrame(pixels, expectedPixels) {
-  if (pixels.length !== expectedPixels) {
-    throw new RangeError(`Packed AVS frame has ${pixels.length} pixels, expected ${expectedPixels}`);
-  }
-  if (!(pixels.buffer instanceof ArrayBuffer)) {
-    throw new TypeError("Packed AVS frame must use transferable ArrayBuffer storage");
-  }
-}
-function assertAvsPassCompatible(lane, capability) {
-  if (lane === "exact" && (!capability.byteExact || capability.lane !== "exact")) {
-    throw new Error(`Frame pass ${capability.id} requires the explicit 120 lane: ${capability.reason}`);
-  }
-}
-var PackedAvsGpuFrameGraph = class _PackedAvsGpuFrameGraph {
-  capability = AVS_GPU_TERMINAL_CAPABILITY;
-  plan;
-  lane;
-  device;
-  context;
-  canvas;
-  format;
-  buffers;
-  widthBuffer;
-  bindGroups;
-  pipeline;
-  onTiming;
-  frame = 0;
-  destroyed = false;
-  constructor(device, context2, format, options) {
-    this.device = device;
-    this.context = context2;
-    this.canvas = options.canvas;
-    this.format = format;
-    this.onTiming = options.onTiming;
-    this.lane = options.lane ?? "exact";
-    this.plan = planPackedAvsFrameGraph(
-      options.width,
-      options.height,
-      Number(device.limits.maxStorageBufferBindingSize)
-    );
-    this.canvas.width = options.width;
-    this.canvas.height = options.height;
-    this.context.configure({ device, format, alphaMode: "opaque" });
-    const createFramebuffer = (label) => device.createBuffer({
-      label,
-      size: this.plan.framebufferBytes,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
-    });
-    this.buffers = {
-      primary: createFramebuffer("AVS frame graph primary"),
-      secondary: createFramebuffer("AVS frame graph secondary")
+  const analysis = analysePointProgram2(point.body, phaseReferences);
+  if (!analysis.ok) return { eligible: false, reason: analysis.reason };
+  try {
+    const builder = new DynamicMovementWgslBuilder(analysis.uniformNames);
+    const body = builder.program(point.body);
+    return {
+      eligible: true,
+      program: {
+        source: config.point,
+        wgsl: residentShaderSource(body, analysis.uniformNames, builder.localNames),
+        uniformNames: analysis.uniformNames,
+        workgroupSize: WORKGROUP_SIZE3
+      }
     };
-    this.widthBuffer = device.createBuffer({
-      label: "AVS frame graph width",
-      size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  } catch (error) {
+    return rejected2(error);
+  }
+}
+function analysePointProgram2(root, phaseReferences) {
+  const values = root.kind === "sequence" ? root.values : [root];
+  const written = /* @__PURE__ */ new Set();
+  collectWrites3(root, written);
+  for (const name of written) {
+    if (isRegister2(name)) return { ok: false, reason: `${name} is shared register state` };
+    if (phaseReferences.has(name)) return { ok: false, reason: `${name} is observed by init/frame/beat code` };
+  }
+  const initialized = new Set(POINT_INPUTS2);
+  const reads = /* @__PURE__ */ new Set(["alpha"]);
+  for (const node of values) {
+    const assignment2 = directAssignment3(node);
+    if (assignment2) {
+      const target = normalize3(assignment2.target);
+      const failure2 = validatePure3(assignment2.value, written, initialized, reads);
+      if (failure2) return { ok: false, reason: failure2 };
+      if (assignment2.operator !== "=" && !initialized.has(target)) {
+        return { ok: false, reason: `${target}${assignment2.operator} carries point-to-point state` };
+      }
+      initialized.add(target);
+      continue;
+    }
+    const failure = validatePure3(node, written, initialized, reads);
+    if (failure) return { ok: false, reason: failure };
+  }
+  const uniformNames = [...reads].filter((name) => !POINT_INPUTS2.has(name) && !written.has(name) && !["$pi", "$e", "$phi"].includes(name)).sort();
+  return { ok: true, uniformNames };
+}
+function validatePure3(node, written, initialized, reads) {
+  if (node.kind === "variable") {
+    const name = normalize3(node.name);
+    if (written.has(name) && !initialized.has(name)) return `${name} is read before per-point initialization`;
+    reads.add(name);
+    return null;
+  }
+  if (node.kind === "assign" || node.kind === "call" && node.name === "assign") {
+    return "nested or conditional mutation is order-sensitive";
+  }
+  if (node.kind === "call" && ["loop", "rand", "megabuf", "gmegabuf", "getosc", "getspec", "gettime", "getkbmouse"].includes(node.name)) {
+    return `${node.name} is not a safe independent point operation`;
+  }
+  for (const child of children3(node)) {
+    const failure = validatePure3(child, written, initialized, reads);
+    if (failure) return failure;
+  }
+  return null;
+}
+var EnhancedDynamicMovementResidentState = class {
+  constructor(config, program, global, seed) {
+    this.config = config;
+    this.program = program;
+    this.vm = new AvsEelVm({ global, seed });
+    this.init = bindOrNull2(config.init, this.vm);
+    this.frame = bindOrNull2(config.frame, this.vm);
+    this.beat = bindOrNull2(config.beat, this.vm);
+    this.packedVariables = new Float32Array(Math.max(4, program.uniformNames.length));
+  }
+  vm;
+  init;
+  frame;
+  beat;
+  packedVariables;
+  initialized = false;
+  update(audio, width, height) {
+    this.vm.setHost({
+      getosc: (band, sampleWidth, channel) => avsAudioSample(audio, "osc", band, sampleWidth, channel),
+      getspec: (band, sampleWidth, channel) => avsAudioSample(audio, "spec", band, sampleWidth, channel)
     });
-    device.queue.writeBuffer(this.widthBuffer, 0, new Uint32Array([options.width]));
-    const module = device.createShaderModule({
-      label: "AVS exact packed-u32 terminal",
-      code: AVS_PACKED_PRESENT_WGSL
-    });
-    this.pipeline = device.createRenderPipeline({
-      label: "AVS exact packed-u32 terminal",
-      layout: "auto",
-      vertex: { module, entryPoint: "vertex_main" },
-      fragment: { module, entryPoint: "fragment_main", targets: [{ format }] },
-      primitive: { topology: "triangle-list" }
-    });
-    const layout = this.pipeline.getBindGroupLayout(0);
-    const bind = (slot) => device.createBindGroup({
-      label: `AVS exact terminal ${slot}`,
-      layout,
+    this.vm.set("w", width);
+    this.vm.set("h", height);
+    this.vm.set("b", audio.beat ? 1 : 0);
+    this.vm.set("alpha", 0.5);
+    if (!this.initialized) {
+      this.init?.();
+      this.initialized = true;
+    }
+    this.frame?.();
+    if (audio.beat) this.beat?.();
+    for (let index = 0; index < this.program.uniformNames.length; index++) {
+      const value = this.vm.get(this.program.uniformNames[index]);
+      this.packedVariables[index] = Number.isFinite(value) ? value : 0;
+    }
+    return this.packedVariables;
+  }
+};
+var EnhancedDynamicMovementResidentGpuPass = class {
+  constructor(device, state, width, height) {
+    this.device = device;
+    this.state = state;
+    this.width = width;
+    this.height = height;
+    const { config, program } = state;
+    if (config.buffer !== 0 || config.noMove) throw new Error("Resident Dynamic Movement rejects global-buffer and no-move modes");
+    if (config.bilinear && (width < 2 || height < 2)) throw new RangeError("Resident bilinear Dynamic Movement requires dimensions >= 2");
+    const columns = columnsFor(config), rows = rowsFor(config);
+    const module = device.createShaderModule({ label: "AVS enhanced Dynamic Movement resident map", code: program.wgsl });
+    this.bindGroupLayout = device.createBindGroupLayout({
+      label: "AVS Dynamic Movement resident layout",
       entries: [
-        { binding: 0, resource: { buffer: this.buffers[slot] } },
-        { binding: 1, resource: { buffer: this.widthBuffer } }
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } }
       ]
     });
-    this.bindGroups = { primary: bind("primary"), secondary: bind("secondary") };
+    const layout = device.createPipelineLayout({ label: "AVS Dynamic Movement resident pipeline layout", bindGroupLayouts: [this.bindGroupLayout] });
+    this.gridPipeline = device.createComputePipeline({ layout, compute: { module, entryPoint: "dynamic_movement_grid" } });
+    this.resamplePipeline = device.createComputePipeline({ layout, compute: { module, entryPoint: "dynamic_movement_resample" } });
+    this.grid = storageBuffer2(device, "AVS Dynamic Movement resident grid", columns * rows * 16, 0);
+    this.variables = storageBuffer2(device, "AVS Dynamic Movement resident uniforms", Math.max(4, program.uniformNames.length) * 4, GPUBufferUsage.COPY_DST);
+    this.params = device.createBuffer({ label: "AVS Dynamic Movement resident params", size: this.packedParams.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   }
-  static async create(options) {
-    const navigation = globalThis.navigator;
-    const gpu = navigation?.gpu;
-    if (!gpu) return null;
-    const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
-    if (!adapter) return null;
-    const device = await adapter.requestDevice();
-    const context2 = options.canvas.getContext("webgpu");
-    if (!context2) {
-      device.destroy();
-      return null;
-    }
-    try {
-      return new _PackedAvsGpuFrameGraph(device, context2, gpu.getPreferredCanvasFormat(), options);
-    } catch (error) {
-      context2.unconfigure();
-      device.destroy();
-      throw error;
-    }
-  }
-  buffer(slot) {
+  capability = AVS_ENHANCED_DYNAMIC_MOVEMENT_RESIDENT_CAPABILITY;
+  gridPipeline;
+  resamplePipeline;
+  bindGroupLayout;
+  grid;
+  variables;
+  params;
+  packedParams = new Uint32Array(12);
+  groups = /* @__PURE__ */ new WeakMap();
+  destroyed = false;
+  /** Uploads scalar phase state only; the coarse grid and packed sampling map stay on GPU. */
+  update(audio) {
     this.assertActive();
-    return this.buffers[slot];
-  }
-  upload(slot, pixels) {
-    this.assertActive();
-    assertPackedAvsFrame(pixels, this.plan.pixels);
-    const started = performance.now();
-    this.device.queue.writeBuffer(
-      this.buffers[slot],
+    const packedVariables = this.state.update(audio, this.width, this.height);
+    const { config, program } = this.state;
+    this.packedParams.set([
+      this.width,
+      this.height,
+      this.width * this.height,
+      columnsFor(config),
+      rowsFor(config),
+      config.bilinear ? 1 : 0,
+      config.blend ? 1 : 0,
+      config.wrap ? 1 : 0,
+      config.rectangular ? 1 : 0,
+      program.uniformNames.length,
       0,
-      pixels.buffer,
-      pixels.byteOffset,
-      pixels.byteLength
-    );
-    return performance.now() - started;
+      0
+    ]);
+    this.device.queue.writeBuffer(this.variables, 0, packedVariables.buffer, packedVariables.byteOffset, packedVariables.byteLength);
+    this.device.queue.writeBuffer(this.params, 0, this.packedParams);
   }
-  present(slot, uploadMs = 0) {
-    return this.executeAndPresent([], slot, uploadMs);
-  }
-  /**
-   * Records the compiled pass chain and terminal presentation in one encoder.
-   * Every pass alternates the two resident buffers; no pass may read back.
-   */
-  executeAndPresent(passes, inputSlot = "primary", uploadMs = 0) {
+  encode(context2) {
     this.assertActive();
-    const started = performance.now();
-    const encoder = this.device.createCommandEncoder({ label: "AVS frame graph encoder" });
-    let sourceSlot = inputSlot;
-    for (const framePass of passes) {
-      assertAvsPassCompatible(this.lane, framePass.capability);
-      const targetSlot = sourceSlot === "primary" ? "secondary" : "primary";
-      framePass.encode({
-        device: this.device,
-        encoder,
-        width: this.plan.width,
-        height: this.plan.height,
-        source: this.buffers[sourceSlot],
-        target: this.buffers[targetSlot]
-      });
-      sourceSlot = targetSlot;
+    let targets = this.groups.get(context2.source);
+    if (!targets) {
+      targets = /* @__PURE__ */ new WeakMap();
+      this.groups.set(context2.source, targets);
     }
-    const pass = encoder.beginRenderPass({
-      label: "AVS exact terminal pass",
-      colorAttachments: [{
-        view: this.context.getCurrentTexture().createView(),
-        loadOp: "clear",
-        storeOp: "store",
-        clearValue: { r: 0, g: 0, b: 0, a: 1 }
-      }]
-    });
-    pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, this.bindGroups[sourceSlot]);
-    pass.draw(3);
+    let group = targets.get(context2.target);
+    if (!group) {
+      group = context2.device.createBindGroup({
+        label: "AVS Dynamic Movement resident bindings",
+        layout: this.bindGroupLayout,
+        entries: [
+          { binding: 0, resource: { buffer: context2.source } },
+          { binding: 1, resource: { buffer: context2.target } },
+          { binding: 2, resource: { buffer: this.grid } },
+          { binding: 3, resource: { buffer: this.variables } },
+          { binding: 4, resource: { buffer: this.params } }
+        ]
+      });
+      targets.set(context2.target, group);
+    }
+    let pass = context2.encoder.beginComputePass({ label: "AVS Dynamic Movement resident grid" });
+    pass.setPipeline(this.gridPipeline);
+    pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(Math.ceil(columnsFor(this.state.config) * rowsFor(this.state.config) / WORKGROUP_SIZE3));
     pass.end();
-    this.device.queue.submit([encoder.finish()]);
-    const encodeSubmitMs = performance.now() - started;
-    const frame = ++this.frame;
-    this.onTiming?.({ frame, uploadMs, encodeSubmitMs });
-    if (this.onTiming) {
-      const gpuStarted = performance.now();
-      void this.device.queue.onSubmittedWorkDone().then(() => {
-        if (!this.destroyed) {
-          this.onTiming?.({ frame, uploadMs, encodeSubmitMs, gpuCompleteMs: performance.now() - gpuStarted });
-        }
-      });
-    }
-    return { uploadMs, encodeSubmitMs };
-  }
-  uploadAndPresent(pixels, slot = "primary") {
-    const uploadMs = this.upload(slot, pixels);
-    return this.present(slot, uploadMs);
+    pass = context2.encoder.beginComputePass({ label: "AVS Dynamic Movement resident resample" });
+    pass.setPipeline(this.resamplePipeline);
+    pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(Math.ceil(context2.width * context2.height / WORKGROUP_SIZE3));
+    pass.end();
   }
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
-    this.context.unconfigure();
-    this.buffers.primary.destroy();
-    this.buffers.secondary.destroy();
-    this.widthBuffer.destroy();
-    this.device.destroy();
+    this.grid.destroy();
+    this.variables.destroy();
+    this.params.destroy();
   }
   assertActive() {
-    if (this.destroyed) throw new Error("AVS GPU frame graph is destroyed");
+    if (this.destroyed) throw new Error("AVS resident Dynamic Movement pass is destroyed");
   }
 };
+function residentShaderSource(body, uniformNames, locals) {
+  const declarations = [...locals].filter((name) => !["v_x", "v_y", "v_d", "v_r", "v_alpha"].includes(name)).sort().map((name) => `var ${name}: f32 = 0.0;`).join("\n  ");
+  const alphaIndex = uniformNames.indexOf("alpha");
+  return (
+    /* wgsl */
+    `
+struct Params { width:u32, height:u32, pixels:u32, columns:u32, rows:u32, bilinear:u32, blend_enabled:u32, wrap_enabled:u32, rectangular:u32, variable_count:u32, _p0:u32, _p1:u32 };
+@group(0) @binding(0) var<storage,read> source:array<u32>;
+@group(0) @binding(1) var<storage,read_write> destination:array<u32>;
+@group(0) @binding(2) var<storage,read_write> grid:array<vec4f>;
+@group(0) @binding(3) var<storage,read> initial:array<f32>;
+@group(0) @binding(4) var<uniform> params:Params;
+fn finite(v:f32)->f32{return select(0.0,v,v==v&&abs(v)<=3.402823e38);}
+fn truth(v:f32)->bool{return abs(v)>=0.00001;}
+fn close(a:f32,b:f32)->bool{return abs(a-b)<0.00001;}
+fn divide(a:f32,b:f32)->f32{return select(finite(a/b),0.0,abs(b)<1.1920929e-7);}
+fn modulo(a:f32,b:f32)->f32{return select(finite(a%b),0.0,abs(b)<1.1920929e-7);}
+fn avs_table(a:u32,b:u32)->u32{var r=(a*b)/255u;let c=(a==147u&&(b==85u||b==170u))||(a==155u&&(b==51u||b==102u||b==153u||b==204u))||(a==171u&&(b==85u||b==170u))||(a==187u&&(b==75u||b==150u||b==165u))||(a==195u&&b==153u);if(c){r-=1u;}return r;}
+fn blend_avs(a:u32,b:u32,alpha:u32)->u32{let inv=255u-alpha;let lo=avs_table(a&255u,alpha)+avs_table(b&255u,inv);let mi=avs_table((a>>8u)&255u,alpha)+avs_table((b>>8u)&255u,inv);let hi=avs_table((a>>16u)&255u,alpha)+avs_table((b>>16u)&255u,inv);return lo|(mi<<8u)|(hi<<16u);}
+fn sample4(offset:u32,fx:u32,fy:u32)->u32{let ix=255u-fx;let iy=255u-fy;let w=array<u32,4>(avs_table(ix,iy),avs_table(fx,iy),avs_table(ix,fy),avs_table(fx,fy));let p=array<u32,4>(source[offset],source[offset+1u],source[offset+params.width],source[offset+params.width+1u]);var lo=0u;var mi=0u;var hi=0u;for(var i=0u;i<4u;i++){lo+=avs_table(p[i]&255u,w[i]);mi+=avs_table((p[i]>>8u)&255u,w[i]);hi+=avs_table((p[i]>>16u)&255u,w[i]);}return (lo&255u)|((mi&255u)<<8u)|((hi&255u)<<16u);}
+@compute @workgroup_size(${WORKGROUP_SIZE3}) fn dynamic_movement_grid(@builtin(global_invocation_id) id:vec3u){
+  let index=id.x;if(index>=params.columns*params.rows){return;}let gx=index%params.columns;let gy=index/params.columns;
+  let sx=f32(gx)*f32(params.width)/f32(params.columns-1u);let sy=f32(gy)*f32(params.height)/f32(params.rows-1u);
+  let cx=f32(params.width)*0.5;let cy=f32(params.height)*0.5;let radius=sqrt(f32(params.width*params.width+params.height*params.height))*0.5;
+  var v_x=(sx-cx)*(2.0/f32(params.width));var v_y=(sy-cy)*(2.0/f32(params.height));
+  var v_d=sqrt((sx-cx)*(sx-cx)+(sy-cy)*(sy-cy))/radius;var v_r=atan2(sy-cy,sx-cx)+3.14159265358979323846*0.5;
+  var v_alpha:f32=${alphaIndex < 0 ? "0.5" : `initial[${alphaIndex}u]`};${declarations ? `
+  ${declarations}` : ""}
+  var _result=0.0;${body ? `
+  ${body}` : ""}
+  var mx=0.0;var my=0.0;if(params.rectangular!=0u){mx=(v_x+1.0)*f32(params.width)*0.5;my=(v_y+1.0)*f32(params.height)*0.5;}else{let distance=v_d*radius;let angle=v_r-3.14159265358979323846*0.5;mx=f32(params.width)*0.5+cos(angle)*distance;my=f32(params.height)*0.5+sin(angle)*distance;}grid[index]=vec4f(mx,my,clamp(v_alpha,0.0,1.0),0.0);
+}
+@compute @workgroup_size(${WORKGROUP_SIZE3}) fn dynamic_movement_resample(@builtin(global_invocation_id) id:vec3u){
+  let i=id.x;if(i>=params.pixels){return;}let x=i%params.width;let y=i/params.width;
+  let cellfx=f32(x)*f32(params.columns-1u)/f32(params.width);let cellfy=f32(y)*f32(params.rows-1u)/f32(params.height);
+  let cellx=min(params.columns-2u,u32(cellfx));let celly=min(params.rows-2u,u32(cellfy));let fx=cellfx-f32(cellx);let fy=cellfy-f32(celly);let invy=1.0-fy;let tl=cellx+celly*params.columns;
+  let a=grid[tl];let b=grid[tl+1u];let c=grid[tl+params.columns];let d=grid[tl+params.columns+1u];
+  var mapped=(a+(b-a)*fx)*invy+(c+(d-c)*fx)*fy;let maximum=vec2f(f32(params.width-select(1u,2u,params.bilinear!=0u)),f32(params.height-select(1u,2u,params.bilinear!=0u)));let span=max(vec2f(1.0),maximum);
+  if(params.wrap_enabled!=0u){mapped.xy=((mapped.xy%span)+span)%span;}else{mapped.x=clamp(mapped.x,0.0,maximum.x);mapped.y=clamp(mapped.y,0.0,maximum.y);}
+  let ix=u32(mapped.x);let iy=u32(mapped.y);let offset=ix+iy*params.width;var sampled=source[offset];
+  if(params.bilinear!=0u&&params.width>=2u&&params.height>=2u){sampled=sample4(offset,u32((mapped.x-f32(ix))*256.0)&255u,u32((mapped.y-f32(iy))*256.0)&255u);}let alpha=u32(clamp(mapped.z,0.0,1.0)*255.0);destination[i]=select(sampled,blend_avs(sampled,source[i],alpha),params.blend_enabled!=0u);
+}`
+  );
+}
+var DynamicMovementWgslBuilder = class {
+  localNames = /* @__PURE__ */ new Set();
+  uniformIndex = /* @__PURE__ */ new Map();
+  constructor(uniformNames) {
+    uniformNames.forEach((name, index) => this.uniformIndex.set(name, index));
+  }
+  program(root) {
+    const values = root.kind === "sequence" ? root.values : [root];
+    const lines = [];
+    for (const node of values) {
+      const assignment2 = directAssignment3(node);
+      if (!assignment2) {
+        lines.push(`_result=finite(${this.expression(node)});`);
+        continue;
+      }
+      const target = this.name(assignment2.target);
+      this.localNames.add(target);
+      lines.push(`${target}=${assignmentExpression3(assignment2.operator, target, this.expression(assignment2.value))};`, `_result=${target};`);
+    }
+    return lines.join("\n  ");
+  }
+  expression(node) {
+    switch (node.kind) {
+      case "number":
+        return numberLiteral4(node.value);
+      case "variable":
+        return this.variable(node.name);
+      case "unary": {
+        const v = this.expression(node.value);
+        if (node.operator === "+") return `finite(${v})`;
+        if (node.operator === "-") return `finite(-(${v}))`;
+        if (node.operator === "!") return `select(1.0,0.0,truth(${v}))`;
+        if (node.operator === "~") return `f32(~i32(${v}))`;
+        throw new Error(`Unsupported unary ${node.operator}`);
+      }
+      case "binary":
+        return this.binary(node.operator, node.left, node.right);
+      case "conditional":
+        return `select(${this.expression(node.no)},${this.expression(node.yes)},truth(${this.expression(node.condition)}))`;
+      case "call":
+        return this.call(node.name, node.args);
+      case "sequence":
+        if (node.values.length === 1) return this.expression(node.values[0]);
+        throw new Error("Nested sequence is not GPU-pure");
+      case "assign":
+        throw new Error("Nested assignment is not GPU-pure");
+    }
+  }
+  binary(op, l, r) {
+    const a = this.expression(l), b = this.expression(r);
+    switch (op) {
+      case "+":
+        return `finite((${a})+(${b}))`;
+      case "-":
+        return `finite((${a})-(${b}))`;
+      case "*":
+        return `finite((${a})*(${b}))`;
+      case "/":
+        return `divide(${a},${b})`;
+      case "%":
+        return `modulo(${a},${b})`;
+      case "**":
+        return `finite(pow(${a},${b}))`;
+      case "|":
+        return `f32(i32(${a})|i32(${b}))`;
+      case "&":
+        return `f32(i32(${a})&i32(${b}))`;
+      case "^":
+        return `f32(i32(${a})^i32(${b}))`;
+      case "<<":
+        return `f32(i32(${a})<<(u32(i32(${b}))&31u))`;
+      case ">>":
+        return `f32(i32(${a})>>(u32(i32(${b}))&31u))`;
+      case "&&":
+        return `select(0.0,select(0.0,1.0,truth(${b})),truth(${a}))`;
+      case "||":
+        return `select(select(0.0,1.0,truth(${b})),1.0,truth(${a}))`;
+      case "==":
+        return `select(0.0,1.0,close(${a},${b}))`;
+      case "!=":
+        return `select(1.0,0.0,close(${a},${b}))`;
+      case "===":
+        return `select(0.0,1.0,(${a})==(${b}))`;
+      case "!==":
+        return `select(0.0,1.0,(${a})!=(${b}))`;
+      case "<":
+      case "<=":
+      case ">":
+      case ">=":
+        return `select(0.0,1.0,(${a})${op}(${b}))`;
+      default:
+        throw new Error(`Unsupported binary ${op}`);
+    }
+  }
+  call(name, nodes) {
+    if (name === "if") return `select(${this.expression(nodes[2])},${this.expression(nodes[1])},truth(${this.expression(nodes[0])}))`;
+    const a = nodes.map((n) => this.expression(n)), one = (f) => `finite(${f}(${a[0]}))`, two = (f) => `finite(${f}(${a[0]},${a[1]}))`;
+    switch (name) {
+      case "sin":
+      case "cos":
+      case "tan":
+      case "asin":
+      case "acos":
+      case "atan":
+      case "sqrt":
+      case "exp":
+      case "log":
+      case "abs":
+      case "floor":
+      case "ceil":
+        return one(name);
+      case "atan2":
+        return two("atan2");
+      case "sqr":
+        return `finite((${a[0]})*(${a[0]}))`;
+      case "invsqrt":
+        return `finite(inverseSqrt(${a[0]}))`;
+      case "pow":
+      case "min":
+      case "max":
+        return two(name);
+      case "log10":
+        return `finite(log2(${a[0]})/log2(10.0))`;
+      case "int":
+        return `finite(trunc(${a[0]}))`;
+      case "sign":
+        return `select(select(0.0,1.0,(${a[0]})>0.0),-1.0,(${a[0]})<0.0)`;
+      case "equal":
+        return `select(0.0,1.0,close(${a[0]},${a[1]}))`;
+      case "above":
+        return `select(0.0,1.0,(${a[0]})>(${a[1]}))`;
+      case "below":
+        return `select(0.0,1.0,(${a[0]})<(${a[1]}))`;
+      case "band":
+        return `select(0.0,1.0,truth(${a[0]})&&truth(${a[1]}))`;
+      case "bor":
+        return `select(0.0,1.0,truth(${a[0]})||truth(${a[1]}))`;
+      case "bnot":
+        return `select(1.0,0.0,truth(${a[0]}))`;
+      default:
+        throw new Error(`Function ${name} is not supported by resident Dynamic Movement`);
+    }
+  }
+  variable(raw) {
+    const name = normalize3(raw);
+    if (name === "$pi") return "3.14159265358979323846";
+    if (name === "$e") return "2.71828182845904523536";
+    if (name === "$phi") return "1.61803398874989484820";
+    const local = this.name(name);
+    if (POINT_INPUTS2.has(name) || this.localNames.has(local)) return local;
+    const index = this.uniformIndex.get(name);
+    if (index === void 0) throw new Error(`Missing GPU input ${name}`);
+    return `initial[${index}u]`;
+  }
+  name(raw) {
+    return `v_${normalize3(raw).replace(/^\$/, "").replace(/[^a-z0-9_]/g, "_")}`;
+  }
+};
+function collectWrites3(node, target) {
+  if (node.kind === "assign" && node.target.kind === "variable") target.add(normalize3(node.target.name));
+  if (node.kind === "call" && node.name === "assign" && node.args[0]?.kind === "variable") target.add(normalize3(node.args[0].name));
+  for (const child of children3(node)) collectWrites3(child, target);
+}
+function collectVariables(node, target) {
+  if (node.kind === "variable") target.add(normalize3(node.name));
+  for (const child of children3(node)) collectVariables(child, target);
+}
+function directAssignment3(node) {
+  if (node.kind === "assign" && node.target.kind === "variable") return { target: node.target.name, operator: node.operator, value: node.value };
+  if (node.kind === "call" && node.name === "assign" && node.args[0]?.kind === "variable" && node.args[1]) return { target: node.args[0].name, operator: "=", value: node.args[1] };
+  return null;
+}
+function children3(node) {
+  switch (node.kind) {
+    case "number":
+    case "variable":
+      return [];
+    case "unary":
+      return [node.value];
+    case "binary":
+      return [node.left, node.right];
+    case "conditional":
+      return [node.condition, node.yes, node.no];
+    case "assign":
+      return [node.target, node.value];
+    case "call":
+      return node.args;
+    case "sequence":
+      return node.values;
+  }
+}
+function assignmentExpression3(op, left, right) {
+  switch (op) {
+    case "=":
+      return `finite(${right})`;
+    case "+=":
+      return `finite(${left}+(${right}))`;
+    case "-=":
+      return `finite(${left}-(${right}))`;
+    case "*=":
+      return `finite(${left}*(${right}))`;
+    case "/=":
+      return `divide(${left},${right})`;
+    case "%=":
+      return `modulo(${left},${right})`;
+    case "|=":
+      return `f32(i32(${left})|i32(${right}))`;
+    case "&=":
+      return `f32(i32(${left})&i32(${right}))`;
+    case "^=":
+      return `f32(i32(${left})^i32(${right}))`;
+    case "**=":
+      return `finite(pow(${left},${right}))`;
+    default:
+      throw new Error(`Unsupported assignment ${op}`);
+  }
+}
+function bindOrNull2(source, vm) {
+  if (!source.trim()) return null;
+  try {
+    return compileAvsEel(source).bind(vm);
+  } catch {
+    return null;
+  }
+}
+function columnsFor(config) {
+  return clampInt2(Math.trunc(config.gridWidth) + 1, 2, 256);
+}
+function rowsFor(config) {
+  return clampInt2(Math.trunc(config.gridHeight) + 1, 2, 256);
+}
+function storageBuffer2(device, label, size, extra) {
+  return device.createBuffer({ label, size: Math.max(16, Math.ceil(size / 16) * 16), usage: GPUBufferUsage.STORAGE | extra });
+}
+function normalize3(name) {
+  return name.toLowerCase().slice(0, 8);
+}
+function isRegister2(name) {
+  return /^reg\d\d$/.test(name);
+}
+function numberLiteral4(value) {
+  if (!Number.isFinite(value)) return "0.0";
+  return Number.isInteger(value) ? `${value}.0` : `${value}`;
+}
+function clampInt2(value, min, max) {
+  return value < min ? min : value > max ? max : value;
+}
+function rejected2(error) {
+  return { eligible: false, reason: error instanceof Error ? error.message : String(error) };
+}
+
+// src/avs/dynamic-movement-gpu-plan.ts
+function planTerminalEnhancedDynamicMovement(preset) {
+  if (!preset.clearEveryFrame) return empty2(preset, "root framebuffer feedback requires classic Dynamic Movement");
+  const component = preset.components.at(-1);
+  if (!component || component.list || component.apeId || component.effectId !== 43) {
+    return empty2(preset, "no root-terminal Dynamic Movement");
+  }
+  const config = decodeAvsDynamicMovement(component.payload);
+  if (config.buffer !== 0) return empty2(preset, "Dynamic Movement global-buffer source remains classic CPU");
+  if (config.noMove) return empty2(preset, "Dynamic Movement no-move alpha mask remains classic CPU");
+  const resident = compileEnhancedDynamicMovementResident(config);
+  return {
+    cpuPreset: { ...preset, components: preset.components.slice(0, -1) },
+    component,
+    config,
+    residentProgram: resident.eligible ? resident.program : null,
+    residentReason: resident.eligible ? "pure point EEL grid generated resident on WebGPU" : `CPU map fallback: ${resident.reason}`,
+    reason: resident.eligible ? "root-terminal Dynamic Movement pure point EEL grid + resampler resident on WebGPU (120 lane)" : "root-terminal Dynamic Movement EEL map on CPU + exact resident WebGPU resampler (120 lane)"
+  };
+}
+function empty2(preset, reason) {
+  return { cpuPreset: preset, component: null, config: null, residentProgram: null, residentReason: reason, reason };
+}
+
+// src/avs/effects/dynamic-movement-gpu.ts
+var AVS_GPU_DYNAMIC_MOVEMENT_CAPABILITY = {
+  id: "dynamic-movement-cpu-map-gpu-resample",
+  backend: "webgpu",
+  lane: "120",
+  byteExact: true,
+  reason: "CPU preserves EEL/grid state and uploads an exact packed map; WebGPU performs packed-u32 sampling and alpha blend."
+};
+var AvsDynamicMovementGpuMapGenerator = class {
+  constructor(config, global, seed) {
+    this.config = config;
+    if (config.buffer !== 0 || config.noMove) throw new Error("Dynamic Movement GPU map rejects global-buffer and no-move modes");
+    this.vm = new AvsEelVm({ global, seed });
+    this.programs = [
+      compileOrNull6(config.point),
+      compileOrNull6(config.frame),
+      compileOrNull6(config.beat),
+      compileOrNull6(config.init)
+    ];
+  }
+  vm;
+  programs;
+  initialized = false;
+  gridX = new Float64Array(0);
+  gridY = new Float64Array(0);
+  gridAlpha = new Float64Array(0);
+  cellX = new Uint16Array(0);
+  fractionX = new Float64Array(0);
+  cellY = new Uint16Array(0);
+  fractionY = new Float64Array(0);
+  packed = new Uint32Array(0);
+  generate(audio, width, height) {
+    if (width <= 0 || height <= 0 || width * height >= 4194304) throw new RangeError("Dynamic Movement GPU dimensions unsupported");
+    const vm = this.vm;
+    vm.setHost({
+      getosc: (band, sampleWidth, channel) => avsAudioSample(audio, "osc", band, sampleWidth, channel),
+      getspec: (band, sampleWidth, channel) => avsAudioSample(audio, "spec", band, sampleWidth, channel)
+    });
+    vm.set("w", width);
+    vm.set("h", height);
+    vm.set("b", audio.beat ? 1 : 0);
+    vm.set("alpha", 0.5);
+    if (!this.initialized) {
+      execute7(this.programs[3], vm);
+      this.initialized = true;
+    }
+    execute7(this.programs[1], vm);
+    if (audio.beat) execute7(this.programs[2], vm);
+    const columns = clamp13(Math.trunc(this.config.gridWidth) + 1, 2, 256);
+    const rows = clamp13(Math.trunc(this.config.gridHeight) + 1, 2, 256);
+    const gridSize = columns * rows;
+    if (this.gridX.length !== gridSize) {
+      this.gridX = new Float64Array(gridSize);
+      this.gridY = new Float64Array(gridSize);
+      this.gridAlpha = new Float64Array(gridSize);
+    }
+    this.prepareAxes(width, height, columns, rows);
+    const radius = Math.sqrt(width * width + height * height) * 0.5;
+    for (let gy = 0; gy < rows; gy++) {
+      const screenY = gy * height / (rows - 1);
+      const normalizedY = (screenY - height * 0.5) * (2 / height);
+      for (let gx = 0; gx < columns; gx++) {
+        const screenX = gx * width / (columns - 1);
+        vm.set("x", (screenX - width * 0.5) * (2 / width));
+        vm.set("y", normalizedY);
+        vm.set("d", Math.hypot(screenX - width * 0.5, screenY - height * 0.5) / radius);
+        vm.set("r", Math.atan2(screenY - height * 0.5, screenX - width * 0.5) + Math.PI * 0.5);
+        execute7(this.programs[0], vm);
+        const index = gx + gy * columns;
+        if (this.config.rectangular) {
+          this.gridX[index] = (vm.get("x") + 1) * width * 0.5;
+          this.gridY[index] = (vm.get("y") + 1) * height * 0.5;
+        } else {
+          const distance = vm.get("d") * radius, angle = vm.get("r") - Math.PI * 0.5;
+          this.gridX[index] = width * 0.5 + Math.cos(angle) * distance;
+          this.gridY[index] = height * 0.5 + Math.sin(angle) * distance;
+        }
+        this.gridAlpha[index] = clamp13(vm.get("alpha"), 0, 1);
+      }
+    }
+    if (this.packed.length !== width * height * 2) this.packed = new Uint32Array(width * height * 2);
+    this.buildPackedMap(width, height, columns);
+    return { packed: this.packed, bilinear: this.config.bilinear, blend: this.config.blend };
+  }
+  buildPackedMap(width, height, columns) {
+    const bilinear3 = this.config.bilinear;
+    const maxX = Math.max(0, width - (bilinear3 ? 2 : 1));
+    const maxY = Math.max(0, height - (bilinear3 ? 2 : 1));
+    const spanX = Math.max(1, maxX), spanY = Math.max(1, maxY);
+    let index = 0;
+    for (let y = 0; y < height; y++) {
+      const cellY = this.cellY[y], fy = this.fractionY[y], inverseY = 1 - fy;
+      const row = cellY * columns;
+      for (let x = 0; x < width; x++, index++) {
+        const fx = this.fractionX[x], topLeft = this.cellX[x] + row;
+        const topRight = topLeft + 1, bottomLeft = topLeft + columns, bottomRight = bottomLeft + 1;
+        let mappedX = (this.gridX[topLeft] + (this.gridX[topRight] - this.gridX[topLeft]) * fx) * inverseY + (this.gridX[bottomLeft] + (this.gridX[bottomRight] - this.gridX[bottomLeft]) * fx) * fy;
+        let mappedY = (this.gridY[topLeft] + (this.gridY[topRight] - this.gridY[topLeft]) * fx) * inverseY + (this.gridY[bottomLeft] + (this.gridY[bottomRight] - this.gridY[bottomLeft]) * fx) * fy;
+        if (this.config.wrap) {
+          mappedX = (mappedX % spanX + spanX) % spanX;
+          mappedY = (mappedY % spanY + spanY) % spanY;
+        } else {
+          mappedX = clamp13(mappedX, 0, maxX);
+          mappedY = clamp13(mappedY, 0, maxY);
+        }
+        const ix = Math.trunc(mappedX), iy = Math.trunc(mappedY);
+        const sampleX = bilinear3 && width >= 2 ? Math.trunc((mappedX - ix) * 256) & 255 : 0;
+        const sampleY = bilinear3 && height >= 2 ? Math.trunc((mappedY - iy) * 256) & 255 : 0;
+        const rawAlpha = (this.gridAlpha[topLeft] + (this.gridAlpha[topRight] - this.gridAlpha[topLeft]) * fx) * inverseY + (this.gridAlpha[bottomLeft] + (this.gridAlpha[bottomRight] - this.gridAlpha[bottomLeft]) * fx) * fy;
+        const alpha = Math.trunc(clamp13(rawAlpha, 0, 1) * 255);
+        this.packed[index * 2] = ix + iy * width;
+        this.packed[index * 2 + 1] = sampleX | sampleY << 8 | alpha << 16;
+      }
+    }
+  }
+  prepareAxes(width, height, columns, rows) {
+    if (this.cellX.length !== width) {
+      this.cellX = new Uint16Array(width);
+      this.fractionX = new Float64Array(width);
+      for (let x = 0; x < width; x++) {
+        const c = x * (columns - 1) / width;
+        const cell = Math.min(columns - 2, Math.trunc(c));
+        this.cellX[x] = cell;
+        this.fractionX[x] = c - cell;
+      }
+    }
+    if (this.cellY.length !== height) {
+      this.cellY = new Uint16Array(height);
+      this.fractionY = new Float64Array(height);
+      for (let y = 0; y < height; y++) {
+        const c = y * (rows - 1) / height;
+        const cell = Math.min(rows - 2, Math.trunc(c));
+        this.cellY[y] = cell;
+        this.fractionY[y] = c - cell;
+      }
+    }
+  }
+};
+var AVS_ENHANCED_DYNAMIC_MOVEMENT_WGSL = (
+  /* wgsl */
+  `
+struct Params { width: u32, pixels: u32, bilinear: u32, blend: u32 };
+@group(0) @binding(0) var<storage, read> source: array<u32>;
+@group(0) @binding(1) var<storage, read_write> destination: array<u32>;
+@group(0) @binding(2) var<storage, read> map: array<u32>;
+@group(0) @binding(3) var<uniform> params: Params;
+fn avs_table(a:u32,b:u32)->u32 { var r=(a*b)/255u; let c=(a==147u&&(b==85u||b==170u))||(a==155u&&(b==51u||b==102u||b==153u||b==204u))||(a==171u&&(b==85u||b==170u))||(a==187u&&(b==75u||b==150u||b==165u))||(a==195u&&b==153u); if(c){r-=1u;} return r; }
+fn blend(a:u32,b:u32,alpha:u32)->u32 { let inv=255u-alpha; let lo=avs_table(a&255u,alpha)+avs_table(b&255u,inv); let mi=avs_table((a>>8u)&255u,alpha)+avs_table((b>>8u)&255u,inv); let hi=avs_table((a>>16u)&255u,alpha)+avs_table((b>>16u)&255u,inv); return lo|(mi<<8u)|(hi<<16u); }
+fn sample4(offset:u32,fx:u32,fy:u32)->u32 { let ix=255u-fx; let iy=255u-fy; let w=array<u32,4>(avs_table(ix,iy),avs_table(fx,iy),avs_table(ix,fy),avs_table(fx,fy)); let p=array<u32,4>(source[offset],source[offset+1u],source[offset+params.width],source[offset+params.width+1u]); var lo=0u;var mi=0u;var hi=0u;for(var i=0u;i<4u;i++){lo+=avs_table(p[i]&255u,w[i]);mi+=avs_table((p[i]>>8u)&255u,w[i]);hi+=avs_table((p[i]>>16u)&255u,w[i]);}return (lo&255u)|((mi&255u)<<8u)|((hi&255u)<<16u); }
+@compute @workgroup_size(256) fn dynamic_movement_main(@builtin(global_invocation_id) id:vec3u){let i=id.x;if(i>=params.pixels){return;}let offset=map[i*2u];let extra=map[i*2u+1u];var sampled=source[offset];if(params.bilinear!=0u){sampled=sample4(offset,extra&255u,(extra>>8u)&255u);}destination[i]=select(sampled,blend(sampled,source[i],(extra>>16u)&255u),params.blend!=0u);}
+`
+);
+var EnhancedDynamicMovementGpuPass = class {
+  constructor(device, generator, width, height) {
+    this.device = device;
+    this.generator = generator;
+    this.width = width;
+    this.height = height;
+    this.pipeline = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code: AVS_ENHANCED_DYNAMIC_MOVEMENT_WGSL }), entryPoint: "dynamic_movement_main" } });
+    this.map = device.createBuffer({ size: width * height * 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.params = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  }
+  capability = AVS_GPU_DYNAMIC_MOVEMENT_CAPABILITY;
+  pipeline;
+  map;
+  params;
+  groups = /* @__PURE__ */ new WeakMap();
+  update(audio) {
+    const map = this.generator.generate(audio, this.width, this.height);
+    this.device.queue.writeBuffer(this.map, 0, map.packed.buffer, map.packed.byteOffset, map.packed.byteLength);
+    this.device.queue.writeBuffer(this.params, 0, new Uint32Array([this.width, this.width * this.height, map.bilinear ? 1 : 0, map.blend ? 1 : 0]));
+  }
+  encode(context2) {
+    let targets = this.groups.get(context2.source);
+    if (!targets) {
+      targets = /* @__PURE__ */ new WeakMap();
+      this.groups.set(context2.source, targets);
+    }
+    let group = targets.get(context2.target);
+    if (!group) {
+      group = context2.device.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: context2.source } }, { binding: 1, resource: { buffer: context2.target } }, { binding: 2, resource: { buffer: this.map } }, { binding: 3, resource: { buffer: this.params } }] });
+      targets.set(context2.target, group);
+    }
+    const pass = context2.encoder.beginComputePass();
+    pass.setPipeline(this.pipeline);
+    pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(Math.ceil(context2.width * context2.height / 256));
+    pass.end();
+  }
+  destroy() {
+    this.map.destroy();
+    this.params.destroy();
+  }
+};
+function compileOrNull6(source) {
+  if (!source.trim()) return null;
+  try {
+    return compileAvsEel(source);
+  } catch {
+    return null;
+  }
+}
+function execute7(program, vm) {
+  return program ? vm.execute(program) : 0;
+}
+function clamp13(value, min, max) {
+  return value < min ? min : value > max ? max : value;
+}
+
+// src/avs/movement-eel-gpu-plan.ts
+function planTerminalEnhancedMovementEel(preset) {
+  if (!preset.clearEveryFrame) return empty3(preset, "root framebuffer feedback requires classic custom Movement");
+  const component = preset.components.at(-1);
+  if (!component || component.list || component.apeId || component.effectId !== 15) return empty3(preset, "no root-terminal custom Movement");
+  const config = decodeAvsMovement(component.payload);
+  const compiled = compileEnhancedMovementEelGpu(config);
+  if (!compiled.eligible) return empty3(preset, `custom Movement remains classic CPU: ${compiled.reason}`);
+  return {
+    cpuPreset: { ...preset, components: preset.components.slice(0, -1) },
+    component,
+    config,
+    program: compiled.program,
+    reason: "root-terminal pure inverse custom Movement map + exact packed-u32 sampling resident on WebGPU (120 lane)"
+  };
+}
+function empty3(preset, reason) {
+  return { cpuPreset: preset, component: null, config: null, program: null, reason };
+}
 
 // src/avs-render.worker.ts
 var scope = globalThis;
@@ -7278,6 +11000,19 @@ var context = null;
 var image = null;
 var imageWords = null;
 var gpuGraph = null;
+var originalPreset = null;
+var gpuPlan = null;
+var gpuPasses = [];
+var convolutionPlan = null;
+var enhancedPlan = null;
+var enhancedPass = null;
+var dynamicMovementPlan = null;
+var dynamicMovementPass = null;
+var dynamicMovementGenerator = null;
+var dynamicMovementResidentState = null;
+var movementEelPlan = null;
+var movementEelPass = null;
+var gpuLane = "exact";
 scope.onmessage = (event) => {
   void handle(event.data).catch((error) => {
     scope.postMessage({
@@ -7292,6 +11027,21 @@ async function handle(message) {
   if (message.type === "clear") {
     generation = message.generation;
     runtime = null;
+    originalPreset = null;
+    gpuPlan = null;
+    gpuPasses = [];
+    convolutionPlan = null;
+    enhancedPlan = null;
+    enhancedPass?.destroy();
+    enhancedPass = null;
+    dynamicMovementPass?.destroy();
+    dynamicMovementPass = null;
+    dynamicMovementPlan = null;
+    dynamicMovementGenerator = null;
+    dynamicMovementResidentState = null;
+    movementEelPass?.destroy();
+    movementEelPass = null;
+    movementEelPlan = null;
     gpuGraph?.destroy();
     gpuGraph = null;
     surface = null;
@@ -7305,11 +11055,71 @@ async function handle(message) {
     const resolver = await loadBundledAvsBitmapResolver();
     if (generation !== message.generation) return;
     const registry = createAvsCompatibilityRegistry({}, { bitmapResolver: resolver });
-    runtime = new AvsCompatibilityRuntime(message.preset, message.width, message.height, registry);
+    originalPreset = parseAvsPreset(message.preset);
+    gpuLane = message.gpuLane;
+    await ensureSurface(message.width, message.height, gpuLane);
+    dynamicMovementPlan = gpuGraph && gpuLane === "120" ? planTerminalEnhancedDynamicMovement(originalPreset) : null;
+    dynamicMovementGenerator = null;
+    dynamicMovementResidentState = null;
+    const dynamicInput = dynamicMovementPlan?.component ? dynamicMovementPlan.cpuPreset : originalPreset;
+    enhancedPlan = gpuGraph && gpuLane === "120" ? planTerminalEnhancedSuperScope(dynamicInput) : null;
+    const exactInput = enhancedPlan?.component ? enhancedPlan.cpuPreset : dynamicInput;
+    movementEelPlan = gpuGraph && gpuLane === "120" ? planTerminalEnhancedMovementEel(exactInput) : null;
+    const exactGpuInput = movementEelPlan?.component ? movementEelPlan.cpuPreset : exactInput;
+    gpuPlan = gpuGraph ? planTerminalExactGpuPasses(exactGpuInput) : {
+      cpuPreset: originalPreset,
+      passes: [],
+      blurPasses: [],
+      extractedComponents: 0,
+      fusedPointwiseOperations: 0,
+      movementPasses: 0,
+      rotoBlitterPasses: 0,
+      blitterFeedbackPasses: 0,
+      reason: "WebGPU unavailable; exact CPU fallback"
+    };
+    convolutionPlan = gpuGraph ? planTerminalExactGpuConvolutions(gpuPlan.cpuPreset) : null;
+    runtime = new AvsCompatibilityRuntime(convolutionPlan?.cpuPreset ?? gpuPlan.cpuPreset, message.width, message.height, registry);
+    compileGpuPasses();
     const warmup = runtime.render(void 0, true);
-    await ensureSurface(warmup.framebuffer.width, warmup.framebuffer.height);
+    movementEelPass?.prepare();
     if (generation !== message.generation) return;
-    scope.postMessage({ type: "ready", generation, unsupported: warmup.stats.unsupported });
+    scope.postMessage({ type: "ready", generation, unsupported: warmup.stats.unsupported, preset: originalPreset });
+    return;
+  }
+  if (message.type === "controls") {
+    if (message.generation !== generation || !runtime) return;
+    if (message.controls.length > 0 && ((gpuPlan?.extractedComponents ?? 0) > 0 || (convolutionPlan?.extractedComponents ?? 0) > 0 || enhancedPlan?.component || dynamicMovementPlan?.component || movementEelPlan?.component) && originalPreset) {
+      const controls = message.controls;
+      enhancedPass?.destroy();
+      enhancedPass = null;
+      enhancedPlan = null;
+      dynamicMovementPass?.destroy();
+      dynamicMovementPass = null;
+      dynamicMovementPlan = null;
+      dynamicMovementGenerator = null;
+      dynamicMovementResidentState = null;
+      movementEelPass?.destroy();
+      movementEelPass = null;
+      movementEelPlan = null;
+      convolutionPlan = null;
+      runtime = new AvsCompatibilityRuntime(originalPreset, runtime.framebuffer.width, runtime.framebuffer.height, runtime.registry);
+      runtime.setControls(controls);
+      gpuPlan = {
+        cpuPreset: originalPreset,
+        passes: [],
+        blurPasses: [],
+        extractedComponents: 0,
+        fusedPointwiseOperations: 0,
+        movementPasses: 0,
+        rotoBlitterPasses: 0,
+        blitterFeedbackPasses: 0,
+        reason: "component controls require exact CPU graph"
+      };
+      gpuPasses = [];
+    } else {
+      runtime.setControls(message.controls);
+    }
+    scope.postMessage({ type: "controls-applied", generation, revision: message.revision });
     return;
   }
   if (message.generation !== generation || !runtime) {
@@ -7329,19 +11139,74 @@ async function handle(message) {
   }
   const started = performance.now();
   runtime.resize(message.width, message.height);
+  await ensureSurface(message.width, message.height, gpuLane);
+  const expectedGpuPasses = expectedExactGpuPasses() + (movementEelPlan?.component ? 1 : 0) + (enhancedPlan?.component ? 1 : 0) + (dynamicMovementPlan?.component ? 1 : 0);
+  if (gpuGraph && gpuPlan && gpuPasses.length !== expectedGpuPasses) {
+    compileGpuPasses();
+  } else if (!gpuGraph && ((gpuPlan?.extractedComponents ?? 0) > 0 || (convolutionPlan?.extractedComponents ?? 0) > 0 || enhancedPlan?.component || dynamicMovementPlan?.component || movementEelPlan?.component) && originalPreset) {
+    enhancedPass?.destroy();
+    enhancedPass = null;
+    enhancedPlan = null;
+    dynamicMovementPass?.destroy();
+    dynamicMovementPass = null;
+    dynamicMovementPlan = null;
+    dynamicMovementGenerator = null;
+    dynamicMovementResidentState = null;
+    movementEelPass?.destroy();
+    movementEelPass = null;
+    movementEelPlan = null;
+    convolutionPlan = null;
+    runtime = new AvsCompatibilityRuntime(originalPreset, message.width, message.height, runtime.registry);
+    gpuPlan = {
+      cpuPreset: originalPreset,
+      passes: [],
+      blurPasses: [],
+      extractedComponents: 0,
+      fusedPointwiseOperations: 0,
+      movementPasses: 0,
+      rotoBlitterPasses: 0,
+      blitterFeedbackPasses: 0,
+      reason: "WebGPU unavailable; exact CPU fallback"
+    };
+    gpuPasses = [];
+  }
   const pcm = new Float32Array(message.pcm);
   const effectStarted = performance.now();
-  const frame = runtime.renderPcm({ left: pcm.subarray(0, 576), right: pcm.subarray(576) });
+  const audio = runtime.pcmAudio.analyse({ left: pcm.subarray(0, 576), right: pcm.subarray(576) });
+  let frame = runtime.render(audio);
+  if (movementEelPass) {
+    try {
+      movementEelPass.update(audio);
+    } catch (error) {
+      disableEnhancedMovementEel(error instanceof Error ? error.message : String(error));
+      frame = runtime.render(audio);
+    }
+  }
+  if (enhancedPass) {
+    try {
+      enhancedPass.updateFrame(audio, message.width, message.height);
+    } catch (error) {
+      disableEnhancedSuperScope(error instanceof Error ? error.message : String(error));
+      frame = runtime.render(audio);
+    }
+  }
+  if (dynamicMovementPass) {
+    try {
+      dynamicMovementPass.update(audio);
+    } catch (error) {
+      disableEnhancedDynamicMovement(error instanceof Error ? error.message : String(error));
+      frame = runtime.render(audio);
+    }
+  }
   const effectMs = performance.now() - effectStarted;
-  await ensureSurface(frame.framebuffer.width, frame.framebuffer.height);
   let presenter;
   let uploadMs = 0;
   let encodeSubmitMs = 0;
   if (gpuGraph) {
-    const timing = gpuGraph.uploadAndPresent(frame.framebuffer.pixels);
+    const timing = gpuGraph.uploadExecuteAndPresent(frame.framebuffer.pixels, gpuPasses);
     uploadMs = timing.uploadMs;
     encodeSubmitMs = timing.encodeSubmitMs;
-    presenter = "webgpu-exact";
+    presenter = enhancedPass || dynamicMovementPass || movementEelPass ? "webgpu-enhanced" : "webgpu-exact";
   } else {
     copyAvsPixelsToRgba(frame.framebuffer.pixels, image.data, imageWords);
     context.putImageData(image, 0, 0);
@@ -7362,19 +11227,34 @@ async function handle(message) {
     effectMs,
     presenter,
     uploadMs,
-    encodeSubmitMs
+    encodeSubmitMs,
+    gpuEffectPasses: reportedGpuEffectPasses(),
+    gpuEffectComponents: (gpuPlan?.extractedComponents ?? 0) + (convolutionPlan?.extractedComponents ?? 0) + (movementEelPass ? 1 : 0) + (enhancedPass ? 1 : 0) + (dynamicMovementPass ? 1 : 0),
+    gpuFusedPointwiseOperations: gpuPlan?.fusedPointwiseOperations ?? 0,
+    gpuEffectPlan: combinedGpuPlanReason(),
+    gpuEnhancedSuperScope: enhancedPass !== null,
+    gpuEnhancedDynamicMovement: dynamicMovementPass !== null,
+    gpuEnhancedDynamicMovementResidentMap: dynamicMovementPass instanceof EnhancedDynamicMovementResidentGpuPass,
+    gpuEnhancedMovementEel: movementEelPass !== null
   }, [message.pcm, bitmap]);
 }
-async function ensureSurface(width, height) {
-  if (surface?.width === width && surface.height === height) return;
+async function ensureSurface(width, height, lane) {
+  if (surface?.width === width && surface.height === height && (!gpuGraph || gpuGraph.lane === lane)) return;
+  enhancedPass?.destroy();
+  enhancedPass = null;
+  dynamicMovementPass?.destroy();
+  dynamicMovementPass = null;
+  movementEelPass?.destroy();
+  movementEelPass = null;
   gpuGraph?.destroy();
   gpuGraph = null;
+  gpuPasses = [];
   surface = new OffscreenCanvas(width, height);
   context = null;
   image = null;
   imageWords = null;
   try {
-    gpuGraph = await PackedAvsGpuFrameGraph.create({ canvas: surface, width, height });
+    gpuGraph = await PackedAvsGpuFrameGraph.create({ canvas: surface, width, height, lane });
   } catch {
     gpuGraph = null;
     surface = new OffscreenCanvas(width, height);
@@ -7385,4 +11265,262 @@ async function ensureSurface(width, height) {
     image = new ImageData(width, height);
     imageWords = new Uint32Array(image.data.buffer, image.data.byteOffset, width * height);
   }
+}
+function compileGpuPasses() {
+  enhancedPass?.destroy();
+  enhancedPass = null;
+  dynamicMovementPass?.destroy();
+  dynamicMovementPass = null;
+  movementEelPass?.destroy();
+  movementEelPass = null;
+  if (!gpuGraph || !gpuPlan || !runtime) {
+    gpuPasses = [];
+    return;
+  }
+  let passes;
+  try {
+    passes = compileConvolutionAndExactPasses();
+  } catch (error) {
+    disableGpuConvolution(error instanceof Error ? error.message : String(error));
+    return;
+  }
+  const movementPlan = movementEelPlan;
+  if (movementPlan?.component && movementPlan.config && movementPlan.program) {
+    try {
+      const compiled = gpuGraph.compileExternalPass((device) => new EnhancedMovementEelGpuPass(
+        device,
+        new EnhancedMovementEelGpuState(movementPlan.config, movementPlan.program, runtime.registry.eelGlobal),
+        runtime.framebuffer.width,
+        runtime.framebuffer.height
+      ));
+      if (!(compiled instanceof EnhancedMovementEelGpuPass)) throw new TypeError("Custom Movement EEL pass factory returned an unexpected pass");
+      movementEelPass = compiled;
+      passes.push(compiled);
+    } catch (error) {
+      disableEnhancedMovementEel(error instanceof Error ? error.message : String(error));
+      return;
+    }
+  }
+  const plan = enhancedPlan;
+  if (plan?.component && plan.config && plan.program) {
+    try {
+      const compiled = gpuGraph.compileExternalPass((device) => new EnhancedSuperScopeGpuTerminalPass(
+        device,
+        plan.config,
+        plan.program,
+        runtime.registry.eelGlobal,
+        hashPath14(plan.component.path)
+      ));
+      if (!(compiled instanceof EnhancedSuperScopeGpuTerminalPass)) {
+        throw new TypeError("Enhanced SuperScope pass factory returned an unexpected pass");
+      }
+      enhancedPass = compiled;
+      passes.push(compiled);
+    } catch (error) {
+      disableEnhancedSuperScope(error instanceof Error ? error.message : String(error));
+      return;
+    }
+  }
+  const dynamicPlan = dynamicMovementPlan;
+  if (dynamicPlan?.component && dynamicPlan.config) {
+    try {
+      const compiled = dynamicPlan.residentProgram ? gpuGraph.compileExternalPass((device) => {
+        const state = dynamicMovementResidentState ?? new EnhancedDynamicMovementResidentState(
+          dynamicPlan.config,
+          dynamicPlan.residentProgram,
+          runtime.registry.eelGlobal,
+          hashPath14(dynamicPlan.component.path)
+        );
+        dynamicMovementResidentState = state;
+        return new EnhancedDynamicMovementResidentGpuPass(device, state, runtime.framebuffer.width, runtime.framebuffer.height);
+      }) : gpuGraph.compileExternalPass((device) => {
+        const generator = dynamicMovementGenerator ?? new AvsDynamicMovementGpuMapGenerator(
+          dynamicPlan.config,
+          runtime.registry.eelGlobal,
+          hashPath14(dynamicPlan.component.path)
+        );
+        dynamicMovementGenerator = generator;
+        return new EnhancedDynamicMovementGpuPass(device, generator, runtime.framebuffer.width, runtime.framebuffer.height);
+      });
+      if (!(compiled instanceof EnhancedDynamicMovementGpuPass) && !(compiled instanceof EnhancedDynamicMovementResidentGpuPass)) {
+        throw new TypeError("Dynamic Movement pass factory returned an unexpected pass");
+      }
+      dynamicMovementPass = compiled;
+      passes.push(compiled);
+    } catch (error) {
+      disableEnhancedDynamicMovement(error instanceof Error ? error.message : String(error));
+      return;
+    }
+  }
+  gpuPasses = passes;
+}
+function disableEnhancedMovementEel(reason) {
+  movementEelPass?.destroy();
+  movementEelPass = null;
+  movementEelPlan = null;
+  enhancedPass?.destroy();
+  enhancedPass = null;
+  enhancedPlan = null;
+  dynamicMovementPass?.destroy();
+  dynamicMovementPass = null;
+  dynamicMovementPlan = null;
+  dynamicMovementGenerator = null;
+  dynamicMovementResidentState = null;
+  convolutionPlan = null;
+  if (!originalPreset || !runtime) {
+    gpuPasses = [];
+    return;
+  }
+  runtime = new AvsCompatibilityRuntime(originalPreset, runtime.framebuffer.width, runtime.framebuffer.height, runtime.registry);
+  gpuPlan = {
+    cpuPreset: originalPreset,
+    passes: [],
+    blurPasses: [],
+    extractedComponents: 0,
+    fusedPointwiseOperations: 0,
+    movementPasses: 0,
+    rotoBlitterPasses: 0,
+    blitterFeedbackPasses: 0,
+    reason: `enhanced custom Movement EEL failed closed: ${reason}`
+  };
+  gpuPasses = [];
+}
+function disableEnhancedDynamicMovement(reason) {
+  dynamicMovementPass?.destroy();
+  dynamicMovementPass = null;
+  dynamicMovementPlan = null;
+  dynamicMovementGenerator = null;
+  dynamicMovementResidentState = null;
+  movementEelPass?.destroy();
+  movementEelPass = null;
+  movementEelPlan = null;
+  enhancedPass?.destroy();
+  enhancedPass = null;
+  enhancedPlan = null;
+  convolutionPlan = null;
+  if (!originalPreset || !runtime) {
+    gpuPasses = [];
+    return;
+  }
+  runtime = new AvsCompatibilityRuntime(originalPreset, runtime.framebuffer.width, runtime.framebuffer.height, runtime.registry);
+  gpuPlan = {
+    cpuPreset: originalPreset,
+    passes: [],
+    blurPasses: [],
+    extractedComponents: 0,
+    fusedPointwiseOperations: 0,
+    movementPasses: 0,
+    rotoBlitterPasses: 0,
+    blitterFeedbackPasses: 0,
+    reason: `enhanced Dynamic Movement failed closed: ${reason}`
+  };
+  gpuPasses = [];
+}
+function disableEnhancedSuperScope(reason) {
+  enhancedPass?.destroy();
+  enhancedPass = null;
+  enhancedPlan = null;
+  dynamicMovementPass?.destroy();
+  dynamicMovementPass = null;
+  dynamicMovementPlan = null;
+  dynamicMovementGenerator = null;
+  dynamicMovementResidentState = null;
+  movementEelPass?.destroy();
+  movementEelPass = null;
+  movementEelPlan = null;
+  if (!originalPreset || !runtime) {
+    gpuPasses = [];
+    return;
+  }
+  const width = runtime.framebuffer.width;
+  const height = runtime.framebuffer.height;
+  gpuPlan = gpuGraph ? planTerminalExactGpuPasses(originalPreset) : {
+    cpuPreset: originalPreset,
+    passes: [],
+    blurPasses: [],
+    extractedComponents: 0,
+    fusedPointwiseOperations: 0,
+    movementPasses: 0,
+    rotoBlitterPasses: 0,
+    blitterFeedbackPasses: 0,
+    reason: "WebGPU unavailable; exact CPU fallback"
+  };
+  convolutionPlan = gpuGraph ? planTerminalExactGpuConvolutions(gpuPlan.cpuPreset) : null;
+  runtime = new AvsCompatibilityRuntime(convolutionPlan?.cpuPreset ?? gpuPlan.cpuPreset, width, height, runtime.registry);
+  gpuPasses = gpuGraph ? compileConvolutionAndExactPasses() : [];
+  enhancedPlan = {
+    cpuPreset: originalPreset,
+    component: null,
+    config: null,
+    program: null,
+    reason: `enhanced SuperScope failed closed: ${reason}`
+  };
+}
+function disableGpuConvolution(reason) {
+  convolutionPlan = null;
+  enhancedPass?.destroy();
+  enhancedPass = null;
+  enhancedPlan = null;
+  dynamicMovementPass?.destroy();
+  dynamicMovementPass = null;
+  dynamicMovementPlan = null;
+  dynamicMovementGenerator = null;
+  dynamicMovementResidentState = null;
+  movementEelPass?.destroy();
+  movementEelPass = null;
+  movementEelPlan = null;
+  if (!originalPreset || !runtime) {
+    gpuPasses = [];
+    return;
+  }
+  runtime = new AvsCompatibilityRuntime(originalPreset, runtime.framebuffer.width, runtime.framebuffer.height, runtime.registry);
+  gpuPlan = {
+    cpuPreset: originalPreset,
+    passes: [],
+    blurPasses: [],
+    extractedComponents: 0,
+    fusedPointwiseOperations: 0,
+    movementPasses: 0,
+    rotoBlitterPasses: 0,
+    blitterFeedbackPasses: 0,
+    reason: `GPU convolution failed closed: ${reason}`
+  };
+  gpuPasses = [];
+}
+function combinedGpuPlanReason() {
+  const fused = fusedConvolutionPointwiseOperations();
+  const reasons = [convolutionPlan?.configs.length ? convolutionPlan.reason : "", fused ? `${fused} pointwise operation${fused === 1 ? "" : "s"} fused into final convolution write` : "", gpuPlan?.reason ?? "", movementEelPass ? movementEelPlan?.reason ?? "" : "", enhancedPass ? enhancedPlan?.reason ?? "" : "", dynamicMovementPass ? dynamicMovementPlan?.reason ?? "" : ""].filter(Boolean);
+  return reasons.join("; ") || enhancedPlan?.reason || convolutionPlan?.reason || "exact CPU fallback";
+}
+function fusedConvolutionPointwiseOperations() {
+  if (!convolutionPlan?.configs.length || gpuPlan?.passes[0]?.kind !== "pointwise") return 0;
+  return gpuPlan.passes[0].operations.length;
+}
+function expectedExactGpuPasses() {
+  return (convolutionPlan?.configs.length ?? 0) + (gpuPlan?.passes.length ?? 0) - (fusedConvolutionPointwiseOperations() ? 1 : 0);
+}
+function reportedGpuEffectPasses() {
+  return gpuPasses.length + (movementEelPass ? Math.max(0, movementEelPass.lastEncodedPasses - 1) : 0) + (dynamicMovementPass instanceof EnhancedDynamicMovementResidentGpuPass ? 1 : 0);
+}
+function compileConvolutionAndExactPasses() {
+  if (!gpuGraph || !gpuPlan || !runtime) return [];
+  const configs = convolutionPlan?.configs ?? [];
+  const first = gpuPlan.passes[0];
+  const fused = configs.length && first?.kind === "pointwise" ? first.operations : [];
+  const passes = configs.map((config, index) => gpuGraph.compileExternalPass((device) => new ExactAvsConvolutionGpuPass(
+    device,
+    config,
+    runtime.framebuffer.width,
+    runtime.framebuffer.height,
+    false,
+    index + 1 === configs.length ? fused : []
+  )));
+  const remaining = fused.length ? gpuPlan.passes.slice(1) : gpuPlan.passes;
+  passes.push(...remaining.map((config) => gpuGraph.compileExactPass(config)));
+  return passes;
+}
+function hashPath14(path) {
+  let hash = 2166136261;
+  for (let index = 0; index < path.length; index++) hash = Math.imul(hash ^ path.charCodeAt(index), 16777619);
+  return hash >>> 0;
 }

@@ -13,10 +13,11 @@
   top: 1.25rem;
   right: 1.25rem;
   z-index: 10;
-  width: min(25.5rem, calc(100vw - 2.5rem));
+  width: min(62rem, calc(100vw - 2.5rem));
   max-height: calc(100vh - 2.5rem);
   display: flex;
   flex-direction: column;
+  box-sizing: border-box;
   border: 1px solid var(--ui-line);
   border-radius: 12px;
   background: var(--ui-panel);
@@ -174,6 +175,48 @@
   min-width: 0;
   font-weight: 600;
 }
+.ui-preset-picker {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: stretch;
+  gap: .28rem;
+  min-width: 0;
+}
+.ui-preset-icon-button {
+  width: 2rem;
+  min-height: 2rem;
+  padding: 0;
+  border: 1px solid var(--ui-line);
+  border-radius: 6px;
+  background: var(--ui-sunk);
+  color: var(--ui-fg);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+.ui-preset-icon-button:hover:not(:disabled),
+.ui-preset-icon-button:focus-visible {
+  border-color: var(--ui-accent);
+  outline: none;
+}
+.ui-preset-icon-button:disabled {
+  opacity: .32;
+  cursor: default;
+}
+.ui-preset-icon-button.is-destructive {
+  color: color-mix(in srgb, #ff796f 78%, var(--ui-fg));
+}
+.ui-preset-icon-button.is-destructive:hover:not(:disabled),
+.ui-preset-icon-button.is-destructive:focus-visible {
+  border-color: #ff796f;
+}
+.ui-preset-bank-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: .35rem;
+}
 .ui-auto {
   display: inline-flex;
   align-items: center;
@@ -194,6 +237,39 @@
   display: flex;
   flex-direction: column;
   gap: .45rem;
+}
+.ui-list[hidden] {
+  display: none;
+}
+#aaavs-ui.is-avs-editor .ui-layers-section {
+  padding: 0;
+  border-bottom: 0;
+}
+#aaavs-ui.is-avs-editor .ui-layers-section > .ui-legend {
+  display: none;
+}
+.ui-alternate-layer-editor {
+  min-width: 0;
+}
+.ui-avs-loading {
+  min-height: 16rem;
+  display: grid;
+  place-items: center;
+  padding: 2rem;
+  color: var(--ui-dim);
+  background:
+    linear-gradient(
+      90deg,
+      transparent 49.8%,
+      rgba(255, 61, 129, .12) 50%,
+      transparent 50.2%),
+    var(--ui-sunk);
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.ui-avs-loading.is-error {
+  color: var(--ui-accent);
 }
 .ui-empty {
   padding: .6rem .2rem;
@@ -447,6 +523,15 @@
   }
   .ui-fields {
     grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 420px) {
+  .ui-preset-row {
+    grid-template-columns: 1fr;
+    gap: .25rem;
+  }
+  .ui-preset-picker {
+    width: 100%;
   }
 }
 @media (prefers-reduced-motion: reduce) {

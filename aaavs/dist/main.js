@@ -61,6 +61,285 @@ function resize(gpu2, cssW, cssH, dpr) {
   return true;
 }
 
+// src/audio-features.ts
+var PERCEPTUAL_BAND_EDGES_HZ = [
+  0,
+  125,
+  250,
+  500,
+  750,
+  1e3,
+  1500,
+  2500,
+  4e3,
+  6e3,
+  8500,
+  12e3,
+  2e4
+];
+var PERCEPTUAL_BAND_COUNT = PERCEPTUAL_BAND_EDGES_HZ.length - 1;
+var ONSET_CLASS_NAMES = [
+  null,
+  "kick",
+  "snare",
+  "hat",
+  "tonal"
+];
+var ONSET_CLASS_KICK = 1;
+var ONSET_CLASS_SNARE = 2;
+var ONSET_CLASS_HAT = 3;
+var ONSET_CLASS_TONAL = 4;
+var AUDIO_FEATURE_OFFSETS = Object.freeze({
+  time: 0,
+  flux: 1,
+  threshold: 2,
+  level: 3,
+  crest: 4,
+  pan: 5,
+  width: 6,
+  centroid: 7,
+  flatness: 8,
+  publicBands: 9,
+  onsetStrength: 14,
+  onsetClass: 15,
+  perceptualBands: 16,
+  perceptualFlux: 16 + PERCEPTUAL_BAND_COUNT
+});
+var AUDIO_FEATURE_FLOATS = 16 + PERCEPTUAL_BAND_COUNT * 2;
+var PUBLIC_EDGES = [0, 80, 250, 2e3, 8e3, 2e4];
+var PUBLIC_GAINS = [1.6, 1.5, 2.2, 3, 3];
+var PUBLIC_BAND_COUNT = 5;
+var HISTORY_SECONDS = 1.1;
+var WARMUP_SECONDS = 0.25;
+var THRESHOLD_SIGMA = 1.55;
+var FLUX_FLOOR = 0.012;
+var MIN_GAP_SECONDS = 0.09;
+var WHITEN_FLOOR = 0.02;
+var WHITEN_DECAY_PER_SECOND = 0.36;
+var ENERGY_ATTACK_SECONDS = 0.012;
+var ENERGY_RELEASE_SECONDS = 0.18;
+var FLUX_ATTACK_SECONDS = 4e-3;
+var FLUX_RELEASE_SECONDS = 0.085;
+var EMPTY_TIME = -1e9;
+var SPECTRUM_MIN_DB = -100;
+var SPECTRUM_DB_RANGE = 70;
+var AdaptiveMultibandDetector = class {
+  result = {
+    flux: 0,
+    threshold: 0,
+    onsetStrength: 0,
+    onsetClassCode: 0,
+    bands: new Float32Array(PERCEPTUAL_BAND_COUNT),
+    bandFlux: new Float32Array(PERCEPTUAL_BAND_COUNT),
+    publicBands: new Float32Array(PUBLIC_BAND_COUNT)
+  };
+  bandStart = new Int16Array(PERCEPTUAL_BAND_COUNT);
+  bandEnd = new Int16Array(PERCEPTUAL_BAND_COUNT);
+  publicWeights = new Float32Array(PUBLIC_BAND_COUNT * PERCEPTUAL_BAND_COUNT);
+  publicWeightSums = new Float32Array(PUBLIC_BAND_COUNT);
+  energy = new Float32Array(PERCEPTUAL_BAND_COUNT);
+  classificationEnergy = new Float32Array(PERCEPTUAL_BAND_COUNT);
+  positiveFlux = new Float32Array(PERCEPTUAL_BAND_COUNT);
+  peak = new Float32Array(PERCEPTUAL_BAND_COUNT);
+  previous = new Float32Array(PERCEPTUAL_BAND_COUNT);
+  linearMagnitude = new Float32Array(256);
+  historyTime;
+  historyFlux;
+  historyCapacity;
+  historyHead = 0;
+  historyCount = 0;
+  historySum = 0;
+  historySquareSum = 0;
+  historyFirstTime = EMPTY_TIME;
+  lastOnset = EMPTY_TIME;
+  activeBands = 0;
+  constructor(sampleRate, spectrumBins, maximumFramesPerSecond = 1e3) {
+    const nyquist = Math.max(1, sampleRate * 0.5);
+    for (let value = 0; value < 256; value++) {
+      const db = SPECTRUM_MIN_DB + value / 255 * SPECTRUM_DB_RANGE;
+      this.linearMagnitude[value] = Math.pow(10, db / 20);
+    }
+    for (let band = 0; band < PERCEPTUAL_BAND_COUNT; band++) {
+      const lo = PERCEPTUAL_BAND_EDGES_HZ[band];
+      const hi = Math.min(nyquist, PERCEPTUAL_BAND_EDGES_HZ[band + 1]);
+      const start = Math.min(spectrumBins, Math.max(0, Math.floor(lo / nyquist * spectrumBins)));
+      const end = hi > lo ? Math.min(spectrumBins, Math.max(start + 1, Math.ceil(hi / nyquist * spectrumBins))) : start;
+      this.bandStart[band] = start;
+      this.bandEnd[band] = end;
+      if (end > start) this.activeBands++;
+      const perceptualHi = PERCEPTUAL_BAND_EDGES_HZ[band + 1];
+      for (let pub = 0; pub < PUBLIC_BAND_COUNT; pub++) {
+        const overlap = Math.max(
+          0,
+          Math.min(perceptualHi, PUBLIC_EDGES[pub + 1]) - Math.max(lo, PUBLIC_EDGES[pub])
+        );
+        const weight = overlap / Math.max(1, perceptualHi - lo);
+        this.publicWeights[pub * PERCEPTUAL_BAND_COUNT + band] = weight;
+        this.publicWeightSums[pub] = this.publicWeightSums[pub] + weight;
+      }
+    }
+    this.historyCapacity = Math.max(32, Math.ceil(HISTORY_SECONDS * maximumFramesPerSecond) + 4);
+    this.historyTime = new Float32Array(this.historyCapacity);
+    this.historyFlux = new Float32Array(this.historyCapacity);
+    this.reset();
+  }
+  reset() {
+    this.result.flux = 0;
+    this.result.threshold = 0;
+    this.result.onsetStrength = 0;
+    this.result.onsetClassCode = 0;
+    this.result.bands.fill(0);
+    this.result.bandFlux.fill(0);
+    this.result.publicBands.fill(0);
+    this.energy.fill(0);
+    this.classificationEnergy.fill(0);
+    this.positiveFlux.fill(0);
+    this.peak.fill(WHITEN_FLOOR);
+    this.previous.fill(0);
+    this.historyTime.fill(EMPTY_TIME);
+    this.historyFlux.fill(0);
+    this.historyHead = 0;
+    this.historyCount = 0;
+    this.historySum = 0;
+    this.historySquareSum = 0;
+    this.historyFirstTime = EMPTY_TIME;
+    this.lastOnset = EMPTY_TIME;
+  }
+  analyse(spectrum, scale, time, dt, flatness) {
+    const safeDt = Math.max(1e-5, Math.min(0.25, dt));
+    const peakDecay = Math.pow(WHITEN_DECAY_PER_SECOND, safeDt);
+    let flux = 0;
+    let active = 0;
+    for (let band = 0; band < PERCEPTUAL_BAND_COUNT; band++) {
+      const start = this.bandStart[band];
+      const end = Math.min(this.bandEnd[band], spectrum.length);
+      let square = 0;
+      let linearSquare = 0;
+      for (let bin = start; bin < end; bin++) {
+        const raw = (spectrum[bin] ?? 0) * scale;
+        const quantized = Math.floor(Math.max(0, Math.min(1, raw)) * 255 + 1e-6);
+        const value = quantized / 255;
+        square += value * value;
+        const linear = this.linearMagnitude[quantized];
+        linearSquare += linear * linear;
+      }
+      const energy = end > start ? Math.sqrt(square / (end - start)) : 0;
+      this.energy[band] = energy;
+      this.classificationEnergy[band] = end > start ? Math.sqrt(linearSquare / (end - start)) : 0;
+      const oldEnvelope = this.result.bands[band];
+      const energyTau = energy > oldEnvelope ? ENERGY_ATTACK_SECONDS : ENERGY_RELEASE_SECONDS;
+      const energyCoeff = Math.exp(-safeDt / energyTau);
+      this.result.bands[band] = energy + (oldEnvelope - energy) * energyCoeff;
+      const peak = Math.max(energy, this.peak[band] * peakDecay, WHITEN_FLOOR);
+      this.peak[band] = peak;
+      const normalised = energy / peak;
+      const positive2 = Math.max(0, normalised - this.previous[band]);
+      this.positiveFlux[band] = positive2;
+      this.previous[band] = normalised;
+      const oldFlux = this.result.bandFlux[band];
+      const fluxTau = positive2 > oldFlux ? FLUX_ATTACK_SECONDS : FLUX_RELEASE_SECONDS;
+      const fluxCoeff = Math.exp(-safeDt / fluxTau);
+      this.result.bandFlux[band] = positive2 + (oldFlux - positive2) * fluxCoeff;
+      if (end > start) {
+        flux += positive2;
+        active++;
+      }
+    }
+    flux /= Math.max(1, active);
+    this.expireHistory(time);
+    const mean = this.historyCount > 0 ? this.historySum / this.historyCount : 0;
+    const variance = this.historyCount > 0 ? Math.max(0, this.historySquareSum / this.historyCount - mean * mean) : 0;
+    const threshold = mean + THRESHOLD_SIGMA * Math.sqrt(variance);
+    const warmed = this.historyFirstTime > EMPTY_TIME * 0.5 && time - this.historyFirstTime >= WARMUP_SECONDS;
+    let onsetStrength = 0;
+    let onsetClassCode = 0;
+    if (warmed && flux > threshold && flux > FLUX_FLOOR && time - this.lastOnset > MIN_GAP_SECONDS) {
+      this.lastOnset = time;
+      onsetStrength = clamp01(0.55 + (flux - threshold) / Math.max(threshold, 1e-4) * 0.45);
+      onsetClassCode = this.classify(flatness);
+    }
+    this.pushHistory(time, flux);
+    this.aggregatePublicBands();
+    this.result.flux = flux;
+    this.result.threshold = threshold;
+    this.result.onsetStrength = onsetStrength;
+    this.result.onsetClassCode = onsetClassCode;
+    return this.result;
+  }
+  classify(flatness) {
+    let low = 0, mid = 0, high = 0;
+    let lowCount = 0, midCount = 0, highCount = 0;
+    for (let band = 0; band < PERCEPTUAL_BAND_COUNT; band++) {
+      if (this.bandEnd[band] <= this.bandStart[band]) continue;
+      const density = this.classificationEnergy[band] * (0.2 + this.positiveFlux[band]);
+      if (band < 2) {
+        low += density;
+        lowCount++;
+      } else if (band < 7) {
+        mid += density;
+        midCount++;
+      } else {
+        high += density;
+        highCount++;
+      }
+    }
+    low /= Math.max(1, lowCount);
+    mid /= Math.max(1, midCount);
+    high /= Math.max(1, highCount);
+    const total = low + mid + high + 1e-6;
+    const lowShare = low / total;
+    const highShare = high / total;
+    if (highShare > 0.4) return ONSET_CLASS_HAT;
+    if (flatness > 0.28) return ONSET_CLASS_SNARE;
+    if (lowShare > 0.56) return ONSET_CLASS_KICK;
+    return ONSET_CLASS_TONAL;
+  }
+  aggregatePublicBands() {
+    for (let pub = 0; pub < PUBLIC_BAND_COUNT; pub++) {
+      let sum = 0;
+      for (let band = 0; band < PERCEPTUAL_BAND_COUNT; band++) {
+        sum += this.result.bands[band] * this.publicWeights[pub * PERCEPTUAL_BAND_COUNT + band];
+      }
+      this.result.publicBands[pub] = clamp01(
+        sum / Math.max(1e-6, this.publicWeightSums[pub]) * PUBLIC_GAINS[pub]
+      );
+    }
+  }
+  expireHistory(time) {
+    while (this.historyCount > 0) {
+      const tail = (this.historyHead - this.historyCount + this.historyCapacity) % this.historyCapacity;
+      if (time - this.historyTime[tail] <= HISTORY_SECONDS) break;
+      const old = this.historyFlux[tail];
+      this.historySum -= old;
+      this.historySquareSum -= old * old;
+      this.historyCount--;
+    }
+    if (this.historyCount === 0) this.historyFirstTime = EMPTY_TIME;
+    else {
+      const tail = (this.historyHead - this.historyCount + this.historyCapacity) % this.historyCapacity;
+      this.historyFirstTime = this.historyTime[tail];
+    }
+  }
+  pushHistory(time, flux) {
+    if (this.historyCount === this.historyCapacity) {
+      const old = this.historyFlux[this.historyHead];
+      this.historySum -= old;
+      this.historySquareSum -= old * old;
+      this.historyCount--;
+    }
+    this.historyTime[this.historyHead] = time;
+    this.historyFlux[this.historyHead] = flux;
+    this.historyHead = (this.historyHead + 1) % this.historyCapacity;
+    this.historyCount++;
+    this.historySum += flux;
+    this.historySquareSum += flux * flux;
+    if (this.historyCount === 1) this.historyFirstTime = time;
+  }
+};
+function clamp01(value) {
+  return value < 0 ? 0 : value > 1 ? 1 : value;
+}
+
 // src/audio.ts
 var BANDS = {
   sub: [20, 80],
@@ -73,12 +352,6 @@ var BAND_NAMES = Object.keys(BANDS);
 var WAVE_N = 1024;
 var SPEC_N = 256;
 var SPECTROGRAM_ROWS = 256;
-var DETECT_RING = 256;
-var DETECT_WINDOW = 1.1;
-var DETECT_K = 1.6;
-var DETECT_FLOOR = 4e-3;
-var DETECT_HZ = 8e3;
-var MIN_GAP = 0.09;
 var AudioEngine = class {
   ctx = null;
   input = null;
@@ -106,6 +379,10 @@ var AudioEngine = class {
   spectrogramRow = 0;
   /** Peak-hold with fall, per bin. */
   peaks = new Float32Array(SPEC_N);
+  /** Low-to-high perceptual-band energy envelopes. Stable live buffer. */
+  perceptualBands = new Float32Array(PERCEPTUAL_BAND_COUNT);
+  /** Perceptual-band adaptively whitened novelty envelopes. Stable live buffer. */
+  perceptualFlux = new Float32Array(PERCEPTUAL_BAND_COUNT);
   bands = { sub: 0, low: 0, mid: 0, high: 0, air: 0 };
   level = 0;
   beat = 0;
@@ -130,13 +407,7 @@ var AudioEngine = class {
   timeL = new Float32Array(0);
   timeR = new Float32Array(0);
   detSpec = new Uint8Array(0);
-  prevSpec = new Uint8Array(0);
-  /** Running max per bin — adaptive whitening makes detection loudness-invariant. */
-  whiten = new Float32Array(0);
-  fluxT = new Float32Array(DETECT_RING);
-  fluxV = new Float32Array(DETECT_RING);
-  fi = 0;
-  lastBeat = -1;
+  multiband = null;
   /** Short white-noise burst, reused for test-signal hats. */
   noiseBuf = null;
   startedAt = 0;
@@ -212,8 +483,7 @@ var AudioEngine = class {
     this.timeL = new Float32Array(this.anL.fftSize);
     this.timeR = new Float32Array(this.anR.fftSize);
     this.detSpec = new Uint8Array(this.detector.frequencyBinCount);
-    this.prevSpec = new Uint8Array(this.detector.frequencyBinCount);
-    this.whiten = new Float32Array(this.detector.frequencyBinCount).fill(1);
+    this.multiband = new AdaptiveMultibandDetector(ctx.sampleRate, this.detector.frequencyBinCount, 240);
     return ctx;
   }
   async loadFile(file) {
@@ -404,12 +674,9 @@ var AudioEngine = class {
     });
   }
   resetDetector() {
-    this.prevSpec.fill(0);
-    this.whiten.fill(1);
-    this.fluxT.fill(0);
-    this.fluxV.fill(0);
-    this.fi = 0;
-    this.lastBeat = -1;
+    this.multiband?.reset();
+    this.perceptualBands.fill(0);
+    this.perceptualFlux.fill(0);
     this.beat = 0;
     this.spectrogram.fill(0);
     this.spectrogramRow = 0;
@@ -474,22 +741,11 @@ var AudioEngine = class {
     this.spectrogramRow = (this.spectrogramRow + 1) % SPECTROGRAM_ROWS;
     this.centroid = cenDen > 0 ? cenNum / cenDen / SPEC_N : 0;
     this.flatness = linSum > 0 ? Math.exp(logSum / SPEC_N) / (linSum / SPEC_N) : 0;
-    const nyq = this.ctx.sampleRate / 2;
-    const binOf = (hz) => Math.min(this.freqL.length - 1, Math.round(hz / nyq * this.freqL.length));
     let panNum = 0, panDen = 0;
-    for (const name of BAND_NAMES) {
-      const [lo, hi] = BANDS[name];
-      const a = binOf(lo), b = binOf(hi);
-      let sL = 0, sR = 0;
-      for (let i = a; i <= b; i++) {
-        sL += this.freqL[i];
-        sR += this.freqR[i];
-      }
-      const n = (b - a + 1) * 255;
-      const gain = name === "sub" ? 1.6 : name === "low" ? 1.5 : name === "mid" ? 2.2 : 3;
-      this.bands[name] = clamp((sL + sR) / (2 * n) * gain);
-      panNum += sL - sR;
-      panDen += sL + sR;
+    for (let bin = 0; bin < this.freqL.length; bin++) {
+      const left = this.freqL[bin], right = this.freqR[bin];
+      panNum += left - right;
+      panDen += left + right;
     }
     this.pan = panDen > 0 ? clampSigned(panNum / panDen) : 0;
     this.detectOnset(dt, t);
@@ -497,63 +753,19 @@ var AudioEngine = class {
   detectOnset(dt, t) {
     const det = this.detector;
     det.getByteFrequencyData(this.detSpec);
-    const nyq = this.ctx.sampleRate / 2;
-    const top = Math.min(this.detSpec.length, Math.ceil(DETECT_HZ / nyq * this.detSpec.length));
-    let flux = 0, wsum = 0;
-    let lg = 0, ln = 0;
-    let loE = 0, midE = 0, hiE = 0;
-    const loTop = Math.min(top, Math.max(1, Math.round(250 / nyq * this.detSpec.length)));
-    const hiBot = Math.min(top, Math.round(5e3 / nyq * this.detSpec.length));
-    for (let i = 0; i < top; i++) {
-      const cur = this.detSpec[i] / 255;
-      this.whiten[i] = Math.max(cur, this.whiten[i] * 0.999, 0.02);
-      const norm = cur / this.whiten[i];
-      const prev = this.prevSpec[i] / 255 / this.whiten[i];
-      const w = 1 + 3 * Math.exp(-i / 5);
-      const d = norm - prev;
-      if (d > 0) flux += d * w;
-      wsum += w;
-      this.prevSpec[i] = this.detSpec[i];
-      lg += Math.log(cur + 1e-6);
-      ln += cur;
-      const pos = d > 0 ? d : 0;
-      if (i < loTop) loE += pos;
-      else if (i >= hiBot) hiE += pos;
-      else midE += pos;
+    const features = this.multiband.analyse(this.detSpec, 1 / 255, t, dt, this.flatness);
+    this.debugFlux = features.flux;
+    this.debugThresh = features.threshold;
+    this.perceptualBands.set(features.bands);
+    this.perceptualFlux.set(features.bandFlux);
+    for (let band = 0; band < BAND_NAMES.length; band++) {
+      this.bands[BAND_NAMES[band]] = features.publicBands[band];
     }
-    flux /= wsum;
-    this.fluxT[this.fi] = t;
-    this.fluxV[this.fi] = flux;
-    this.fi = (this.fi + 1) % DETECT_RING;
-    let n = 0, s = 0, s2 = 0;
-    for (let i = 0; i < DETECT_RING; i++) {
-      if (t - this.fluxT[i] > DETECT_WINDOW) continue;
-      const v = this.fluxV[i];
-      s += v;
-      s2 += v * v;
-      n++;
-    }
-    const mean = n ? s / n : 0;
-    const varc = n ? Math.max(0, s2 / n - mean * mean) : 0;
-    const thresh = mean + DETECT_K * Math.sqrt(varc);
-    this.debugFlux = flux;
-    this.debugThresh = thresh;
     this.beat *= Math.exp(-dt * 7);
-    if (flux > thresh && flux > DETECT_FLOOR && t - this.lastBeat > MIN_GAP) {
-      this.lastBeat = t;
-      const strength = clamp(0.55 + (flux - thresh) / Math.max(thresh, 1e-4) * 0.45);
+    if (features.onsetClassCode !== 0) {
+      const strength = features.onsetStrength;
       this.beat = Math.max(this.beat, strength);
-      const flat = ln > 0 ? Math.exp(lg / top) / (ln / top) : 0;
-      const loD = loE / Math.max(1, loTop);
-      const midD = midE / Math.max(1, hiBot - loTop);
-      const hiD = hiE / Math.max(1, top - hiBot);
-      const tot = loD + midD + hiD + 1e-6;
-      const lo = loD / tot, hi = hiD / tot;
-      let klass;
-      if (hi > 0.42) klass = "hat";
-      else if (lo > 0.42) klass = "kick";
-      else if (flat > 0.3) klass = "snare";
-      else klass = "tonal";
+      const klass = ONSET_CLASS_NAMES[features.onsetClassCode] ?? "tonal";
       this.onOnset?.({ time: t, strength, klass, pan: this.pan });
     }
   }
@@ -568,11 +780,19 @@ function clampSigned(v) {
 // src/clock.ts
 var SLOTS_PER_BEAT = 240;
 var SLOTS_PER_BAR = SLOTS_PER_BEAT * 4;
-var MIN_BPM = 90;
-var MAX_BPM = 180;
-var MAX_LOOKAHEAD = 10;
-var WINDOW = 48;
-var MIN_ONSETS = 8;
+var MIN_BPM = 55;
+var MAX_BPM = 200;
+var MAX_LOOKAHEAD = 8;
+var WINDOW = 64;
+var MIN_ONSETS = 6;
+var MIN_ONSET_GAP = 0.1;
+var LOCK_THRESHOLD = 0.44;
+var UNLOCK_THRESHOLD = 0.3;
+function resolveTempoBpm(trackedBpm, estimatedBpm, fallback = 120) {
+  if (Number.isFinite(trackedBpm) && trackedBpm > 0) return trackedBpm;
+  if (Number.isFinite(estimatedBpm) && estimatedBpm > 0) return estimatedBpm;
+  return fallback;
+}
 var DIVISIONS = {
   "1/64": SLOTS_PER_BEAT / 16,
   // 15
@@ -604,9 +824,16 @@ var DIVISIONS = {
 };
 var TempoTracker = class {
   onsets = [];
+  /** Detector/output delay in audio-clock seconds, never wall-clock time. */
+  inputLatency = 0;
   bpm = 0;
   confidence = 0;
   locked = false;
+  lastOnsetTime = Number.NEGATIVE_INFINITY;
+  lockEvidence = 0;
+  unlockEvidence = 0;
+  pendingBpm = 0;
+  pendingCount = 0;
   /** Absolute time of the next grid beat. NEVER an index recomputed from an
    *  anchor — easing a moving anchor makes the index run backwards and the
    *  grid dies silently. Pulse lost an evening to this. */
@@ -618,6 +845,11 @@ var TempoTracker = class {
     this.bpm = 0;
     this.confidence = 0;
     this.locked = false;
+    this.lastOnsetTime = Number.NEGATIVE_INFINITY;
+    this.lockEvidence = 0;
+    this.unlockEvidence = 0;
+    this.pendingBpm = 0;
+    this.pendingCount = 0;
     this.nextBeat = 0;
     this.beatIndex = 0;
     this.phase = 0;
@@ -629,59 +861,135 @@ var TempoTracker = class {
     const period = 60 / this.bpm;
     this.nextBeat = targetTime + (1 - this.phase) * period;
     this.onsets.length = 0;
+    this.lastOnsetTime = targetTime;
   }
   addOnset(t) {
+    if (!Number.isFinite(t)) return;
+    const latency = Number.isFinite(this.inputLatency) ? this.inputLatency : 0;
+    t -= latency;
     const last2 = this.onsets[this.onsets.length - 1];
-    if (last2 !== void 0 && t - last2 < 0.12) return;
+    if (last2 !== void 0 && t <= last2) {
+      this.onsets.length = 0;
+    } else if (last2 !== void 0 && t - last2 < MIN_ONSET_GAP) return;
     this.onsets.push(t);
+    this.lastOnsetTime = t;
     if (this.onsets.length > WINDOW) this.onsets.shift();
     if (this.onsets.length >= MIN_ONSETS) this.score();
     if (this.locked && this.nextBeat) {
       const period = 60 / this.bpm;
       const err2 = wrapSigned(t - this.nextBeat, period);
-      if (Math.abs(err2) > period * 0.12) this.nextBeat += err2 * 0.25;
+      if (Math.abs(err2) <= period * 0.24) {
+        const bounded = Math.max(-period * 0.1, Math.min(period * 0.1, err2));
+        this.nextBeat += bounded * (0.18 + (1 - this.confidence) * 0.14);
+      }
     }
   }
   score() {
-    const hist = /* @__PURE__ */ new Map();
-    for (let i = 0; i < this.onsets.length; i++) {
-      for (let j = 1; j <= MAX_LOOKAHEAD; j++) {
-        const k = i + j;
-        if (k >= this.onsets.length) break;
-        const dt = this.onsets[k] - this.onsets[i];
-        if (dt <= 0) continue;
-        const tempo2 = foldTempo(60 / dt);
-        if (!tempo2) continue;
-        const key = Math.round(tempo2);
-        hist.set(key, (hist.get(key) ?? 0) + 1);
+    let best = 0, bestScore = -1, runnerUp = 0;
+    const scores = [];
+    for (let candidate = MIN_BPM; candidate <= MAX_BPM; candidate += 0.25) {
+      const score = this.candidateScore(candidate);
+      scores.push({ bpm: candidate, score });
+      if (score > bestScore) {
+        bestScore = score;
+        best = candidate;
       }
     }
-    if (!hist.size) return;
-    const smooth = /* @__PURE__ */ new Map();
-    let total = 0;
-    for (const [tempo2, count] of hist) {
-      for (let d = -2; d <= 2; d++) {
-        smooth.set(tempo2 + d, (smooth.get(tempo2 + d) ?? 0) + count * (1 - Math.abs(d) * 0.3));
-      }
-      total += count;
+    if (!best || bestScore <= 0) return;
+    for (const candidate of scores) {
+      if (Math.abs(candidate.bpm - best) < Math.max(3, best * 0.04)) continue;
+      if (candidate.score > runnerUp) runnerUp = candidate.score;
     }
-    let best = 0, bestScore = 0;
-    for (const [tempo2, sc] of smooth) {
-      if (tempo2 < MIN_BPM || tempo2 > MAX_BPM) continue;
-      if (sc > bestScore) {
-        bestScore = sc;
-        best = tempo2;
-      }
-    }
-    if (!best) return;
-    this.confidence = Math.min(1, bestScore / Math.max(total, 1));
+    const separation = Math.max(0, (bestScore - runnerUp) / Math.max(bestScore, 1e-9));
+    const maturity = Math.min(1, Math.max(0, (this.onsets.length - 4) / 4));
+    const rawConfidence = Math.min(1, (bestScore * 0.72 + separation * 0.28) * maturity);
+    this.confidence += (rawConfidence - this.confidence) * (this.locked ? 0.28 : 0.55);
     if (!this.bpm) this.bpm = best;
-    else if (Math.abs(best - this.bpm) > 6) this.bpm = best;
-    else this.bpm += (best - this.bpm) * 0.2;
-    this.locked = this.confidence > 0.12 && this.onsets.length >= MIN_ONSETS;
+    else {
+      const largeChange = Math.abs(best - this.bpm) > Math.max(8, this.bpm * 0.12);
+      if (largeChange) {
+        if (Math.abs(best - this.pendingBpm) <= 2) this.pendingCount++;
+        else {
+          this.pendingBpm = best;
+          this.pendingCount = 1;
+        }
+        if (!this.locked || this.pendingCount >= 3) {
+          this.bpm = best;
+          this.pendingBpm = 0;
+          this.pendingCount = 0;
+        }
+      } else {
+        this.pendingBpm = 0;
+        this.pendingCount = 0;
+        const gain = this.locked ? 0.42 : 0.52;
+        this.bpm += (best - this.bpm) * gain;
+      }
+    }
+    if (this.confidence >= LOCK_THRESHOLD) {
+      this.lockEvidence++;
+      this.unlockEvidence = 0;
+    } else if (this.confidence < UNLOCK_THRESHOLD) {
+      this.unlockEvidence++;
+      this.lockEvidence = 0;
+    } else {
+      this.lockEvidence = Math.max(0, this.lockEvidence - 1);
+      this.unlockEvidence = 0;
+    }
+    if (!this.locked && this.lockEvidence >= 2) {
+      this.locked = true;
+      const period = 60 / this.bpm;
+      this.nextBeat = this.onsets[this.onsets.length - 1] + period;
+    } else if (this.locked && this.unlockEvidence >= 3) {
+      this.locked = false;
+      this.nextBeat = 0;
+      this.phase = 0;
+    }
+  }
+  candidateScore(candidateBpm) {
+    const period = 60 / candidateBpm;
+    let adjacent = 0, adjacentWeight = 0, context = 0, contextWeight = 0;
+    const count = this.onsets.length;
+    for (let index = 1; index < count; index++) {
+      const age = count - 1 - index;
+      const recency = Math.pow(0.75, age);
+      const dt = this.onsets[index] - this.onsets[index - 1];
+      const beats = Math.max(1, Math.round(dt / period));
+      const residual = Math.abs(dt - beats * period) / period;
+      adjacent += recency * gaussian(residual, 0.105) / beats;
+      adjacentWeight += recency;
+    }
+    for (let index = 0; index < count; index++) for (let distance = 2; distance <= MAX_LOOKAHEAD; distance++) {
+      const next = index + distance;
+      if (next >= count) break;
+      const age = count - 1 - next, pairWeight = Math.pow(0.75, age) / distance;
+      const dt = this.onsets[next] - this.onsets[index];
+      const beats = Math.max(1, Math.round(dt / period));
+      const residual = Math.abs(dt - beats * period) / period;
+      context += pairWeight * gaussian(residual, 0.08) / Math.sqrt(beats);
+      contextWeight += pairWeight;
+    }
+    const adjacentFit = adjacentWeight ? adjacent / adjacentWeight : 0;
+    const contextFit = contextWeight ? context / contextWeight : adjacentFit;
+    return adjacentFit * 0.72 + contextFit * 0.28;
   }
   /** Advance the predicted grid. `now` is audio-clock seconds. */
   update(now) {
+    if (!Number.isFinite(now)) return;
+    if (this.locked && this.bpm && Number.isFinite(this.lastOnsetTime)) {
+      const period2 = 60 / this.bpm;
+      const timeout = Math.max(2.5, period2 * 4);
+      const silentFor = now - this.lastOnsetTime;
+      if (silentFor > timeout) {
+        this.confidence = Math.min(this.confidence, Math.max(0, 1 - (silentFor - timeout) / timeout));
+        if (silentFor > timeout * 1.5 || this.confidence < UNLOCK_THRESHOLD) {
+          this.locked = false;
+          this.nextBeat = 0;
+          this.phase = 0;
+          this.unlockEvidence = 0;
+          return;
+        }
+      }
+    }
     if (!this.locked || !this.bpm) {
       this.phase = 0;
       return;
@@ -706,15 +1014,13 @@ var TempoTracker = class {
     return beats * SLOTS_PER_BEAT;
   }
 };
-function foldTempo(bpm) {
-  if (!isFinite(bpm) || bpm <= 0) return 0;
-  while (bpm < MIN_BPM) bpm *= 2;
-  while (bpm > MAX_BPM) bpm /= 2;
-  return bpm >= MIN_BPM && bpm <= MAX_BPM ? bpm : 0;
-}
 function wrapSigned(v, period) {
   const m = (v % period + period) % period;
   return m > period / 2 ? m - period : m;
+}
+function gaussian(value, sigma) {
+  const normalized = value / sigma;
+  return Math.exp(-0.5 * normalized * normalized);
 }
 
 // src/contracts.ts
@@ -1184,27 +1490,33 @@ function solveTime(timeline2, slot2, near, secPerSlot) {
 }
 
 // src/worklet-host.ts
-var FEATURE_FLOATS = 16;
 var RING_FRAMES = 256;
 var HEADER_INTS = 4;
 var HEADER_BYTES = HEADER_INTS * 4;
 var CTL_WRITE_COUNT = 0;
-var F_TIME = 0;
-var F_FLUX = 1;
-var F_THRESH = 2;
-var F_LEVEL = 3;
-var F_CREST = 4;
-var F_PAN = 5;
-var F_WIDTH = 6;
-var F_CENTROID = 7;
-var F_FLATNESS = 8;
-var F_BAND_SUB = 9;
-var F_ONSET_STRENGTH = 14;
-var F_ONSET_CLASS = 15;
 var BAND_ORDER = ["sub", "low", "mid", "high", "air"];
-var CLASS_NAMES = [null, "kick", "snare", "hat", "tonal"];
 var DETECTOR_PROCESSOR = "aaavs-detector";
 var DETECTOR_MODULE_URL = "dist/detector.worklet.js";
+function decodeWorkletFeatureFrame(frames2, base2, target, timeOrigin = 0) {
+  const offsets = AUDIO_FEATURE_OFFSETS;
+  target.time = (frames2[base2 + offsets.time] ?? 0) - timeOrigin;
+  target.flux = frames2[base2 + offsets.flux] ?? 0;
+  target.thresh = frames2[base2 + offsets.threshold] ?? 0;
+  target.level = frames2[base2 + offsets.level] ?? 0;
+  target.crest = frames2[base2 + offsets.crest] ?? 1;
+  target.pan = frames2[base2 + offsets.pan] ?? 0;
+  target.width = frames2[base2 + offsets.width] ?? 0;
+  target.centroid = frames2[base2 + offsets.centroid] ?? 0;
+  target.flatness = frames2[base2 + offsets.flatness] ?? 0;
+  for (let band = 0; band < BAND_ORDER.length; band++) {
+    target.bands[BAND_ORDER[band]] = frames2[base2 + offsets.publicBands + band] ?? 0;
+  }
+  for (let band = 0; band < PERCEPTUAL_BAND_COUNT; band++) {
+    target.perceptualBands[band] = frames2[base2 + offsets.perceptualBands + band] ?? 0;
+    target.perceptualFlux[band] = frames2[base2 + offsets.perceptualFlux + band] ?? 0;
+  }
+  target.onsetClass = ONSET_CLASS_NAMES[(frames2[base2 + offsets.onsetClass] ?? 0) | 0] ?? null;
+}
 var WorkletDetectorError = class extends Error {
 };
 function ringAvailable() {
@@ -1244,6 +1556,8 @@ var WorkletDetector = class {
     centroid: 0,
     flatness: 0,
     bands: { sub: 0, low: 0, mid: 0, high: 0, air: 0 },
+    perceptualBands: new Float32Array(PERCEPTUAL_BAND_COUNT),
+    perceptualFlux: new Float32Array(PERCEPTUAL_BAND_COUNT),
     onsetClass: null
   };
   /** Onset envelope, 0..1, decaying. The reactive counterpart to `Timeline`. */
@@ -1269,7 +1583,7 @@ var WorkletDetector = class {
     if (this.node) this.detach();
     let ring;
     if (ringAvailable()) {
-      ring = new SharedArrayBuffer(HEADER_BYTES + RING_FRAMES * FEATURE_FLOATS * 4);
+      ring = new SharedArrayBuffer(HEADER_BYTES + RING_FRAMES * AUDIO_FEATURE_FLOATS * 4);
     }
     try {
       await ctx.audioWorklet.addModule(moduleUrl);
@@ -1312,7 +1626,7 @@ var WorkletDetector = class {
     this.source = source3;
     if (ring) {
       this.ctl = new Int32Array(ring, 0, HEADER_INTS);
-      this.frames = new Float32Array(ring, HEADER_BYTES, RING_FRAMES * FEATURE_FLOATS);
+      this.frames = new Float32Array(ring, HEADER_BYTES, RING_FRAMES * AUDIO_FEATURE_FLOATS);
     }
     this.readCount = this.ctl ? Atomics.load(this.ctl, CTL_WRITE_COUNT) : 0;
   }
@@ -1337,26 +1651,14 @@ var WorkletDetector = class {
       count = RING_FRAMES;
     }
     for (let i = 0; i < count; i++) {
-      const base3 = (this.readCount + i) % RING_FRAMES * FEATURE_FLOATS;
-      const s = frames2[base3 + F_ONSET_STRENGTH];
+      const base3 = (this.readCount + i) % RING_FRAMES * AUDIO_FEATURE_FLOATS;
+      const s = frames2[base3 + AUDIO_FEATURE_OFFSETS.onsetStrength];
       if (s > this.beat) this.beat = s;
     }
     this.readCount = write;
-    const base2 = (write - 1) % RING_FRAMES * FEATURE_FLOATS;
+    const base2 = (write - 1) % RING_FRAMES * AUDIO_FEATURE_FLOATS;
     const f = this.features;
-    f.time = frames2[base2 + F_TIME] - this.timeOrigin;
-    f.flux = frames2[base2 + F_FLUX];
-    f.thresh = frames2[base2 + F_THRESH];
-    f.level = frames2[base2 + F_LEVEL];
-    f.crest = frames2[base2 + F_CREST];
-    f.pan = frames2[base2 + F_PAN];
-    f.width = frames2[base2 + F_WIDTH];
-    f.centroid = frames2[base2 + F_CENTROID];
-    f.flatness = frames2[base2 + F_FLATNESS];
-    for (let b = 0; b < BAND_ORDER.length; b++) {
-      f.bands[BAND_ORDER[b]] = frames2[base2 + F_BAND_SUB + b];
-    }
-    f.onsetClass = CLASS_NAMES[frames2[base2 + F_ONSET_CLASS] | 0] ?? null;
+    decodeWorkletFeatureFrame(frames2, base2, f, this.timeOrigin);
     return count;
   }
   /**
@@ -1883,7 +2185,7 @@ function blendConstantFor(spec) {
   if (spec.blend === "50/50") return 0.5;
   if (spec.blend === "adjustable") {
     const raw = spec.params["mix"];
-    return typeof raw === "number" ? clamp01(raw) : 0.5;
+    return typeof raw === "number" ? clamp012(raw) : 0.5;
   }
   return null;
 }
@@ -2240,7 +2542,7 @@ var LayerStack = class {
       out.push({
         layer: layer2,
         progress,
-        opacity: clamp01(layer2.spec.opacity * progress),
+        opacity: clamp012(layer2.spec.opacity * progress),
         blendConstant: blendConstantFor(layer2.spec)
       });
     }
@@ -2252,7 +2554,7 @@ var LayerStack = class {
     return { resolved, plan: planStack(resolved) };
   }
 };
-function clamp01(v) {
+function clamp012(v) {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 
@@ -2615,7 +2917,7 @@ var PresetDirector = class {
    */
   update(timeline2, now, energy, impact = 0) {
     if (!this.enabled || this.mode === "hold" || this.bank.length < 2) return null;
-    this.pendingImpact = Math.max(this.pendingImpact, clamp012(impact));
+    this.pendingImpact = Math.max(this.pendingImpact, clamp013(impact));
     const fired = this.scheduler.due(timeline2, now, {
       key: "director",
       // euclidK/N = 1/1 is "every tick" — the Euclidean generator's identity.
@@ -2628,7 +2930,7 @@ var PresetDirector = class {
     if (fired.length === 0) return null;
     const last2 = fired[fired.length - 1];
     const bar = Math.floor(last2.tick);
-    const level = clamp012(energy ?? this.lastEnergy);
+    const level = clamp013(energy ?? this.lastEnergy);
     if (!this.dynamic) {
       if (bar % this.every !== 0) return null;
       return this.advance(now, last2.time, "phrase", level);
@@ -2769,7 +3071,7 @@ var PresetDirector = class {
     return pool[index] ?? fallback;
   }
 };
-function clamp012(v) {
+function clamp013(v) {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 var TRANSITION_ID = {
@@ -4249,7 +4551,7 @@ var DebugOverlay = class {
       ctx.fillStyle = LINE;
       ctx.fillRect(barX, by + 1, barW, rowH - 4);
       ctx.fillStyle = ACCENT;
-      ctx.fillRect(barX, by + 1, barW * clamp013(v), rowH - 4);
+      ctx.fillRect(barX, by + 1, barW * clamp014(v), rowH - 4);
       ctx.fillStyle = FG;
       ctx.fillText(v.toFixed(2), barX + barW + 4, by);
     }
@@ -4299,7 +4601,7 @@ var DebugOverlay = class {
     }
     peak *= 1.15;
     const px = (t) => x + (t - t0) / PLOT_SEC * w;
-    const py = (v) => plotY + plotH - clamp013(v / peak) * plotH;
+    const py = (v) => plotY + plotH - clamp014(v / peak) * plotH;
     ctx.strokeStyle = LINE;
     ctx.strokeRect(x + 0.5, plotY + 0.5, w - 1, plotH - 1);
     for (const o of this.onsets) {
@@ -4368,7 +4670,7 @@ var DebugOverlay = class {
       ctx.fillStyle = LINE;
       ctx.fillRect(barX, ty2 + 2, barW, 7);
       ctx.fillStyle = LEFT_CH;
-      ctx.fillRect(barX, ty2 + 2, barW * clamp013(t.ms / scale), 7);
+      ctx.fillRect(barX, ty2 + 2, barW * clamp014(t.ms / scale), 7);
       ctx.fillStyle = FG;
       ctx.textAlign = "right";
       ctx.fillText(t.ms.toFixed(3), x + w, ty2);
@@ -4431,7 +4733,7 @@ var RAMP = [
   [1, 255, 255, 240]
 ];
 function heat(v, out, o) {
-  const t = clamp013(v);
+  const t = clamp014(v);
   let i = 0;
   while (i < RAMP.length - 2 && t > RAMP[i + 1][0]) i++;
   const a = RAMP[i];
@@ -4443,7 +4745,7 @@ function heat(v, out, o) {
   out[o + 2] = a[3] + (b[3] - a[3]) * k;
   out[o + 3] = 255;
 }
-function clamp013(v) {
+function clamp014(v) {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 function clampSigned2(v) {
@@ -4503,6 +4805,8 @@ var SyntheticAudio = class {
   crest = 1;
   centroid = 0;
   flatness = 0;
+  perceptualBands = new Float32Array(12);
+  perceptualFlux = new Float32Array(12);
   waveform = new Float32Array(WAVE_N * 2);
   spectrum = new Float32Array(SPEC_N * 2);
   bandPan = new Float32Array(SPEC_N);
@@ -7158,8 +7462,8 @@ var scopePass = {
     out[F_CENTRE_X] = num8(p, "centreX", -0.16);
     out[F_CENTRE_Y] = num8(p, "centreY", 0.08);
     out[F_SPREAD] = num8(p, "spread", 0.86) * ctx.aspect;
-    out[F_WEIGHT_VAR] = clamp014(num8(p, "weightVar", 0.7));
-    out[F_WINDOW] = clamp014(num8(p, "window", 1));
+    out[F_WEIGHT_VAR] = clamp015(num8(p, "weightVar", 0.7));
+    out[F_WINDOW] = clamp015(num8(p, "window", 1));
     const spinBeats = Math.max(num8(p, "spinBeats", 32), 1e-3);
     out[F_SPIN] = fract7(ctx.beats / spinBeats) * Math.PI * 2;
   }
@@ -7176,7 +7480,7 @@ function mode(p, key, fallback) {
   const found = MODES.find((m) => m === v);
   return found ?? fallback;
 }
-function clamp014(v) {
+function clamp015(v) {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 function fract7(v) {
@@ -7240,13 +7544,13 @@ var ribbonPass = {
     out[F_TWIST_TURNS] = num9(p, "twistTurns", 1.35) * TAU7;
     const twistBars = Math.max(num9(p, "twistBars", 24), 1e-3);
     out[F_TWIST_PHASE] = fract8(ctx.bars / twistBars) * TAU7;
-    out[F_WEIGHT_VAR2] = clamp015(num9(p, "weightVar", 0.75));
-    out[F_WINDOW2] = clamp015(num9(p, "window", 1));
+    out[F_WEIGHT_VAR2] = clamp016(num9(p, "weightVar", 0.75));
+    out[F_WINDOW2] = clamp016(num9(p, "window", 1));
     const scrollBeats = Math.max(num9(p, "scrollBeats", 8), 1e-3);
     out[F_SCROLL] = fract8(ctx.beats / scrollBeats);
     out[F_STEREO_WIDTH] = Math.max(num9(p, "stereoWidth", 0.9), 0);
     out[F_GLOSS] = Math.max(num9(p, "gloss", 0.55), 0) * Math.max(ctx.color.intensity, 0);
-    out[F_SHADE] = clamp015(num9(p, "shade", 0.22));
+    out[F_SHADE] = clamp016(num9(p, "shade", 0.22));
     out[F_TAPER] = Math.max(num9(p, "taper", 0.55), 0.05);
   }
 };
@@ -7258,7 +7562,7 @@ function num9(p, key, fallback) {
   const v = p[key];
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
-function clamp015(v) {
+function clamp016(v) {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 function fract8(v) {
@@ -7320,12 +7624,12 @@ var spiralPass = {
     out[F_CENTRE_Y3] = num10(p, "centreY", -0.06);
     const spinBars = Math.max(num10(p, "spinBars", 12), 1e-3);
     out[F_SPIN2] = fract9(ctx.bars / spinBars) * TAU8;
-    out[F_WINDOW3] = clamp016(num10(p, "window", 1));
+    out[F_WINDOW3] = clamp017(num10(p, "window", 1));
     const scrollBeats = Math.max(num10(p, "scrollBeats", 4), 1e-3);
     out[F_SCROLL2] = fract9(ctx.beats / scrollBeats);
-    out[F_WEIGHT_VAR3] = clamp016(num10(p, "weightVar", 0.7));
-    out[F_TAPER_INNER] = clamp016(num10(p, "taperInner", 0.28));
-    out[F_INNER_FADE] = clamp016(num10(p, "innerFade", 0.22));
+    out[F_WEIGHT_VAR3] = clamp017(num10(p, "weightVar", 0.7));
+    out[F_TAPER_INNER] = clamp017(num10(p, "taperInner", 0.28));
+    out[F_INNER_FADE] = clamp017(num10(p, "innerFade", 0.22));
     const step = turns * TAU8 / segmentCount3(p);
     out[F_SWIRL] = Math.min(Math.max(num10(p, "swirl", 0.35), 0), step * 8);
   }
@@ -7338,7 +7642,7 @@ function num10(p, key, fallback) {
   const v = p[key];
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
-function clamp016(v) {
+function clamp017(v) {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 function fract9(v) {
@@ -7368,7 +7672,7 @@ var F_SCROLL3 = 14;
 var F_STEREO = 15;
 var F_Z_WAVE = 16;
 var F_DEPTH_AMP = 17;
-var F_CREST2 = 18;
+var F_CREST = 18;
 var PARAM_FLOATS4 = 20;
 var DEFAULT_ROWS = 48;
 var DEFAULT_COLS = 64;
@@ -7404,13 +7708,13 @@ var wavegridPass = {
     out[F_HORIZON] = num11(p, "horizon", 0.3);
     out[F_CAM_Y] = num11(p, "cameraHeight", 1.5);
     out[F_FOCAL] = Math.max(num11(p, "focal", 1), 1e-3);
-    out[F_WINDOW4] = clamp017(num11(p, "window", 1));
-    out[F_WEIGHT_VAR4] = clamp017(num11(p, "weightVar", 0.7));
+    out[F_WINDOW4] = clamp018(num11(p, "window", 1));
+    out[F_WEIGHT_VAR4] = clamp018(num11(p, "weightVar", 0.7));
     out[F_FOG] = Math.max(num11(p, "fog", 0.11), 0);
-    out[F_STEREO] = clamp017(num11(p, "stereo", 0.8));
+    out[F_STEREO] = clamp018(num11(p, "stereo", 0.8));
     out[F_Z_WAVE] = num11(p, "zWave", 0.09);
     out[F_DEPTH_AMP] = Math.max(num11(p, "depthDamp", 0.1), 0);
-    out[F_CREST2] = Math.max(num11(p, "crest", 0.9), 0);
+    out[F_CREST] = Math.max(num11(p, "crest", 0.9), 0);
     const travelBeats = Math.max(num11(p, "travelBeats", 1), 1e-3);
     out[F_TRAVEL] = 1 - fract10(ctx.beats / travelBeats);
     const scrollBeats = Math.max(num11(p, "scrollBeats", 16), 1e-3);
@@ -7430,7 +7734,7 @@ function num11(p, key, fallback) {
   const v = p[key];
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
-function clamp017(v) {
+function clamp018(v) {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 function fract10(v) {
@@ -7449,7 +7753,7 @@ var F_GAMMA = 3;
 var F_LO = 4;
 var F_HI = 5;
 var F_GAP = 6;
-var F_PAN2 = 7;
+var F_PAN = 7;
 var F_CAP_HALF = 8;
 var F_BODY_LEVEL = 9;
 var F_CAP_LEVEL = 10;
@@ -7500,7 +7804,7 @@ var spectrumPass = {
     out[F_LO] = lo;
     out[F_HI] = clamp3(num12(p, "fHi", DEFAULT_HI), lo * 1.01, 1);
     out[F_GAP] = clamp3(num12(p, "gap", 0.32), 0, 0.95);
-    out[F_PAN2] = clamp3(num12(p, "pan", 0), 0, 1);
+    out[F_PAN] = clamp3(num12(p, "pan", 0), 0, 1);
     out[F_CAP_HALF] = Math.max(num12(p, "capThickness", 6e-3), 1e-4);
     out[F_BODY_LEVEL] = Math.max(num12(p, "bodyLevel", 0.55), 0);
     out[F_CAP_LEVEL] = Math.max(num12(p, "capLevel", 1), 0);
@@ -7959,8 +8263,8 @@ var chladniPass = {
     out[F_CENTRE_Y6] = num18(p, "centreY", 0.04);
     const settleBeats = Math.max(num18(p, "settleBeats", 0.75), 1e-3);
     const intoStep = ctx.beats - step * divBeats;
-    out[F_EXCITE] = clamp018(num18(p, "excite", 0.6)) * Math.exp(-intoStep / settleBeats);
-    out[F_WEIGHT_VAR8] = clamp018(num18(p, "weightVar", 0.7));
+    out[F_EXCITE] = clamp019(num18(p, "excite", 0.6)) * Math.exp(-intoStep / settleBeats);
+    out[F_WEIGHT_VAR8] = clamp019(num18(p, "weightVar", 0.7));
     const spinBeats = num18(p, "spinBeats", 0);
     out[F_SPIN5] = spinBeats > 1e-3 ? fract13(ctx.beats / spinBeats) * Math.PI * 2 : 0;
   }
@@ -8002,8 +8306,8 @@ function modesFor(ctx, step, divBeats, p) {
     }
   }
   const span = nMax - nMin;
-  let n = nMin + Math.round(clamp018((i0 + clamp018(v0)) / BAND_ORDER3.length) * span);
-  let m = nMin + Math.round(clamp018((i1 + clamp018(v1)) / BAND_ORDER3.length) * span);
+  let n = nMin + Math.round(clamp019((i0 + clamp019(v0)) / BAND_ORDER3.length) * span);
+  let m = nMin + Math.round(clamp019((i1 + clamp019(v1)) / BAND_ORDER3.length) * span);
   m += Math.floor(hash2(ctx.seed, step) * 3) - 1;
   const pair = separate(
     pinnedN !== null ? clampInt(pinnedN, nMin, nMax) : n,
@@ -8037,7 +8341,7 @@ function num18(p, key, fallback) {
   const v = p[key];
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
-function clamp018(v) {
+function clamp019(v) {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 function fract13(v) {
@@ -9506,6 +9810,12 @@ function fillSelect(node, values, current) {
   }
   node.value = current;
 }
+function option(value, label) {
+  const node = document.createElement("option");
+  node.value = value;
+  node.textContent = label;
+  return node;
+}
 function iconButton(glyph, label, extra = "") {
   const b = el("button", `ui-icon ${extra}`.trim(), glyph);
   b.type = "button";
@@ -9529,11 +9839,38 @@ function slug(name) {
   const s = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
   return s.length > 0 ? s : "preset";
 }
+function chooseRandomPreset(select) {
+  const candidates = [...select.options].filter((entry) => entry.value && !entry.disabled);
+  if (candidates.length === 0) return false;
+  const alternatives = candidates.length > 1 ? candidates.filter((entry) => entry.value !== select.value) : candidates;
+  const entropy = new Uint32Array(1);
+  crypto.getRandomValues(entropy);
+  const selected = alternatives[entropy[0] % alternatives.length];
+  select.value = selected.value;
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
+}
+function presetIconButton(label, glyph) {
+  const button = el("button", "ui-preset-icon-button", glyph);
+  button.type = "button";
+  button.setAttribute("aria-label", label);
+  button.title = label;
+  return button;
+}
+function presetPicker(button, select) {
+  const picker = el("div", "ui-preset-picker");
+  picker.append(button, select);
+  return picker;
+}
 var LayerUI = class {
   root;
-  /** Present only when a preset bank was supplied. */
-  presetSelect = null;
   avsPresetSelect = null;
+  localAvsPresetSelect = null;
+  personalAvsPresetSelect = null;
+  personalAvsRandomButton = null;
+  personalAvsAddButton = null;
+  personalAvsRemoveButton = null;
+  personalAvsCanAdd = false;
   autoBox = null;
   opts;
   stack;
@@ -9626,37 +9963,15 @@ var LayerUI = class {
     const presetSection = el("div", "ui-section ui-preset-section");
     const presetLegend = el("span", "ui-legend", "preset library");
     presetSection.append(presetLegend);
-    if (opts.presets && opts.presets.length > 0) {
-      const row = el("div", "ui-preset-row");
-      const pid = this.nextId("preset");
-      const plabel = el("label", "ui-preset-label", "AAAVS remixes");
-      plabel.htmlFor = pid;
-      this.presetSelect = el("select");
-      this.presetSelect.id = pid;
-      this.presetSelect.className = "ui-preset-select";
-      for (const p of opts.presets) {
-        const o = el("option");
-        o.value = p.name;
-        o.textContent = p.name;
-        this.presetSelect.append(o);
-      }
-      this.presetSelect.value = opts.preset.name;
-      this.presetSelect.addEventListener("change", () => {
-        if (this.avsPresetSelect) this.avsPresetSelect.value = "";
-        opts.onPickPreset?.(this.presetSelect.value);
-      });
-      const autoId = this.nextId("auto");
-      const autoWrap = el("label", "ui-check ui-auto");
-      this.autoBox = el("input");
-      this.autoBox.type = "checkbox";
-      this.autoBox.id = autoId;
-      this.autoBox.addEventListener("change", () => {
-        opts.onAutoChange?.(this.autoBox.checked);
-      });
-      autoWrap.append(this.autoBox, document.createTextNode("auto / responsive 2\u201312 bars"));
-      row.append(plabel, this.presetSelect);
-      presetSection.append(row, autoWrap);
-    }
+    const autoId = this.nextId("auto");
+    const autoWrap = el("label", "ui-check ui-auto");
+    this.autoBox = el("input");
+    this.autoBox.type = "checkbox";
+    this.autoBox.id = autoId;
+    this.autoBox.addEventListener("change", () => {
+      opts.onAutoChange?.(this.autoBox.checked);
+    });
+    autoWrap.append(this.autoBox, document.createTextNode("auto / responsive 2\u201312 bars"));
     if (opts.avsPresets && opts.avsPresets.length > 0) {
       const row = el("div", "ui-preset-row");
       const pid = this.nextId("avs-preset");
@@ -9678,15 +9993,14 @@ var LayerUI = class {
           groups.set(preset3.collection, group);
           this.avsPresetSelect.append(group);
         }
-        const option = el("option");
-        option.value = preset3.id;
-        option.textContent = preset3.name;
-        group.append(option);
+        const option2 = el("option");
+        option2.value = preset3.id;
+        option2.textContent = preset3.name;
+        group.append(option2);
       }
       this.avsPresetSelect.addEventListener("change", () => {
         const id = this.avsPresetSelect.value;
         if (!id || !opts.onPickAvsPreset) return;
-        if (this.presetSelect) this.presetSelect.selectedIndex = -1;
         const selected = opts.avsPresets?.find((preset3) => preset3.id === id);
         this.status(`loading ${selected?.name ?? "AVS preset"}\u2026`);
         void Promise.resolve(opts.onPickAvsPreset(id)).then(
@@ -9694,9 +10008,138 @@ var LayerUI = class {
           (error) => this.status(String(error), true)
         );
       });
-      row.append(plabel, this.avsPresetSelect);
+      const randomButton = presetIconButton("Random Original AVS preset", "\u2684");
+      randomButton.addEventListener("click", () => {
+        chooseRandomPreset(this.avsPresetSelect);
+      });
+      row.append(plabel, presetPicker(randomButton, this.avsPresetSelect));
       presetSection.append(row);
     }
+    if (opts.onRequestLocalAvsPresets && opts.onPickLocalAvsPreset) {
+      const row = el("div", "ui-preset-row");
+      const pid = this.nextId("local-avs-preset");
+      const plabel = el("label", "ui-preset-label", "Full local AVS");
+      plabel.htmlFor = pid;
+      this.localAvsPresetSelect = el("select");
+      this.localAvsPresetSelect.id = pid;
+      this.localAvsPresetSelect.className = "ui-preset-select";
+      this.localAvsPresetSelect.append(option("", "open 3,409-preset catalog\u2026"));
+      let loading = null;
+      const ensureCatalog = () => loading ??= opts.onRequestLocalAvsPresets().then((presets) => {
+        this.localAvsPresetSelect.replaceChildren(option("", `choose from ${presets.length.toLocaleString()} presets\u2026`));
+        const fragment = document.createDocumentFragment();
+        for (const preset3 of presets) fragment.append(option(preset3.id, preset3.name));
+        this.localAvsPresetSelect.append(fragment);
+      }, (error) => {
+        loading = null;
+        this.status(String(error), true);
+      });
+      this.localAvsPresetSelect.addEventListener("pointerdown", () => {
+        void ensureCatalog();
+      }, { once: true });
+      this.localAvsPresetSelect.addEventListener("focus", () => {
+        void ensureCatalog();
+      }, { once: true });
+      this.localAvsPresetSelect.addEventListener("change", () => {
+        const id = this.localAvsPresetSelect.value;
+        if (!id) return;
+        if (this.avsPresetSelect) this.avsPresetSelect.value = "";
+        void Promise.resolve(opts.onPickLocalAvsPreset(id)).catch((error) => this.status(String(error), true));
+      });
+      const randomButton = presetIconButton("Random preset from full local AVS bank", "\u2684");
+      randomButton.addEventListener("click", () => {
+        randomButton.disabled = true;
+        void ensureCatalog().then(
+          () => {
+            chooseRandomPreset(this.localAvsPresetSelect);
+            randomButton.disabled = false;
+          },
+          () => {
+            randomButton.disabled = false;
+          }
+        );
+      });
+      row.append(plabel, presetPicker(randomButton, this.localAvsPresetSelect));
+      presetSection.append(row);
+    }
+    if (opts.onPickPersonalAvsPreset) {
+      const row = el("div", "ui-preset-row");
+      const pid = this.nextId("personal-avs-preset");
+      const plabel = el("label", "ui-preset-label", "My AVS bank");
+      plabel.htmlFor = pid;
+      this.personalAvsPresetSelect = el("select");
+      this.personalAvsPresetSelect.id = pid;
+      this.personalAvsPresetSelect.className = "ui-preset-select";
+      this.setPersonalAvsPresets(opts.personalAvsPresets ?? []);
+      this.personalAvsPresetSelect.addEventListener("change", () => {
+        const id = this.personalAvsPresetSelect.value;
+        if (!id) return;
+        if (this.avsPresetSelect) this.avsPresetSelect.value = "";
+        if (this.localAvsPresetSelect) this.localAvsPresetSelect.value = "";
+        this.updatePersonalAvsActions();
+        void Promise.resolve(opts.onPickPersonalAvsPreset(id)).catch((error) => this.status(String(error), true));
+      });
+      this.personalAvsRandomButton = presetIconButton("Random preset from My AVS", "\u2684");
+      this.personalAvsRandomButton.addEventListener("click", () => {
+        chooseRandomPreset(this.personalAvsPresetSelect);
+      });
+      const picker = presetPicker(this.personalAvsRandomButton, this.personalAvsPresetSelect);
+      if (opts.onAddPersonalAvsPreset) {
+        this.personalAvsAddButton = presetIconButton("Add current edited AVS preset to My AVS", "+");
+        this.personalAvsAddButton.disabled = true;
+        this.personalAvsAddButton.addEventListener("click", () => {
+          this.personalAvsAddButton.disabled = true;
+          void Promise.resolve(opts.onAddPersonalAvsPreset()).then(
+            () => this.status("saved current preset to My AVS"),
+            (error) => this.status(String(error), true)
+          ).finally(() => this.updatePersonalAvsActions());
+        });
+        picker.append(this.personalAvsAddButton);
+      }
+      if (opts.onRemovePersonalAvsPreset) {
+        this.personalAvsRemoveButton = presetIconButton("Delete selected preset from My AVS", "\u2212");
+        this.personalAvsRemoveButton.classList.add("is-destructive");
+        this.personalAvsRemoveButton.addEventListener("click", () => {
+          const id = this.personalAvsPresetSelect?.value ?? "";
+          const name = this.personalAvsPresetSelect?.selectedOptions[0]?.textContent ?? "this preset";
+          if (!id || !window.confirm(`Remove ${name} from My AVS bank?`)) return;
+          this.personalAvsRemoveButton.disabled = true;
+          void Promise.resolve(opts.onRemovePersonalAvsPreset(id)).then(
+            () => this.status(`removed ${name} from My AVS`),
+            (error) => this.status(String(error), true)
+          ).finally(() => this.updatePersonalAvsActions());
+        });
+        picker.append(this.personalAvsRemoveButton);
+      }
+      row.append(plabel, picker);
+      const bankActions = el("div", "ui-preset-bank-actions");
+      if (opts.onImportPersonalAvsBank) {
+        const input = el("input");
+        input.type = "file";
+        input.accept = "application/json,.json";
+        input.hidden = true;
+        input.addEventListener("change", () => {
+          const file = input.files?.[0];
+          if (file) void Promise.resolve(opts.onImportPersonalAvsBank(file)).catch((error) => this.status(String(error), true));
+          input.value = "";
+        });
+        const importButton = el("button", "ui-transport-button", "import bank");
+        importButton.type = "button";
+        importButton.addEventListener("click", () => input.click());
+        bankActions.append(importButton, input);
+      }
+      if (opts.onExportPersonalAvsBank) {
+        const exportButton = el("button", "ui-transport-button", "export bank");
+        exportButton.type = "button";
+        exportButton.addEventListener("click", () => {
+          void Promise.resolve(opts.onExportPersonalAvsBank()).catch((error) => this.status(String(error), true));
+        });
+        bankActions.append(exportButton);
+      }
+      presetSection.append(row, bankActions);
+      this.updatePersonalAvsActions();
+    }
+    presetSection.append(autoWrap);
     const layers = el("div", "ui-section ui-layers-section");
     const layersLegend = el(
       "span",
@@ -9812,15 +10255,20 @@ var LayerUI = class {
     this.palette = preset2.palette;
     this.nameInput.value = preset2.name;
     this.seedInput.value = String(preset2.seed);
-    if (this.presetSelect) {
-      const has = [...this.presetSelect.options].some((o) => o.value === preset2.name);
-      if (has) this.presetSelect.value = preset2.name;
-    }
     this.refresh();
   }
   /** Reflect the director's enabled state, which the keyboard can also change. */
   setAuto(enabled) {
     if (this.autoBox) this.autoBox.checked = enabled;
+  }
+  /** Keep every preset selector aligned with the bank that actually rendered. */
+  setAvsPresetSelection(id, bank) {
+    if (this.avsPresetSelect) this.avsPresetSelect.value = bank === "bundled" ? id : "";
+    if (this.localAvsPresetSelect) {
+      const has = [...this.localAvsPresetSelect.options].some((entry) => entry.value === id);
+      this.localAvsPresetSelect.value = bank === "local" && has ? id : "";
+    }
+    if (this.personalAvsPresetSelect) this.personalAvsPresetSelect.value = bank === "personal" ? id : "";
   }
   /** The preset as it stands: stack order plus the metadata this panel holds. */
   getPreset() {
@@ -9842,6 +10290,53 @@ var LayerUI = class {
       return;
     }
     layers.forEach((layer2, i) => this.list.append(this.buildRow(layer2.spec, i)));
+  }
+  setPersonalAvsPresets(presets) {
+    if (!this.personalAvsPresetSelect) return;
+    const selected = this.personalAvsPresetSelect.value;
+    this.personalAvsPresetSelect.replaceChildren(option("", presets.length ? `choose from ${presets.length.toLocaleString()} saved presets\u2026` : "bank is empty \xB7 use Add to bank"));
+    for (const preset2 of presets) this.personalAvsPresetSelect.append(option(preset2.id, preset2.name));
+    if (presets.some((preset2) => preset2.id === selected)) this.personalAvsPresetSelect.value = selected;
+    this.updatePersonalAvsActions();
+  }
+  setPersonalAvsCanAdd(canAdd) {
+    this.personalAvsCanAdd = canAdd;
+    this.updatePersonalAvsActions();
+  }
+  updatePersonalAvsActions() {
+    const hasPresets = Boolean(this.personalAvsPresetSelect?.options.length && this.personalAvsPresetSelect.options.length > 1);
+    const hasSelection = Boolean(this.personalAvsPresetSelect?.value);
+    if (this.personalAvsAddButton) this.personalAvsAddButton.disabled = !this.personalAvsCanAdd;
+    if (this.personalAvsRandomButton) this.personalAvsRandomButton.disabled = !hasPresets;
+    if (this.personalAvsRemoveButton) this.personalAvsRemoveButton.disabled = !hasSelection;
+  }
+  /**
+   * Replace only the graph-editing region while keeping shared transport and
+   * preset selection visible. Passing null restores the native LayerStack.
+   */
+  setLayerEditor(content) {
+    const layers = this.list.parentElement;
+    if (!layers) return;
+    let alternate = layers.querySelector(":scope > .ui-alternate-layer-editor");
+    const addField = this.addSelect.closest(".ui-field");
+    const presetTools = this.root.querySelector(".ui-preset-tools");
+    if (content) {
+      if (!alternate) {
+        alternate = el("div", "ui-alternate-layer-editor");
+        layers.append(alternate);
+      }
+      alternate.replaceChildren(content);
+      this.root.classList.add("is-avs-editor");
+      this.list.hidden = true;
+      if (addField) addField.hidden = true;
+      if (presetTools) presetTools.hidden = true;
+      return;
+    }
+    alternate?.remove();
+    this.root.classList.remove("is-avs-editor");
+    this.list.hidden = false;
+    if (addField) addField.hidden = false;
+    if (presetTools) presetTools.hidden = false;
   }
   /**
    * Per-frame transport readout.
@@ -10387,203 +10882,254 @@ function ensureStylesheet(href) {
   document.head.append(link);
 }
 
+// src/avs/framebuffer.ts
+var AVS_LIST_BLEND_MODES = {
+  0: "ignore",
+  1: "replace",
+  2: "average",
+  3: "maximum",
+  4: "additive",
+  5: "destination-minus-source",
+  6: "source-minus-destination",
+  7: "every-other-line",
+  8: "every-other-pixel",
+  9: "xor",
+  10: "adjustable",
+  11: "multiply",
+  12: "buffer-depth",
+  13: "minimum"
+};
+var AVS_BLEND_TABLE = (() => {
+  const values = new Uint8Array(256 * 256);
+  for (let x = 0; x < 256; x++) {
+    const row = x << 8;
+    for (let y = 0; y < 256; y++) values[row | y] = Math.trunc(x / 255 * y);
+  }
+  return values;
+})();
+var AvsFramebuffer = class _AvsFramebuffer {
+  constructor(width, height, pixels) {
+    this.width = width;
+    this.height = height;
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+      throw new RangeError(`Invalid AVS framebuffer size ${width}x${height}`);
+    }
+    const length = width * height;
+    if (pixels && pixels.length !== length) {
+      throw new RangeError(`AVS framebuffer has ${pixels.length} pixels, expected ${length}`);
+    }
+    this.pixels = pixels ?? new Uint32Array(length);
+  }
+  pixels;
+  clear(color = 0) {
+    this.pixels.fill(color & 16777215);
+  }
+  clone() {
+    return new _AvsFramebuffer(this.width, this.height, this.pixels.slice());
+  }
+  copyFrom(source3) {
+    this.assertShape(source3);
+    this.pixels.set(source3.pixels);
+  }
+  /** Blend source (the list/local image) over this destination/parent image. */
+  blendFrom(source3, mode4, amount = 128, depth, invertDepth = false) {
+    this.assertShape(source3);
+    if (mode4 === "ignore") return;
+    if (mode4 === "replace") {
+      this.copyFrom(source3);
+      return;
+    }
+    if (mode4 === "buffer-depth") {
+      if (!depth) return;
+      this.assertShape(depth);
+    }
+    const alpha = clampByte(amount);
+    const destination = this.pixels;
+    const input = source3.pixels;
+    const length = destination.length;
+    if (mode4 === "every-other-line") {
+      const width = this.width;
+      for (let y = 0; y < this.height; y += 2) {
+        const end = (y + 1) * width;
+        for (let i = y * width; i < end; i++) destination[i] = input[i];
+      }
+      return;
+    }
+    if (mode4 === "every-other-pixel") {
+      const width = this.width;
+      for (let y = 0; y < this.height; y++) {
+        const end = (y + 1) * width;
+        for (let i = y * width + (y & 1); i < end; i += 2) destination[i] = input[i];
+      }
+      return;
+    }
+    if (mode4 === "buffer-depth") {
+      const depthPixels = depth.pixels;
+      for (let i = 0; i < length; i++) {
+        const depthPixel = depthPixels[i];
+        const low = depthPixel & 255;
+        const middle = depthPixel >>> 8 & 255;
+        const high = depthPixel >>> 16 & 255;
+        let mix = low > middle ? low : middle;
+        if (high > mix) mix = high;
+        if (invertDepth) mix = 255 - mix;
+        destination[i] = adjustablePixel(input[i], destination[i], mix);
+      }
+      return;
+    }
+    switch (mode4) {
+      case "average":
+        for (let i = 0; i < length; i++) {
+          destination[i] = (input[i] >>> 1 & 8355711) + (destination[i] >>> 1 & 8355711);
+        }
+        return;
+      case "maximum":
+        for (let i = 0; i < length; i++) destination[i] = maximumPixel(input[i], destination[i]);
+        return;
+      case "minimum":
+        for (let i = 0; i < length; i++) destination[i] = minimumPixel(input[i], destination[i]);
+        return;
+      case "additive":
+        for (let i = 0; i < length; i++) destination[i] = additivePixel(input[i], destination[i]);
+        return;
+      case "destination-minus-source":
+        for (let i = 0; i < length; i++) destination[i] = subtractPixel(destination[i], input[i]);
+        return;
+      case "source-minus-destination":
+        for (let i = 0; i < length; i++) destination[i] = subtractPixel(input[i], destination[i]);
+        return;
+      case "xor":
+        for (let i = 0; i < length; i++) destination[i] = (input[i] ^ destination[i]) & 16777215;
+        return;
+      case "adjustable":
+        for (let i = 0; i < length; i++) destination[i] = adjustablePixel(input[i], destination[i], alpha);
+        return;
+      case "multiply":
+        for (let i = 0; i < length; i++) destination[i] = multiplyPixel(input[i], destination[i]);
+        return;
+    }
+  }
+  assertShape(other) {
+    if (other.width !== this.width || other.height !== this.height) {
+      throw new RangeError(`AVS framebuffer mismatch ${other.width}x${other.height} vs ${this.width}x${this.height}`);
+    }
+  }
+};
+var AvsBufferBank = class {
+  buffers = new Array(8).fill(null);
+  get(index, width, height, create = true) {
+    if (!Number.isInteger(index) || index < 0 || index >= 8) return null;
+    const current = this.buffers[index];
+    if (current?.width === width && current.height === height) return current;
+    if (!create) return null;
+    const next = new AvsFramebuffer(width, height);
+    this.buffers[index] = next;
+    return next;
+  }
+  clear() {
+    for (const buffer of this.buffers) buffer?.clear();
+  }
+  release() {
+    this.buffers.fill(null);
+  }
+};
+function decodeAvsListBlend(code) {
+  return AVS_LIST_BLEND_MODES[code] ?? "ignore";
+}
+function blendPixel(source3, destination, mode4, amount = 128) {
+  source3 &= 16777215;
+  destination &= 16777215;
+  switch (mode4) {
+    case "ignore":
+      return destination;
+    case "replace":
+      return source3;
+    case "average":
+      return (source3 >>> 1 & 8355711) + (destination >>> 1 & 8355711);
+    case "maximum":
+      return maximumPixel(source3, destination);
+    case "minimum":
+      return minimumPixel(source3, destination);
+    case "additive":
+      return additivePixel(source3, destination);
+    case "destination-minus-source":
+      return subtractPixel(destination, source3);
+    case "source-minus-destination":
+      return subtractPixel(source3, destination);
+    case "xor":
+      return (source3 ^ destination) & 16777215;
+    case "adjustable":
+    case "buffer-depth": {
+      const a = clampByte(amount);
+      return adjustablePixel(source3, destination, a);
+    }
+    case "multiply":
+      return multiplyPixel(source3, destination);
+    // Selection for these modes is performed by blendFrom because it needs x/y.
+    case "every-other-line":
+    case "every-other-pixel":
+      return source3;
+  }
+}
+function maximumPixel(a, b) {
+  const a0 = a & 255;
+  const b0 = b & 255;
+  const a1 = a >>> 8 & 255;
+  const b1 = b >>> 8 & 255;
+  const a2 = a >>> 16 & 255;
+  const b2 = b >>> 16 & 255;
+  return (a0 > b0 ? a0 : b0) | (a1 > b1 ? a1 : b1) << 8 | (a2 > b2 ? a2 : b2) << 16;
+}
+function minimumPixel(a, b) {
+  const a0 = a & 255;
+  const b0 = b & 255;
+  const a1 = a >>> 8 & 255;
+  const b1 = b >>> 8 & 255;
+  const a2 = a >>> 16 & 255;
+  const b2 = b >>> 16 & 255;
+  return (a0 < b0 ? a0 : b0) | (a1 < b1 ? a1 : b1) << 8 | (a2 < b2 ? a2 : b2) << 16;
+}
+function additivePixel(a, b) {
+  let c0 = (a & 255) + (b & 255);
+  let c1 = (a >>> 8 & 255) + (b >>> 8 & 255);
+  let c2 = (a >>> 16 & 255) + (b >>> 16 & 255);
+  if (c0 > 255) c0 = 255;
+  if (c1 > 255) c1 = 255;
+  if (c2 > 255) c2 = 255;
+  return c0 | c1 << 8 | c2 << 16;
+}
+function subtractPixel(a, b) {
+  let c0 = (a & 255) - (b & 255);
+  let c1 = (a >>> 8 & 255) - (b >>> 8 & 255);
+  let c2 = (a >>> 16 & 255) - (b >>> 16 & 255);
+  if (c0 < 0) c0 = 0;
+  if (c1 < 0) c1 = 0;
+  if (c2 < 0) c2 = 0;
+  return c0 | c1 << 8 | c2 << 16;
+}
+function adjustablePixel(source3, destination, amount) {
+  const inverse = 255 - amount;
+  const c0 = table(source3 & 255, amount) + table(destination & 255, inverse);
+  const c1 = table(source3 >>> 8 & 255, amount) + table(destination >>> 8 & 255, inverse);
+  const c2 = table(source3 >>> 16 & 255, amount) + table(destination >>> 16 & 255, inverse);
+  return c0 | c1 << 8 | c2 << 16;
+}
+function multiplyPixel(a, b) {
+  return table(a & 255, b & 255) | table(a >>> 8 & 255, b >>> 8 & 255) << 8 | table(a >>> 16 & 255, b >>> 16 & 255) << 16;
+}
+function table(x, y) {
+  return AVS_BLEND_TABLE[x << 8 | y];
+}
+function clampByte(value) {
+  return value < 0 ? 0 : value > 255 ? 255 : Math.trunc(value);
+}
+
 // src/avs/types.ts
 var AVS_PRESET_HEADER_V1 = "Nullsoft AVS Preset 0.1";
 var AVS_PRESET_HEADER_V2 = "Nullsoft AVS Preset 0.2";
 var AVS_AUDIO_SAMPLES = 576;
 var AVS_FFT_SIZE = 512;
 var AVS_FFT_BINS = AVS_FFT_SIZE / 2;
-
-// src/avs/preset.ts
-var HEADER_BYTES2 = 24;
-var ROOT_CONFIG_BYTES = 1;
-var EFFECT_LIST_ID = -2;
-var DLL_RENDER_BASE = 16384;
-var TEXT = new TextDecoder("windows-1252");
-var EFFECT_LIST_CODE_ID = 16384;
-var EFFECT_LIST_CODE_NAME = "AVS 2.8+ Effect List Config";
-var AvsPresetError = class extends Error {
-  constructor(message, offset) {
-    super(`${message} (byte ${offset})`);
-    this.offset = offset;
-    this.name = "AvsPresetError";
-  }
-};
-function parseAvsPreset(input) {
-  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
-  if (bytes.byteLength < HEADER_BYTES2 + ROOT_CONFIG_BYTES) {
-    throw new AvsPresetError("AVS preset is shorter than its header", bytes.byteLength);
-  }
-  const header = decode(bytes.subarray(0, HEADER_BYTES2));
-  let version;
-  if (header === AVS_PRESET_HEADER_V2) version = 2;
-  else if (header === AVS_PRESET_HEADER_V1) version = 1;
-  else throw new AvsPresetError(`Unsupported AVS preset signature ${JSON.stringify(header)}`, 0);
-  const components = readComponents(bytes, HEADER_BYTES2 + ROOT_CONFIG_BYTES, bytes.byteLength, "");
-  return {
-    version,
-    header,
-    clearEveryFrame: bytes[HEADER_BYTES2] === 1,
-    components,
-    byteLength: bytes.byteLength
-  };
-}
-function readComponents(bytes, start, end, parent, absoluteBase = 0) {
-  const components = [];
-  let cursor = start;
-  let ordinal = 0;
-  while (cursor < end) {
-    if (end - cursor < 8) {
-      for (let i = cursor; i < end; i++) {
-        if (bytes[i] !== 0) throw new AvsPresetError("Truncated renderer record", absoluteBase + cursor);
-      }
-      break;
-    }
-    ordinal++;
-    const path = parent ? `${parent}.${ordinal}` : `${ordinal}`;
-    const effectId = i32(bytes, cursor);
-    const isApe = effectId !== EFFECT_LIST_ID && effectId >>> 0 >= DLL_RENDER_BASE;
-    const headerBytes = isApe ? 40 : 8;
-    requireBytes(cursor, headerBytes, end, "renderer header", absoluteBase);
-    const apeId = isApe ? nulText(bytes.subarray(cursor + 4, cursor + 36)) : null;
-    const lengthOffset = cursor + 4 + (isApe ? 32 : 0);
-    const payloadLength = u32(bytes, lengthOffset);
-    const payloadStart = cursor + headerBytes;
-    const payloadEnd = payloadStart + payloadLength;
-    if (!Number.isSafeInteger(payloadEnd) || payloadEnd > end) {
-      throw new AvsPresetError(
-        `Renderer ${path} payload (${payloadLength} bytes) exceeds its container`,
-        absoluteBase + lengthOffset
-      );
-    }
-    const payload = bytes.slice(payloadStart, payloadEnd);
-    let list = null;
-    let listCode = null;
-    let children = [];
-    if (effectId === EFFECT_LIST_ID && payload.length > 0) {
-      list = readListSettings(payload, payloadStart);
-      let childOffset = list.byteLength;
-      const codeRecord = readEffectListCode(payload, childOffset, payloadStart);
-      if (codeRecord) {
-        listCode = codeRecord.code;
-        childOffset = codeRecord.nextOffset;
-      }
-      children = readComponents(payload, childOffset, payload.length, path, absoluteBase + payloadStart);
-    }
-    components.push({
-      effectId,
-      apeId,
-      payload,
-      fileOffset: absoluteBase + cursor,
-      path,
-      children,
-      list,
-      listCode
-    });
-    cursor = payloadEnd;
-  }
-  return components;
-}
-function readListSettings(payload, absoluteOffset) {
-  const extended = (payload[0] & 128) !== 0;
-  if (!extended) {
-    const mode5 = payload[0];
-    return {
-      mode: mode5,
-      // r_list.h stores a DISABLE bit. This inversion is easy to miss because
-      // most serialized modes are zero, meaning an enabled, uncleared list.
-      enabled: (mode5 & 2) === 0,
-      clearEveryFrame: (mode5 & 1) !== 0,
-      inputBlendMode: mode5 >>> 8 & 31,
-      // The output selector is stored with bit zero toggled for historical
-      // compatibility with the original list renderer.
-      outputBlendMode: mode5 >>> 16 & 31 ^ 1,
-      inputBlendValue: 128,
-      outputBlendValue: 128,
-      inputBuffer: 0,
-      outputBuffer: 0,
-      inputInvert: false,
-      outputInvert: false,
-      beatRender: false,
-      beatRenderFrames: 1,
-      byteLength: 1
-    };
-  }
-  requireBytes(0, 5, payload.length, "extended Effect List header", absoluteOffset);
-  const mode4 = u32(payload, 1);
-  const byteLength = payload[4] + 1;
-  if (byteLength < 5 || byteLength > payload.length) {
-    throw new AvsPresetError(`Invalid Effect List header length ${byteLength}`, absoluteOffset + 4);
-  }
-  const ext = (index, fallback) => 5 + index * 4 + 4 <= byteLength ? i32(payload, 5 + index * 4) : fallback;
-  return {
-    mode: mode4,
-    enabled: (mode4 & 2) === 0,
-    clearEveryFrame: (mode4 & 1) !== 0,
-    inputBlendMode: mode4 >>> 8 & 31,
-    outputBlendMode: mode4 >>> 16 & 31 ^ 1,
-    inputBlendValue: ext(0, 128),
-    outputBlendValue: ext(1, 128),
-    inputBuffer: ext(2, 0),
-    outputBuffer: ext(3, 0),
-    inputInvert: ext(4, 0) !== 0,
-    outputInvert: ext(5, 0) !== 0,
-    beatRender: ext(6, 0) !== 0,
-    beatRenderFrames: ext(7, 1),
-    byteLength
-  };
-}
-function readEffectListCode(payload, offset, absoluteOffset) {
-  if (payload.length - offset < 40) return null;
-  if (i32(payload, offset) !== EFFECT_LIST_CODE_ID) return null;
-  const name = nulText(payload.subarray(offset + 4, offset + 36));
-  if (name !== EFFECT_LIST_CODE_NAME) return null;
-  const length = u32(payload, offset + 36);
-  const start = offset + 40;
-  const end = start + length;
-  if (end > payload.length) {
-    throw new AvsPresetError("Effect List code record exceeds its container", absoluteOffset + offset + 36);
-  }
-  const raw = payload.slice(start, end);
-  const decoded = decodeListCode(raw);
-  return { code: { ...decoded, raw }, nextOffset: end };
-}
-function decodeListCode(raw) {
-  if (raw.length < 4) return { enabled: false, init: "", frame: "" };
-  let cursor = 0;
-  const enabled = i32(raw, cursor) !== 0;
-  cursor += 4;
-  const readString4 = () => {
-    if (cursor + 4 > raw.length) return "";
-    const length = u32(raw, cursor);
-    cursor += 4;
-    const end = Math.min(raw.length, cursor + length);
-    const value = nulText(raw.subarray(cursor, end));
-    cursor = end;
-    return value;
-  };
-  return { enabled, init: readString4(), frame: readString4() };
-}
-function requireBytes(offset, length, end, what, base2 = 0) {
-  if (offset < 0 || length < 0 || offset + length > end) {
-    throw new AvsPresetError(`Truncated ${what}`, base2 + offset);
-  }
-}
-function u32(bytes, offset) {
-  requireBytes(offset, 4, bytes.length, "uint32");
-  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(offset, true);
-}
-function i32(bytes, offset) {
-  requireBytes(offset, 4, bytes.length, "int32");
-  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(offset, true);
-}
-function decode(bytes) {
-  return TEXT.decode(bytes);
-}
-function nulText(bytes) {
-  const zero = bytes.indexOf(0);
-  return decode(zero < 0 ? bytes : bytes.subarray(0, zero));
-}
 
 // src/avs/audio.ts
 var AvsBeatDetector = class {
@@ -11055,44 +11601,6 @@ var HELPERS = {
   },
   modulo(a, b) {
     return Math.abs(b) < Number.EPSILON ? 0 : Number.isFinite(a % b) ? a % b : 0;
-  },
-  assignment(operator, left, right) {
-    let result;
-    switch (operator) {
-      case "=":
-        result = right;
-        break;
-      case "+=":
-        result = left + right;
-        break;
-      case "-=":
-        result = left - right;
-        break;
-      case "*=":
-        result = left * right;
-        break;
-      case "/=":
-        result = this.divide(left, right);
-        break;
-      case "%=":
-        result = this.modulo(left, right);
-        break;
-      case "|=":
-        result = this.integer(left) | this.integer(right);
-        break;
-      case "&=":
-        result = this.integer(left) & this.integer(right);
-        break;
-      case "^=":
-        result = this.integer(left) ^ this.integer(right);
-        break;
-      case "**=":
-        result = Math.pow(left, right);
-        break;
-      default:
-        result = 0;
-    }
-    return this.finite(result);
   }
 };
 function compileAvsEelJit(node) {
@@ -11261,7 +11769,7 @@ var Builder = class {
       const rightTemp = this.store(right);
       const left = this.store(targetAccess);
       const result = this.temp();
-      this.lines.push(`const ${result}=H.assignment(${JSON.stringify(operator)},${left},${rightTemp});`);
+      this.lines.push(`const ${result}=${this.assignment(operator, left, rightTemp)};`);
       this.lines.push(`${targetAccess}=${result};`);
       return result;
     }
@@ -11271,7 +11779,7 @@ var Builder = class {
       const global = target.name === "gmegabuf";
       const left = this.store(`vm.readMemory(${global},${address})`);
       const result = this.temp();
-      this.lines.push(`const ${result}=H.assignment(${JSON.stringify(operator)},${left},${right});`);
+      this.lines.push(`const ${result}=${this.assignment(operator, left, right)};`);
       this.lines.push(`vm.writeMemory(${global},${address},${result});`);
       return result;
     }
@@ -11385,6 +11893,33 @@ var Builder = class {
     this.lines.push(`const ${temporary}=${expression};`);
     return temporary;
   }
+  /** Inline the compile-time-known assignment operator in hot point scripts. */
+  assignment(operator, left, right) {
+    switch (operator) {
+      case "=":
+        return `H.finite(${right})`;
+      case "+=":
+        return `H.finite((${left})+(${right}))`;
+      case "-=":
+        return `H.finite((${left})-(${right}))`;
+      case "*=":
+        return `H.finite((${left})*(${right}))`;
+      case "/=":
+        return `H.divide(${left},${right})`;
+      case "%=":
+        return `H.modulo(${left},${right})`;
+      case "|=":
+        return `(H.integer(${left})|H.integer(${right}))`;
+      case "&=":
+        return `(H.integer(${left})&H.integer(${right}))`;
+      case "^=":
+        return `(H.integer(${left})^H.integer(${right}))`;
+      case "**=":
+        return `H.finite(Math.pow(${left},${right}))`;
+      default:
+        throw new UnsupportedJitNode();
+    }
+  }
   temp() {
     return `t${this.temporary++}`;
   }
@@ -11409,16 +11944,17 @@ function compileAvsEel(source3) {
 function compileAvsEelAst(ast) {
   const fallback = compileNode(ast.body);
   const bindJit = ast.source.length <= 1400 ? compileAvsEelJit(ast.body) : null;
+  const bind = (vm) => bindJit ? bindJit(vm) : () => fallback(vm);
   let boundVm;
   let boundExecute;
   const execute7 = (vm) => {
     if (vm !== boundVm) {
       boundVm = vm;
-      boundExecute = bindJit ? bindJit(vm) : () => fallback(vm);
+      boundExecute = bind(vm);
     }
     return boundExecute();
   };
-  return { source: ast.source, ast, execute: execute7 };
+  return { source: ast.source, ast, bind, execute: execute7 };
 }
 function compileNode(node) {
   switch (node.kind) {
@@ -11972,248 +12508,6 @@ function registerIndex(name) {
   return tens >= 0 && tens <= 9 && ones >= 0 && ones <= 9 ? tens * 10 + ones : -1;
 }
 
-// src/avs/framebuffer.ts
-var AVS_LIST_BLEND_MODES = {
-  0: "ignore",
-  1: "replace",
-  2: "average",
-  3: "maximum",
-  4: "additive",
-  5: "destination-minus-source",
-  6: "source-minus-destination",
-  7: "every-other-line",
-  8: "every-other-pixel",
-  9: "xor",
-  10: "adjustable",
-  11: "multiply",
-  12: "buffer-depth",
-  13: "minimum"
-};
-var AVS_BLEND_TABLE = (() => {
-  const values = new Uint8Array(256 * 256);
-  for (let x = 0; x < 256; x++) {
-    const row = x << 8;
-    for (let y = 0; y < 256; y++) values[row | y] = Math.trunc(x / 255 * y);
-  }
-  return values;
-})();
-var AvsFramebuffer = class _AvsFramebuffer {
-  constructor(width, height, pixels) {
-    this.width = width;
-    this.height = height;
-    if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
-      throw new RangeError(`Invalid AVS framebuffer size ${width}x${height}`);
-    }
-    const length = width * height;
-    if (pixels && pixels.length !== length) {
-      throw new RangeError(`AVS framebuffer has ${pixels.length} pixels, expected ${length}`);
-    }
-    this.pixels = pixels ?? new Uint32Array(length);
-  }
-  pixels;
-  clear(color = 0) {
-    this.pixels.fill(color & 16777215);
-  }
-  clone() {
-    return new _AvsFramebuffer(this.width, this.height, this.pixels.slice());
-  }
-  copyFrom(source3) {
-    this.assertShape(source3);
-    this.pixels.set(source3.pixels);
-  }
-  /** Blend source (the list/local image) over this destination/parent image. */
-  blendFrom(source3, mode4, amount = 128, depth, invertDepth = false) {
-    this.assertShape(source3);
-    if (mode4 === "ignore") return;
-    if (mode4 === "replace") {
-      this.copyFrom(source3);
-      return;
-    }
-    if (mode4 === "buffer-depth") {
-      if (!depth) return;
-      this.assertShape(depth);
-    }
-    const alpha = clampByte(amount);
-    const destination = this.pixels;
-    const input = source3.pixels;
-    const length = destination.length;
-    if (mode4 === "every-other-line") {
-      const width = this.width;
-      for (let y = 0; y < this.height; y += 2) {
-        const end = (y + 1) * width;
-        for (let i = y * width; i < end; i++) destination[i] = input[i];
-      }
-      return;
-    }
-    if (mode4 === "every-other-pixel") {
-      const width = this.width;
-      for (let y = 0; y < this.height; y++) {
-        const end = (y + 1) * width;
-        for (let i = y * width + (y & 1); i < end; i += 2) destination[i] = input[i];
-      }
-      return;
-    }
-    if (mode4 === "buffer-depth") {
-      const depthPixels = depth.pixels;
-      for (let i = 0; i < length; i++) {
-        const depthPixel = depthPixels[i];
-        const low = depthPixel & 255;
-        const middle = depthPixel >>> 8 & 255;
-        const high = depthPixel >>> 16 & 255;
-        let mix = low > middle ? low : middle;
-        if (high > mix) mix = high;
-        if (invertDepth) mix = 255 - mix;
-        destination[i] = adjustablePixel(input[i], destination[i], mix);
-      }
-      return;
-    }
-    switch (mode4) {
-      case "average":
-        for (let i = 0; i < length; i++) {
-          destination[i] = (input[i] >>> 1 & 8355711) + (destination[i] >>> 1 & 8355711);
-        }
-        return;
-      case "maximum":
-        for (let i = 0; i < length; i++) destination[i] = maximumPixel(input[i], destination[i]);
-        return;
-      case "minimum":
-        for (let i = 0; i < length; i++) destination[i] = minimumPixel(input[i], destination[i]);
-        return;
-      case "additive":
-        for (let i = 0; i < length; i++) destination[i] = additivePixel(input[i], destination[i]);
-        return;
-      case "destination-minus-source":
-        for (let i = 0; i < length; i++) destination[i] = subtractPixel(destination[i], input[i]);
-        return;
-      case "source-minus-destination":
-        for (let i = 0; i < length; i++) destination[i] = subtractPixel(input[i], destination[i]);
-        return;
-      case "xor":
-        for (let i = 0; i < length; i++) destination[i] = (input[i] ^ destination[i]) & 16777215;
-        return;
-      case "adjustable":
-        for (let i = 0; i < length; i++) destination[i] = adjustablePixel(input[i], destination[i], alpha);
-        return;
-      case "multiply":
-        for (let i = 0; i < length; i++) destination[i] = multiplyPixel(input[i], destination[i]);
-        return;
-    }
-  }
-  assertShape(other) {
-    if (other.width !== this.width || other.height !== this.height) {
-      throw new RangeError(`AVS framebuffer mismatch ${other.width}x${other.height} vs ${this.width}x${this.height}`);
-    }
-  }
-};
-var AvsBufferBank = class {
-  buffers = new Array(8).fill(null);
-  get(index, width, height, create = true) {
-    if (!Number.isInteger(index) || index < 0 || index >= 8) return null;
-    const current = this.buffers[index];
-    if (current?.width === width && current.height === height) return current;
-    if (!create) return null;
-    const next = new AvsFramebuffer(width, height);
-    this.buffers[index] = next;
-    return next;
-  }
-  clear() {
-    for (const buffer of this.buffers) buffer?.clear();
-  }
-  release() {
-    this.buffers.fill(null);
-  }
-};
-function decodeAvsListBlend(code) {
-  return AVS_LIST_BLEND_MODES[code] ?? "ignore";
-}
-function blendPixel(source3, destination, mode4, amount = 128) {
-  source3 &= 16777215;
-  destination &= 16777215;
-  switch (mode4) {
-    case "ignore":
-      return destination;
-    case "replace":
-      return source3;
-    case "average":
-      return (source3 >>> 1 & 8355711) + (destination >>> 1 & 8355711);
-    case "maximum":
-      return maximumPixel(source3, destination);
-    case "minimum":
-      return minimumPixel(source3, destination);
-    case "additive":
-      return additivePixel(source3, destination);
-    case "destination-minus-source":
-      return subtractPixel(destination, source3);
-    case "source-minus-destination":
-      return subtractPixel(source3, destination);
-    case "xor":
-      return (source3 ^ destination) & 16777215;
-    case "adjustable":
-    case "buffer-depth": {
-      const a = clampByte(amount);
-      return adjustablePixel(source3, destination, a);
-    }
-    case "multiply":
-      return multiplyPixel(source3, destination);
-    // Selection for these modes is performed by blendFrom because it needs x/y.
-    case "every-other-line":
-    case "every-other-pixel":
-      return source3;
-  }
-}
-function maximumPixel(a, b) {
-  const a0 = a & 255;
-  const b0 = b & 255;
-  const a1 = a >>> 8 & 255;
-  const b1 = b >>> 8 & 255;
-  const a2 = a >>> 16 & 255;
-  const b2 = b >>> 16 & 255;
-  return (a0 > b0 ? a0 : b0) | (a1 > b1 ? a1 : b1) << 8 | (a2 > b2 ? a2 : b2) << 16;
-}
-function minimumPixel(a, b) {
-  const a0 = a & 255;
-  const b0 = b & 255;
-  const a1 = a >>> 8 & 255;
-  const b1 = b >>> 8 & 255;
-  const a2 = a >>> 16 & 255;
-  const b2 = b >>> 16 & 255;
-  return (a0 < b0 ? a0 : b0) | (a1 < b1 ? a1 : b1) << 8 | (a2 < b2 ? a2 : b2) << 16;
-}
-function additivePixel(a, b) {
-  let c0 = (a & 255) + (b & 255);
-  let c1 = (a >>> 8 & 255) + (b >>> 8 & 255);
-  let c2 = (a >>> 16 & 255) + (b >>> 16 & 255);
-  if (c0 > 255) c0 = 255;
-  if (c1 > 255) c1 = 255;
-  if (c2 > 255) c2 = 255;
-  return c0 | c1 << 8 | c2 << 16;
-}
-function subtractPixel(a, b) {
-  let c0 = (a & 255) - (b & 255);
-  let c1 = (a >>> 8 & 255) - (b >>> 8 & 255);
-  let c2 = (a >>> 16 & 255) - (b >>> 16 & 255);
-  if (c0 < 0) c0 = 0;
-  if (c1 < 0) c1 = 0;
-  if (c2 < 0) c2 = 0;
-  return c0 | c1 << 8 | c2 << 16;
-}
-function adjustablePixel(source3, destination, amount) {
-  const inverse = 255 - amount;
-  const c0 = table(source3 & 255, amount) + table(destination & 255, inverse);
-  const c1 = table(source3 >>> 8 & 255, amount) + table(destination >>> 8 & 255, inverse);
-  const c2 = table(source3 >>> 16 & 255, amount) + table(destination >>> 16 & 255, inverse);
-  return c0 | c1 << 8 | c2 << 16;
-}
-function multiplyPixel(a, b) {
-  return table(a & 255, b & 255) | table(a >>> 8 & 255, b >>> 8 & 255) << 8 | table(a >>> 16 & 255, b >>> 16 & 255) << 16;
-}
-function table(x, y) {
-  return AVS_BLEND_TABLE[x << 8 | y];
-}
-function clampByte(value) {
-  return value < 0 ? 0 : value > 255 ? 255 : Math.trunc(value);
-}
-
 // src/avs/executor.ts
 var AvsEffectRegistry = class {
   /** Shared NS-EEL registers and gmegabuf for every effect in this graph. */
@@ -12240,6 +12534,7 @@ var AvsExecutor = class {
     this.preset = preset2;
     this.registry = registry;
     this.eelGlobal = registry.eelGlobal;
+    this.indexComponents(preset2.components, null);
   }
   buffers = new AvsBufferBank();
   stats = { rendered: 0, unsupported: 0, lists: 0 };
@@ -12249,6 +12544,56 @@ var AvsExecutor = class {
   alternates = /* @__PURE__ */ new Map();
   beatFrames = /* @__PURE__ */ new Map();
   listEel = /* @__PURE__ */ new Map();
+  components = /* @__PURE__ */ new Map();
+  parents = /* @__PURE__ */ new Map();
+  controlsByPath = /* @__PURE__ */ new Map();
+  soloSelection = null;
+  /** Current non-default controls, in preset traversal order. */
+  get controls() {
+    const result = [];
+    for (const path of this.components.keys()) {
+      const control = this.controlsByPath.get(path);
+      if (control) result.push(control);
+    }
+    return result;
+  }
+  /**
+   * Atomically replaces graph controls. Unknown or duplicate paths are rejected
+   * so stale editor state cannot silently control a different preset.
+   */
+  setControls(controls) {
+    const next = /* @__PURE__ */ new Map();
+    for (const control of controls) {
+      if (!this.components.has(control.path)) throw new RangeError(`Unknown AVS component path ${control.path}`);
+      if (next.has(control.path)) throw new RangeError(`Duplicate AVS component control path ${control.path}`);
+      const resolved = {
+        path: control.path,
+        enabled: control.enabled ?? true,
+        muted: control.muted ?? false,
+        solo: control.solo ?? false
+      };
+      if (!isDefaultControl(resolved)) next.set(control.path, resolved);
+    }
+    if (sameControls(this.controlsByPath, next)) return;
+    this.controlsByPath = next;
+    this.rebuildSoloSelection();
+    this.resetControlSensitiveState();
+  }
+  /** Merge one path's editor state without disturbing controls on other paths. */
+  setComponentControl(path, patch) {
+    if (!this.components.has(path)) throw new RangeError(`Unknown AVS component path ${path}`);
+    const current = this.controlsByPath.get(path) ?? { path, enabled: true, muted: false, solo: false };
+    const next = {
+      path,
+      enabled: patch.enabled ?? current.enabled,
+      muted: patch.muted ?? current.muted,
+      solo: patch.solo ?? current.solo
+    };
+    this.setControls([
+      ...this.controls.filter((control) => control.path !== path),
+      next
+    ]);
+  }
   render(framebuffer, audio2, preinit = false) {
     this.stats.rendered = 0;
     this.stats.unsupported = 0;
@@ -12272,6 +12617,7 @@ var AvsExecutor = class {
     let spare = alternate;
     let beat = initialBeat;
     for (const component of children) {
+      if (!this.shouldRun(component)) continue;
       if (component.list) {
         this.runList(component, current, audio2, line, preinit, beat);
         continue;
@@ -12413,7 +12759,60 @@ var AvsExecutor = class {
     store.set(key, created);
     return created;
   }
+  indexComponents(children, parent) {
+    for (const component of children) {
+      if (this.components.has(component.path)) throw new Error(`Duplicate AVS component path ${component.path}`);
+      this.components.set(component.path, component);
+      this.parents.set(component.path, parent);
+      this.indexComponents(component.children, component.path);
+    }
+  }
+  shouldRun(component) {
+    const control = this.controlsByPath.get(component.path);
+    if (control && (!control.enabled || control.muted)) return false;
+    return this.soloSelection === null || this.soloSelection.has(component.path);
+  }
+  rebuildSoloSelection() {
+    const solos = [...this.controlsByPath.values()].filter((control) => control.solo);
+    if (solos.length === 0) {
+      this.soloSelection = null;
+      return;
+    }
+    const selected = /* @__PURE__ */ new Set();
+    for (const solo of solos) {
+      let path = solo.path;
+      while (path !== null) {
+        selected.add(path);
+        path = this.parents.get(path) ?? null;
+      }
+      const component = this.components.get(solo.path);
+      if (component.list) this.selectSubtree(component, selected);
+    }
+    this.soloSelection = selected;
+  }
+  selectSubtree(component, selected) {
+    selected.add(component.path);
+    for (const child of component.children) this.selectSubtree(child, selected);
+  }
+  resetControlSensitiveState() {
+    this.retained.clear();
+    this.alternates.clear();
+    this.beatFrames.clear();
+    this.listEel.clear();
+    this.buffers.release();
+  }
 };
+function isDefaultControl(control) {
+  return control.enabled && !control.muted && !control.solo;
+}
+function sameControls(left, right) {
+  if (left.size !== right.size) return false;
+  for (const [path, a] of left) {
+    const b = right.get(path);
+    if (!b || a.enabled !== b.enabled || a.muted !== b.muted || a.solo !== b.solo) return false;
+  }
+  return true;
+}
 function compileOrNull(source3) {
   if (!source3.trim()) return null;
   try {
@@ -12593,9 +12992,9 @@ function clamp12(value, lo, hi) {
 var AVS_ADD_BORDERS_APE_ID = "Virtual Effect: Addborders";
 function decodeAvsAddBorders(payload) {
   return {
-    enabled: i322(payload, 0, 1) !== 0,
-    color: i322(payload, 4, 0) & 16777215,
-    size: Math.max(0, i322(payload, 8, 1))
+    enabled: i32(payload, 0, 1) !== 0,
+    color: i32(payload, 4, 0) & 16777215,
+    size: Math.max(0, i32(payload, 8, 1))
   };
 }
 function registerAvsAddBorders(registry = new AvsEffectRegistry()) {
@@ -12616,7 +13015,7 @@ function render(context, config) {
     }
   }
 }
-function i322(payload, offset, fallback) {
+function i32(payload, offset, fallback) {
   return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
 }
 
@@ -12685,22 +13084,22 @@ function registerAvsClassicEffects(registry = new AvsEffectRegistry(), options =
       ctx.output.copyFrom(ctx.input);
       return { swap: true };
     }
-    let table6 = scatterTables.get(width);
-    if (!table6) {
-      table6 = new Int32Array(512);
-      for (let i = 0; i < table6.length; i++) {
+    let table5 = scatterTables.get(width);
+    if (!table5) {
+      table5 = new Int32Array(512);
+      for (let i = 0; i < table5.length; i++) {
         let dx = i % 8 - 4;
         let dy = Math.floor(i / 8) % 8 - 4;
         if (dx < 0) dx++;
         if (dy < 0) dy++;
-        table6[i] = width * dy + dx;
+        table5[i] = width * dy + dx;
       }
-      scatterTables.set(width, table6);
+      scatterTables.set(width, table5);
     }
     const edge = width * 4;
     ctx.output.pixels.set(ctx.input.pixels.subarray(0, edge), 0);
     for (let i = edge; i < width * (height - 4); i++) {
-      const offset = table6[normalizeRandom(randomInt(512), 512)];
+      const offset = table5[normalizeRandom(randomInt(512), 512)];
       ctx.output.pixels[i] = ctx.input.pixels[i + offset];
     }
     ctx.output.pixels.set(ctx.input.pixels.subarray(width * (height - 4)), width * (height - 4));
@@ -13056,7 +13455,7 @@ function decodeAvsColorMap(payload) {
       index,
       enabled: count > 0 ? view.getInt32(header, true) !== 0 : index === 0,
       id: view.getUint32(header + 8, true),
-      filename: nulText2(payload.subarray(header + 12, header + MAP_HEADER_BYTES)),
+      filename: nulText(payload.subarray(header + 12, header + MAP_HEADER_BYTES)),
       points
     });
   }
@@ -13071,11 +13470,11 @@ function decodeAvsColorMap(payload) {
   };
 }
 function buildAvsColorMapTable(points) {
-  const table6 = new Uint32Array(256);
+  const table5 = new Uint32Array(256);
   const sorted = points.length > 0 ? [...points].sort((a, b) => a.position - b.position || a.color - b.color) : defaultPoints();
   const first = sorted[0];
   const firstPosition = clamp13(first.position, 0, 255);
-  table6.fill(first.color & 16777215, 0, firstPosition);
+  table5.fill(first.color & 16777215, 0, firstPosition);
   for (let i = 0; i + 1 < sorted.length; i++) {
     const left = sorted[i];
     const right = sorted[i + 1];
@@ -13087,13 +13486,13 @@ function buildAvsColorMapTable(points) {
     let fraction = 0;
     for (let position = leftPosition; position <= rightPosition; position++) {
       const weight = Math.min(256, fraction >>> 8);
-      table6[position] = mix256(left.color, right.color, weight);
+      table5[position] = mix256(left.color, right.color, weight);
       fraction += increment;
     }
   }
   const last2 = sorted[sorted.length - 1];
-  table6.fill(last2.color & 16777215, clamp13(last2.position, 0, 255), 256);
-  return table6;
+  table5.fill(last2.color & 16777215, clamp13(last2.position, 0, 255), 256);
+  return table5;
 }
 function registerAvsColorMap(registry = new AvsEffectRegistry()) {
   const states = /* @__PURE__ */ new Map();
@@ -13114,8 +13513,8 @@ function registerAvsColorMap(registry = new AvsEffectRegistry()) {
       };
       states.set(context.component.path, state);
     }
-    const table6 = selectTable(config, state, context.beat);
-    transform(context, config, table6);
+    const table5 = selectTable(config, state, context.beat);
+    transform(context, config, table5);
   });
   return registry;
 }
@@ -13150,18 +13549,18 @@ function selectTable(config, state, beat) {
     state.previous = state.target;
     return state.tables[state.target];
   }
-  const table6 = new Uint32Array(256);
+  const table5 = new Uint32Array(256);
   const previous = state.tables[state.previous];
   const target = state.tables[state.target];
-  for (let i = 0; i < 256; i++) table6[i] = mix256(previous[i], target[i], state.progress);
-  return table6;
+  for (let i = 0; i < 256; i++) table5[i] = mix256(previous[i], target[i], state.progress);
+  return table5;
 }
-function transform(context, config, table6) {
+function transform(context, config, table5) {
   for (let i = 0; i < context.input.pixels.length; i++) {
     const destination = context.input.pixels[i] & 16777215;
     const key = colorKey(destination, config.key);
     if (key === null) continue;
-    const source3 = table6[key];
+    const source3 = table5[key];
     context.input.pixels[i] = blend(source3, destination, config.blendMode, config.adjustBlend);
   }
 }
@@ -13249,7 +13648,7 @@ function readI32(payload, offset, fallback) {
 function firstEnabled(maps) {
   return maps.find((map) => map.enabled)?.index ?? 0;
 }
-function nulText2(bytes) {
+function nulText(bytes) {
   const end = bytes.indexOf(0);
   return new TextDecoder("windows-1252").decode(end < 0 ? bytes : bytes.subarray(0, end));
 }
@@ -13335,6 +13734,7 @@ function prepareConvolution(config) {
   const divisor = Math.abs(config.scale) || 1;
   const positiveTaps = taps.filter((tap) => tap.coefficient > 0);
   const negativeTaps = taps.filter((tap) => tap.coefficient < 0);
+  const boxCoefficient = taps.length === KERNEL_CELLS && taps.every((tap) => tap.coefficient === taps[0].coefficient) && taps[0].coefficient > 0 ? taps[0].coefficient : 0;
   return {
     config,
     taps,
@@ -13354,7 +13754,9 @@ function prepareConvolution(config) {
     positiveCoefficients: Uint16Array.from(positiveTaps, (tap) => tap.coefficient),
     negativeDx: Int8Array.from(negativeTaps, (tap) => tap.dx),
     negativeDy: Int8Array.from(negativeTaps, (tap) => tap.dy),
-    negativeCoefficients: Uint16Array.from(negativeTaps, (tap) => -tap.coefficient)
+    negativeCoefficients: Uint16Array.from(negativeTaps, (tap) => -tap.coefficient),
+    boxCoefficient,
+    boxScratch: null
   };
 }
 function renderConvolution(context, state) {
@@ -13364,7 +13766,11 @@ function renderConvolution(context, state) {
   const target = swap ? context.output.pixels : source3;
   const width = context.input.width;
   const height = context.input.height;
-  if (swap && !config.twoPass && state.bias === 0 && !state.saturatePositive && !state.saturateNegative && !config.absolute && !config.wrap && state.scaleShift >= 0) {
+  if (swap && !config.twoPass && state.bias === 0 && !state.saturatePositive && !state.saturateNegative && (!state.hasNegative || !config.absolute && !config.wrap)) {
+    if (state.boxCoefficient !== 0) {
+      renderBoxConvolution(source3, target, width, height, state);
+      return { swap: true };
+    }
     renderFastConvolution(source3, target, width, height, state);
     return { swap: true };
   }
@@ -13414,6 +13820,7 @@ function renderFastConvolution(source3, target, width, height, state) {
   const interiorStart = Math.min(width, state.leftEdge);
   const interiorEnd = Math.max(interiorStart, width - state.rightEdge);
   const shift = state.scaleShift;
+  const reciprocal = shift < 0 ? Math.floor(65536 / state.divisor) & 65535 : 0;
   for (let y = 0; y < height; y++) {
     for (let tap = 0; tap < tapCount; tap++) {
       rowBases[tap] = clamp14(y + dy[tap], 0, height - 1) * width;
@@ -13456,15 +13863,105 @@ function renderFastConvolution(source3, target, width, height, state) {
         red = red > negativeRed ? red - negativeRed : 0;
         alpha = alpha > negativeAlpha ? alpha - negativeAlpha : 0;
       }
-      blue >>>= shift;
-      green >>>= shift;
-      red >>>= shift;
-      alpha >>>= shift;
-      if (blue > 255) blue = 255;
-      if (green > 255) green = 255;
-      if (red > 255) red = 255;
-      if (alpha > 255) alpha = 255;
+      if (shift >= 0) {
+        blue >>>= shift;
+        green >>>= shift;
+        red >>>= shift;
+        alpha >>>= shift;
+      } else {
+        blue = Math.floor(blue * reciprocal / 65536) & 65535;
+        green = Math.floor(green * reciprocal / 65536) & 65535;
+        red = Math.floor(red * reciprocal / 65536) & 65535;
+        alpha = Math.floor(alpha * reciprocal / 65536) & 65535;
+      }
+      blue = packByte(blue);
+      green = packByte(green);
+      red = packByte(red);
+      alpha = packByte(alpha);
       target[targetRow + x] = (blue | green << 8 | red << 16 | alpha << 24) >>> 0;
+    }
+  }
+}
+function renderBoxConvolution(source3, target, width, height, state) {
+  let scratch = state.boxScratch;
+  if (!scratch || scratch.width !== width || scratch.height !== height) {
+    scratch = {
+      width,
+      height,
+      redBlue: new Uint32Array(width * height),
+      greenAlpha: new Uint32Array(width * height)
+    };
+    state.boxScratch = scratch;
+  }
+  const horizontalRedBlue = scratch.redBlue;
+  const horizontalGreenAlpha = scratch.greenAlpha;
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    const first = source3[row];
+    let redBlue = (first & 255) * 4 + (first >>> 16 & 255) * 4 * 65536;
+    let greenAlpha = (first >>> 8 & 255) * 4 + (first >>> 24) * 4 * 65536;
+    for (let x = 1; x <= Math.min(3, width - 1); x++) {
+      const pixel = source3[row + x];
+      redBlue += (pixel & 255) + (pixel >>> 16 & 255) * 65536;
+      greenAlpha += (pixel >>> 8 & 255) + (pixel >>> 24) * 65536;
+    }
+    if (width < 4) {
+      const last2 = source3[row + width - 1];
+      const missing = 4 - width;
+      redBlue += (last2 & 255) * missing + (last2 >>> 16 & 255) * missing * 65536;
+      greenAlpha += (last2 >>> 8 & 255) * missing + (last2 >>> 24) * missing * 65536;
+    }
+    for (let x = 0; x < width; x++) {
+      horizontalRedBlue[row + x] = redBlue;
+      horizontalGreenAlpha[row + x] = greenAlpha;
+      const removeX = x < 3 ? 0 : x - 3;
+      const addX = x + 4 >= width ? width - 1 : x + 4;
+      const remove = source3[row + removeX];
+      const add3 = source3[row + addX];
+      redBlue += (add3 & 255) - (remove & 255) + ((add3 >>> 16 & 255) - (remove >>> 16 & 255)) * 65536;
+      greenAlpha += (add3 >>> 8 & 255) - (remove >>> 8 & 255) + ((add3 >>> 24) - (remove >>> 24)) * 65536;
+    }
+  }
+  const coefficient = state.boxCoefficient;
+  const reciprocal = state.scaleShift < 0 ? Math.floor(65536 / state.divisor) & 65535 : 0;
+  for (let x = 0; x < width; x++) {
+    let redBlue = horizontalRedBlue[x] * 4;
+    let greenAlpha = horizontalGreenAlpha[x] * 4;
+    for (let y = 1; y <= Math.min(3, height - 1); y++) {
+      redBlue += horizontalRedBlue[y * width + x];
+      greenAlpha += horizontalGreenAlpha[y * width + x];
+    }
+    if (height < 4) {
+      const last2 = (height - 1) * width + x;
+      const missing = 4 - height;
+      redBlue += horizontalRedBlue[last2] * missing;
+      greenAlpha += horizontalGreenAlpha[last2] * missing;
+    }
+    for (let y = 0; y < height; y++) {
+      let blue = (redBlue & 65535) * coefficient;
+      let red = Math.floor(redBlue / 65536) * coefficient;
+      let green = (greenAlpha & 65535) * coefficient;
+      let alpha = Math.floor(greenAlpha / 65536) * coefficient;
+      if (state.scaleShift >= 0) {
+        blue >>>= state.scaleShift;
+        green >>>= state.scaleShift;
+        red >>>= state.scaleShift;
+        alpha >>>= state.scaleShift;
+      } else {
+        blue = Math.floor(blue * reciprocal / 65536) & 65535;
+        green = Math.floor(green * reciprocal / 65536) & 65535;
+        red = Math.floor(red * reciprocal / 65536) & 65535;
+        alpha = Math.floor(alpha * reciprocal / 65536) & 65535;
+      }
+      blue = packByte(blue);
+      green = packByte(green);
+      red = packByte(red);
+      alpha = packByte(alpha);
+      target[y * width + x] = (blue | green << 8 | red << 16 | alpha << 24) >>> 0;
+      const removeY = y < 3 ? 0 : y - 3;
+      const addY = y + 4 >= height ? height - 1 : y + 4;
+      redBlue += horizontalRedBlue[addY * width + x] - horizontalRedBlue[removeY * width + x];
+      greenAlpha += horizontalGreenAlpha[addY * width + x] - horizontalGreenAlpha[removeY * width + x];
     }
   }
 }
@@ -13549,6 +14046,446 @@ function clamp14(value, minimum, maximum) {
   return value < minimum ? minimum : value > maximum ? maximum : value;
 }
 
+// src/avs/effects/movement.ts
+var TEXT = new TextDecoder("windows-1252");
+var CUSTOM_EFFECT = 32767;
+var LAST_BUILTIN_EFFECT = 23;
+var OFFSET_MASK = (1 << 22) - 1;
+var BILINEAR_WEIGHTS = (() => {
+  const weights = [
+    new Uint8Array(32 * 32),
+    new Uint8Array(32 * 32),
+    new Uint8Array(32 * 32),
+    new Uint8Array(32 * 32)
+  ];
+  for (let x = 0; x < 32; x++) {
+    const xp = x << 3;
+    const inverseX = 255 - xp;
+    for (let y = 0; y < 32; y++) {
+      const yp = y << 3;
+      const inverseY = 255 - yp;
+      const key = x << 5 | y;
+      weights[0][key] = AVS_BLEND_TABLE[inverseX << 8 | inverseY];
+      weights[1][key] = AVS_BLEND_TABLE[xp << 8 | inverseY];
+      weights[2][key] = AVS_BLEND_TABLE[inverseX << 8 | yp];
+      weights[3][key] = AVS_BLEND_TABLE[xp << 8 | yp];
+    }
+  }
+  return weights;
+})();
+var EVALUATED_BUILTINS = {
+  18: {
+    source: "d=d*(1-(sin((r-$pi*.5)*7)*.03));r=r+(cos(d*12)*.03)",
+    rectangular: false
+  },
+  19: {
+    source: "d=d*(1-(sin((r-$pi*.5)*12)*.05));r=r+(cos(d*18)*.05);d=d*(1-((d-.4)*.03));r=r+((d-.4)*.13)",
+    rectangular: false
+  },
+  20: { source: "x=x+(cos(y*18)*.02);y=y+(sin(x*14)*.03)", rectangular: true },
+  21: {
+    source: "x=x+(cos(abs(y-.5)*8)*.02);y=y+(sin(abs(x-.5)*8)*.05);x=x*.95;y=y*.95",
+    rectangular: true
+  },
+  22: {
+    source: "y=y*(1+(sin(r+$pi/2)*.3));x=x*(1+(cos(r+$pi/2)*.3));x=x*.995;y=y*.995",
+    rectangular: true
+  },
+  23: { source: "y=(r*6)/$pi;x=d", rectangular: true }
+};
+function decodeAvsMovement(payload) {
+  let offset = 0;
+  let effect3 = readI322(payload, offset, 1);
+  offset += 4;
+  let expression = "";
+  let rectangular = false;
+  if (effect3 === CUSTOM_EFFECT) {
+    if (asciiEquals(payload, offset, "!rect ")) {
+      offset += 6;
+      rectangular = true;
+    }
+    if (payload[offset] === 1) {
+      offset++;
+      const length = readI322(payload, offset, 0);
+      offset += 4;
+      if (length > 0 && offset + length <= payload.length) {
+        expression = nulText2(payload.subarray(offset, offset + length));
+        offset += length;
+      }
+    } else {
+      const length = 256 - (rectangular ? 6 : 0);
+      if (offset + length <= payload.length) {
+        expression = nulText2(payload.subarray(offset, offset + length));
+        offset += length;
+      }
+    }
+  }
+  const blend2 = readI322(payload, offset, 0) !== 0;
+  offset += 4;
+  const sourceMapped = readI322(payload, offset, 0);
+  offset += 4;
+  rectangular = readI322(payload, offset, rectangular ? 1 : 0) !== 0;
+  offset += 4;
+  const subpixel = readI322(payload, offset, 0) !== 0;
+  offset += 4;
+  const wrap2 = readI322(payload, offset, 0) !== 0;
+  offset += 4;
+  if (effect3 === 0 && offset + 4 <= payload.length) effect3 = readI322(payload, offset, 0);
+  if (effect3 !== CUSTOM_EFFECT && effect3 > LAST_BUILTIN_EFFECT || effect3 < 0) effect3 = 0;
+  return { effect: effect3, expression, blend: blend2, sourceMapped, rectangular, subpixel, wrap: wrap2 };
+}
+function registerAvsMovement(registry, global = new AvsEelGlobalState()) {
+  const states = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(15, (context) => {
+    let state = states.get(context.component.path);
+    if (!state) {
+      const config = decodeAvsMovement(context.component.payload);
+      state = {
+        config,
+        program: movementProgram(config),
+        sourceMapped: config.sourceMapped,
+        width: 0,
+        height: 0,
+        table: null,
+        randomState: hashPath3(context.component.path)
+      };
+      states.set(context.component.path, state);
+    }
+    if (state.config.effect === 0) return;
+    if (!state.table || state.width !== context.input.width || state.height !== context.input.height) {
+      state.table = buildMovementTable(context, state, global);
+      state.width = context.input.width;
+      state.height = context.input.height;
+    }
+    if (context.preinit) return;
+    if ((state.sourceMapped & 2) !== 0 && context.beat) state.sourceMapped ^= 1;
+    if ((state.sourceMapped & 1) !== 0) renderForward(context, state.table, state.config.blend);
+    else renderInverse(context, state.table, state.config.blend);
+    return { swap: true };
+  });
+  return registry;
+}
+function movementProgram(config) {
+  const source3 = config.effect === CUSTOM_EFFECT ? config.expression : EVALUATED_BUILTINS[config.effect]?.source;
+  if (!source3?.trim()) return null;
+  try {
+    return compileAvsEel(source3);
+  } catch {
+    return null;
+  }
+}
+function buildMovementTable(context, state, global) {
+  const { width, height } = context.input;
+  const count = width * height;
+  const config = state.config;
+  const bilinear3 = config.subpixel && width > 1 && height > 1 && count < 1 << 22 && (config.effect === CUSTOM_EFFECT || config.effect >= 3 && config.effect <= 23 && config.effect !== 7);
+  const table5 = {
+    offsets: new Uint32Array(count),
+    weightKeys: new Uint16Array(count),
+    bilinear: bilinear3
+  };
+  if (config.effect === 1) {
+    for (let i = 0; i < count; i++) {
+      const dx = nextRandom(state) % 3 - 1;
+      const dy = nextRandom(state) % 3 - 1;
+      table5.offsets[i] = clamp15(i + dx + dy * width, 0, count - 1);
+    }
+    return table5;
+  }
+  if (config.effect === 2) {
+    buildStaticMovementTable(config, table5, width, height);
+    return table5;
+  }
+  if (config.effect === 7) {
+    buildStaticMovementTable(config, table5, width, height);
+    return table5;
+  }
+  if (state.program) buildEvaluatedTable(context, state, table5, global);
+  else if (config.effect >= 3 && config.effect <= 17) buildStaticMovementTable(config, table5, width, height);
+  else fillIdentity(table5, width, height);
+  return table5;
+}
+function buildStaticMovementTable(config, table5, width, height) {
+  if (config.effect === 2) {
+    const shift = Math.trunc(width / 64);
+    for (let y = 0; y < height; y++) {
+      let sourceX = shift;
+      for (let x = 0; x < width; x++) {
+        table5.offsets[x + y * width] = sourceX + y * width;
+        sourceX++;
+        if (sourceX >= width) sourceX -= width;
+      }
+    }
+    return;
+  }
+  if (config.effect === 7) {
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+      let sourceX = x;
+      let sourceY = y;
+      if ((x & 2) === 0 && (y & 2) === 0) {
+        sourceX = Math.trunc(width / 2 + ((x & ~1) - width / 2) * 7 / 8);
+        sourceY = Math.trunc(height / 2 + ((y & ~1) - height / 2) * 7 / 8);
+      }
+      table5.offsets[x + y * width] = clamp15(sourceX, 0, width - 1) + clamp15(sourceY, 0, height - 1) * width;
+    }
+    return;
+  }
+  const halfWidth = Math.trunc(width / 2);
+  const halfHeight = Math.trunc(height / 2);
+  const maxDistance = Math.sqrt(width * width + height * height) / 2;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const xd = x - halfWidth;
+      const yd = y - halfHeight;
+      let distance = Math.hypot(xd, yd);
+      let angle = Math.atan2(yd, xd);
+      let xOffset = 0;
+      switch (config.effect) {
+        case 3:
+          angle += 0.1 - 0.2 * distance / maxDistance;
+          distance *= 0.96;
+          break;
+        case 4:
+          distance *= 0.99 * (1 - Math.sin(angle) / 32);
+          angle += 0.03 * Math.sin(distance / maxDistance * Math.PI * 4);
+          break;
+        case 5:
+          distance *= 0.94 + Math.cos(angle * 32) * 0.06;
+          break;
+        case 6:
+          distance *= 1.01 + Math.cos(angle * 4) * 0.04;
+          angle += 0.03 * Math.sin(distance / maxDistance * Math.PI * 4);
+          break;
+        case 8:
+          angle += 0.1 * Math.sin(distance / maxDistance * Math.PI * 5);
+          break;
+        case 9: {
+          const t = Math.sin(distance / maxDistance * Math.PI);
+          distance -= 8 * t ** 5;
+          break;
+        }
+        case 10: {
+          const t = Math.sin(distance / maxDistance * Math.PI);
+          distance -= 8 * t ** 5;
+          const swirl = Math.cos(distance / maxDistance * Math.PI / 2);
+          angle += 0.1 * swirl ** 3;
+          break;
+        }
+        case 11:
+          distance *= 0.95 + Math.cos(angle * 5 - Math.PI / 2.5) * 0.03;
+          break;
+        case 12:
+          angle += 0.04;
+          distance *= 0.96 + Math.cos(distance / maxDistance * Math.PI) * 0.05;
+          break;
+        case 13: {
+          const t = Math.cos(distance / maxDistance * Math.PI);
+          angle += 0.07 * t;
+          distance *= 0.98 + t * 0.1;
+          break;
+        }
+        case 14:
+          angle += 0.1 - 0.2 * distance / maxDistance;
+          distance *= 0.96;
+          xOffset = 8;
+          break;
+        case 15:
+          distance = maxDistance * 0.15;
+          break;
+        case 16:
+          angle = Math.cos(angle * 3);
+          break;
+        case 17:
+          distance *= 1 - (distance / maxDistance - 0.35) * 0.5;
+          angle += 0.1;
+          break;
+      }
+      const sampleX = halfWidth + Math.cos(angle) * distance + 0.5 + xOffset * width / 256;
+      const sampleY = halfHeight + Math.sin(angle) * distance + 0.5;
+      storeCoordinate(table5, x + y * width, sampleX, sampleY, width, height, config.wrap);
+    }
+  }
+}
+function buildEvaluatedTable(context, state, table5, global) {
+  const { width, height } = context.input;
+  const halfWidth = Math.trunc(width / 2);
+  const halfHeight = Math.trunc(height / 2);
+  const maxDistance = Math.sqrt(width * width + height * height) / 2;
+  const vm = new AvsEelVm({ global, seed: state.randomState });
+  vm.setHost({
+    getosc: (band, span, channel) => avsAudioSample(context.audio, "osc", band, span, channel),
+    getspec: (band, span, channel) => avsAudioSample(context.audio, "spec", band, span, channel)
+  });
+  vm.set("sw", width);
+  vm.set("sh", height);
+  const rectangular = state.config.effect === CUSTOM_EFFECT ? state.config.rectangular : EVALUATED_BUILTINS[state.config.effect]?.rectangular === true;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const xd = x - halfWidth;
+      const yd = y - halfHeight;
+      vm.set("x", halfWidth === 0 ? 0 : xd / halfWidth);
+      vm.set("y", halfHeight === 0 ? 0 : yd / halfHeight);
+      vm.set("d", maxDistance === 0 ? 0 : Math.hypot(xd, yd) / maxDistance);
+      vm.set("r", Math.atan2(yd, xd) + Math.PI / 2);
+      vm.execute(state.program);
+      let sampleX;
+      let sampleY;
+      if (rectangular) {
+        sampleX = (vm.get("x") + 1) * halfWidth;
+        sampleY = (vm.get("y") + 1) * halfHeight;
+      } else {
+        const distance = vm.get("d") * maxDistance;
+        const angle = vm.get("r") - Math.PI / 2;
+        sampleX = halfWidth + Math.cos(angle) * distance;
+        sampleY = halfHeight + Math.sin(angle) * distance;
+      }
+      if (!table5.bilinear) {
+        sampleX += 0.5;
+        sampleY += 0.5;
+      }
+      storeCoordinate(table5, x + y * width, sampleX, sampleY, width, height, state.config.wrap);
+    }
+  }
+}
+function storeCoordinate(table5, destination, rawX, rawY, width, height, wrap2) {
+  if (!table5.bilinear) {
+    let x2 = Math.trunc(rawX);
+    let y2 = Math.trunc(rawY);
+    if (wrap2) {
+      x2 = modulo3(x2, width);
+      y2 = modulo3(y2, height);
+    } else {
+      x2 = clamp15(x2, 0, width - 1);
+      y2 = clamp15(y2, 0, height - 1);
+    }
+    table5.offsets[destination] = x2 + y2 * width;
+    return;
+  }
+  let x = Math.trunc(rawX);
+  let y = Math.trunc(rawY);
+  let xPartial = Math.trunc(32 * (rawX - x));
+  let yPartial = Math.trunc(32 * (rawY - y));
+  if (wrap2) {
+    x = modulo3(x, width - 1);
+    y = modulo3(y, height - 1);
+  } else {
+    if (x < 0) {
+      x = 0;
+      xPartial = 0;
+    } else if (x >= width - 1) {
+      x = width - 2;
+      xPartial = 31;
+    }
+    if (y < 0) {
+      y = 0;
+      yPartial = 0;
+    } else if (y >= height - 1) {
+      y = height - 2;
+      yPartial = 31;
+    }
+  }
+  const packed = (x + y * width | yPartial << 22 | xPartial << 27) >>> 0;
+  table5.offsets[destination] = packed & OFFSET_MASK;
+  const xWeight = packed >>> 24 & 31 << 3;
+  const yWeight = packed >>> 19 & 31 << 3;
+  table5.weightKeys[destination] = xWeight << 2 | yWeight >>> 3;
+}
+function renderInverse(context, table5, blend2) {
+  const source3 = context.input.pixels;
+  const output = context.output.pixels;
+  const width = context.input.width;
+  if (table5.bilinear) {
+    if (blend2) {
+      for (let i = 0; i < output.length; i++) {
+        output[i] = averagePixel3(source3[i], sampleBilinear(
+          source3,
+          table5.offsets[i],
+          width,
+          table5.weightKeys[i]
+        ));
+      }
+    } else {
+      for (let i = 0; i < output.length; i++) {
+        output[i] = sampleBilinear(source3, table5.offsets[i], width, table5.weightKeys[i]);
+      }
+    }
+  } else if (blend2) {
+    for (let i = 0; i < output.length; i++) output[i] = averagePixel3(source3[i], source3[table5.offsets[i]]);
+  } else {
+    for (let i = 0; i < output.length; i++) output[i] = source3[table5.offsets[i]];
+  }
+}
+function renderForward(context, table5, blend2) {
+  const source3 = context.input.pixels;
+  const output = context.output.pixels;
+  if (blend2) output.set(source3);
+  else output.fill(0);
+  for (let i = 0; i < source3.length; i++) {
+    const destination = table5.offsets[i];
+    output[destination] = maximumPixel2(source3[i], output[destination]);
+  }
+  if (blend2) {
+    for (let i = 0; i < output.length; i++) output[i] = averagePixel3(output[i], source3[i]);
+  }
+}
+function sampleBilinear(source3, offset, width, weightKey) {
+  const blendTable = AVS_BLEND_TABLE;
+  const w0 = BILINEAR_WEIGHTS[0][weightKey];
+  const w1 = BILINEAR_WEIGHTS[1][weightKey];
+  const w2 = BILINEAR_WEIGHTS[2][weightKey];
+  const w3 = BILINEAR_WEIGHTS[3][weightKey];
+  const p0 = source3[offset];
+  const p1 = source3[offset + 1];
+  const p2 = source3[offset + width];
+  const p3 = source3[offset + width + 1];
+  const low = blendTable[(p0 & 255) << 8 | w0] + blendTable[(p1 & 255) << 8 | w1] + blendTable[(p2 & 255) << 8 | w2] + blendTable[(p3 & 255) << 8 | w3];
+  const middle = blendTable[(p0 >>> 8 & 255) << 8 | w0] + blendTable[(p1 >>> 8 & 255) << 8 | w1] + blendTable[(p2 >>> 8 & 255) << 8 | w2] + blendTable[(p3 >>> 8 & 255) << 8 | w3];
+  const high = blendTable[(p0 >>> 16 & 255) << 8 | w0] + blendTable[(p1 >>> 16 & 255) << 8 | w1] + blendTable[(p2 >>> 16 & 255) << 8 | w2] + blendTable[(p3 >>> 16 & 255) << 8 | w3];
+  return low & 255 | (middle & 255) << 8 | (high & 255) << 16;
+}
+function fillIdentity(table5, width, height) {
+  for (let i = 0; i < width * height; i++) table5.offsets[i] = i;
+}
+function averagePixel3(a, b) {
+  return (a >>> 1 & 8355711) + (b >>> 1 & 8355711) & 16777215;
+}
+function maximumPixel2(a, b) {
+  return Math.max(a & 255, b & 255) | Math.max(a >>> 8 & 255, b >>> 8 & 255) << 8 | Math.max(a >>> 16 & 255, b >>> 16 & 255) << 16;
+}
+function nextRandom(state) {
+  let x = state.randomState || 1831565813;
+  x ^= x << 13;
+  x ^= x >>> 17;
+  x ^= x << 5;
+  state.randomState = x >>> 0;
+  return state.randomState;
+}
+function modulo3(value, modulus) {
+  if (modulus <= 0) return 0;
+  const result = value % modulus;
+  return result < 0 ? result + modulus : result;
+}
+function readI322(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+}
+function asciiEquals(payload, offset, value) {
+  if (offset + value.length > payload.length) return false;
+  for (let i = 0; i < value.length; i++) if (payload[offset + i] !== value.charCodeAt(i)) return false;
+  return true;
+}
+function nulText2(bytes) {
+  const end = bytes.indexOf(0);
+  return TEXT.decode(end < 0 ? bytes : bytes.subarray(0, end));
+}
+function clamp15(value, minimum, maximum) {
+  return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+function hashPath3(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+
 // src/avs/effects/basic-transforms.ts
 function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
   const clears = /* @__PURE__ */ new Map();
@@ -13585,7 +14522,7 @@ function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
     const beat = [int4(context, 16, normal[0]), int4(context, 20, normal[1]), int4(context, 24, normal[2])];
     let state = colorFades.get(context.component.path);
     if (!state) {
-      state = { position: [...normal], random: hashPath3(context.component.path) };
+      state = { position: [...normal], random: hashPath4(context.component.path) };
       colorFades.set(context.component.path, state);
     }
     state.position[0] += Math.sign(normal[0] - state.position[0]);
@@ -13593,21 +14530,21 @@ function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
     state.position[2] += Math.sign(normal[1] - state.position[2]);
     if ((enabled & 4) === 0) state.position = [...normal];
     else if (context.beat && (enabled & 2) !== 0) {
-      state.position[0] = nextRandom(state, 32) - 6;
-      state.position[1] = nextRandom(state, 64) - 32;
+      state.position[0] = nextRandom2(state, 32) - 6;
+      state.position[1] = nextRandom2(state, 64) - 32;
       if (state.position[1] < 0 && state.position[1] > -16) state.position[1] = -32;
       if (state.position[1] >= 0 && state.position[1] < 16) state.position[1] = 32;
-      state.position[2] = nextRandom(state, 32) - 6;
+      state.position[2] = nextRandom2(state, 32) - 6;
     } else if (context.beat) state.position = [...beat];
     const [first, second, third] = state.position;
-    const table6 = [[third, second, first], [second, first, third], [first, third, second], [third, third, third]];
+    const table5 = [[third, second, first], [second, first, third], [first, third, second], [third, third, third]];
     for (let i = 0; i < context.input.pixels.length; i++) {
       const pixel = context.input.pixels[i];
       const low = pixel & 255, middle = pixel >>> 8 & 255, high = pixel >>> 16 & 255;
       const x = middle - high;
       const y = high - low;
       const category = x > 0 && x > -y ? 0 : y < 0 && x < -y ? 1 : x < 0 && y > 0 ? 2 : 3;
-      const offsets = table6[category];
+      const offsets = table5[category];
       context.input.pixels[i] = clampByte3(low + offsets[0]) | clampByte3(middle + offsets[1]) << 8 | clampByte3(high + offsets[2]) << 16;
     }
   });
@@ -13629,29 +14566,54 @@ function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
   registry.registerBuiltin(20, (context) => {
     if (context.preinit || int4(context, 0, 1) === 0) return;
     const { width, height } = context.input;
+    const source3 = context.input.pixels;
+    const destination = context.output.pixels;
     let previous = waterFrames.get(context.component.path);
-    if (!previous || previous.length !== context.input.pixels.length) {
-      previous = new Uint32Array(context.input.pixels.length);
+    if (!previous || previous.length !== source3.length) {
+      previous = new Uint32Array(source3.length);
       waterFrames.set(context.component.path, previous);
     }
-    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
-      const neighbors = [];
-      if (x > 0) neighbors.push(context.input.pixels[x - 1 + y * width]);
-      if (x + 1 < width) neighbors.push(context.input.pixels[x + 1 + y * width]);
-      if (y > 0) neighbors.push(context.input.pixels[x + (y - 1) * width]);
-      if (y + 1 < height) neighbors.push(context.input.pixels[x + (y + 1) * width]);
-      const index = x + y * width;
-      let result = 0;
-      for (let shift = 0; shift <= 16; shift += 8) {
-        let total = 0;
-        for (const pixel of neighbors) total += pixel >>> shift & 255;
-        if (neighbors.length > 2) total = Math.trunc(total / 2);
-        const value = clampByte3(total - (previous[index] >>> shift & 255));
-        result |= value << shift;
-      }
-      context.output.pixels[index] = result;
+    destination[0] = water2(source3[1], source3[width], previous[0]);
+    for (let x = 1; x < width - 1; x++) {
+      destination[x] = water3(source3[x - 1], source3[x + 1], source3[width + x], previous[x]);
     }
-    previous.set(context.input.pixels);
+    const topRight = width - 1;
+    destination[topRight] = water2(source3[topRight - 1], source3[topRight + width], previous[topRight]);
+    for (let y = 1; y < height - 1; y++) {
+      const row = y * width;
+      destination[row] = water3(source3[row + 1], source3[row - width], source3[row + width], previous[row]);
+      for (let x = 1; x < width - 1; x++) {
+        const index = row + x;
+        destination[index] = water4(
+          source3[index - 1],
+          source3[index + 1],
+          source3[index - width],
+          source3[index + width],
+          previous[index]
+        );
+      }
+      const right = row + width - 1;
+      destination[right] = water3(
+        source3[right - 1],
+        source3[right - width],
+        source3[right + width],
+        previous[right]
+      );
+    }
+    const bottom = (height - 1) * width;
+    destination[bottom] = water2(source3[bottom + 1], source3[bottom - width], previous[bottom]);
+    for (let x = 1; x < width - 1; x++) {
+      const index = bottom + x;
+      destination[index] = water3(
+        source3[index - 1],
+        source3[index + 1],
+        source3[index - width],
+        previous[index]
+      );
+    }
+    const final = source3.length - 1;
+    destination[final] = water2(source3[final - 1], source3[final - width], previous[final]);
+    previous.set(source3);
     return { swap: true };
   });
   registry.registerBuiltin(23, (context) => {
@@ -13732,6 +14694,33 @@ function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
   });
   return registry;
 }
+function water2(a, b, previous) {
+  return waterChannels(
+    (a & 255) + (b & 255),
+    (a >>> 8 & 255) + (b >>> 8 & 255),
+    (a >>> 16 & 255) + (b >>> 16 & 255),
+    previous
+  );
+}
+function water3(a, b, c, previous) {
+  return waterChannels(
+    (a & 255) + (b & 255) + (c & 255) >> 1,
+    (a >>> 8 & 255) + (b >>> 8 & 255) + (c >>> 8 & 255) >> 1,
+    (a >>> 16 & 255) + (b >>> 16 & 255) + (c >>> 16 & 255) >> 1,
+    previous
+  );
+}
+function water4(a, b, c, d, previous) {
+  return waterChannels(
+    (a & 255) + (b & 255) + (c & 255) + (d & 255) >> 1,
+    (a >>> 8 & 255) + (b >>> 8 & 255) + (c >>> 8 & 255) + (d >>> 8 & 255) >> 1,
+    (a >>> 16 & 255) + (b >>> 16 & 255) + (c >>> 16 & 255) + (d >>> 16 & 255) >> 1,
+    previous
+  );
+}
+function waterChannels(low, middle, high, previous) {
+  return clampByte3(low - (previous & 255)) | clampByte3(middle - (previous >>> 8 & 255)) << 8 | clampByte3(high - (previous >>> 16 & 255)) << 16;
+}
 function mosaic(context, quality, additive, average) {
   const { width, height } = context.input;
   const incrementX = Math.trunc(width * 65536 / quality);
@@ -13770,7 +14759,7 @@ function int4(context, offset, fallback) {
 function clampByte3(value) {
   return value < 0 ? 0 : value > 255 ? 255 : Math.trunc(value);
 }
-function nextRandom(state, bound) {
+function nextRandom2(state, bound) {
   let value = state.random || 1831565813;
   value ^= value << 13;
   value ^= value >>> 17;
@@ -13778,7 +14767,7 @@ function nextRandom(state, bound) {
   state.random = value >>> 0;
   return state.random % bound;
 }
-function hashPath3(path) {
+function hashPath4(path) {
   let hash = 2166136261;
   for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
   return hash >>> 0;
@@ -13804,14 +14793,14 @@ function decodeAvsBmp(bytes) {
     throw new Error("Invalid BMP file header");
   }
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const pixelOffset = u322(view, 10);
-  const dibSize = u322(view, 14);
+  const pixelOffset = u32(view, 10);
+  const dibSize = u32(view, 14);
   if (dibSize < 40 || 14 + dibSize > bytes.length) throw new Error(`Unsupported BMP DIB header ${dibSize}`);
-  const width = i323(view, 18);
-  const rawHeight = i323(view, 22);
+  const width = i322(view, 18);
+  const rawHeight = i322(view, 22);
   const planes = u16(view, 26);
   const bits = u16(view, 28);
-  const compression = u322(view, 30);
+  const compression = u32(view, 30);
   if (width <= 0 || rawHeight === 0 || planes !== 1) throw new Error("Invalid BMP dimensions or plane count");
   const height = Math.abs(rawHeight);
   const topDown = rawHeight < 0;
@@ -13846,7 +14835,7 @@ function decodeRows(bytes, view, pixelOffset, pixels, width, height, topDown, bi
       else if (bits === 24) {
         const offset = row + x * 3;
         pixel = bytes[offset] | bytes[offset + 1] << 8 | bytes[offset + 2] << 16;
-      } else pixel = maskedPixel(u322(view, row + x * 4), masks);
+      } else pixel = maskedPixel(u32(view, row + x * 4), masks);
       pixels[y * width + x] = pixel & 16777215;
     }
   }
@@ -13889,7 +14878,7 @@ function decodeRle8(data, pixels, width, height, topDown, palette) {
 }
 function readPalette2(bytes, view, dibSize, bits) {
   if (bits > 8) return [];
-  const declared = u322(view, 46);
+  const declared = u32(view, 46);
   const count = declared || 1 << bits;
   const start = 14 + dibSize;
   if (start + count * 4 > bytes.length) throw new Error("Truncated BMP palette");
@@ -13904,7 +14893,7 @@ function colorMasks(view, bits, compression, dibSize) {
   if (bits === 16 && compression === 0) return { red: 31744, green: 992, blue: 31 };
   if (bits === 32 && compression === 0) return { red: 16711680, green: 65280, blue: 255 };
   const offset = dibSize >= 52 ? 14 + 40 : 14 + dibSize;
-  return { red: u322(view, offset), green: u322(view, offset + 4), blue: u322(view, offset + 8) };
+  return { red: u32(view, offset), green: u32(view, offset + 4), blue: u32(view, offset + 8) };
 }
 function maskedPixel(value, masks) {
   return scaleMask(value, masks.blue) | scaleMask(value, masks.green) << 8 | scaleMask(value, masks.red) << 16;
@@ -13932,11 +14921,11 @@ function u16(view, offset) {
   if (offset + 2 > view.byteLength) throw new Error("Truncated BMP field");
   return view.getUint16(offset, true);
 }
-function u322(view, offset) {
+function u32(view, offset) {
   if (offset + 4 > view.byteLength) throw new Error("Truncated BMP field");
   return view.getUint32(offset, true);
 }
-function i323(view, offset) {
+function i322(view, offset) {
   if (offset + 4 > view.byteLength) throw new Error("Truncated BMP field");
   return view.getInt32(offset, true);
 }
@@ -13944,36 +14933,36 @@ function i323(view, offset) {
 // src/avs/effects/beat-particle.ts
 function decodeAvsMovingParticle(payload) {
   return {
-    enabled: i324(payload, 0, 1),
-    color: i324(payload, 4, 16777215) & 16777215,
-    maximumDistance: i324(payload, 8, 16),
-    size: i324(payload, 12, 8),
-    beatSize: i324(payload, 16, 8),
-    blend: i324(payload, 20, 1)
+    enabled: i323(payload, 0, 1),
+    color: i323(payload, 4, 16777215) & 16777215,
+    maximumDistance: i323(payload, 8, 16),
+    size: i323(payload, 12, 8),
+    beatSize: i323(payload, 16, 8),
+    blend: i323(payload, 20, 1)
   };
 }
 function decodeAvsCustomBpm(payload) {
   return {
-    enabled: i324(payload, 0, 1) !== 0,
-    arbitrary: i324(payload, 4, 1) !== 0,
-    skip: i324(payload, 8, 0) !== 0,
-    invert: i324(payload, 12, 0) !== 0,
-    arbitraryMilliseconds: i324(payload, 16, 500),
-    skipCount: i324(payload, 20, 1),
-    skipFirst: i324(payload, 24, 0)
+    enabled: i323(payload, 0, 1) !== 0,
+    arbitrary: i323(payload, 4, 1) !== 0,
+    skip: i323(payload, 8, 0) !== 0,
+    invert: i323(payload, 12, 0) !== 0,
+    arbitraryMilliseconds: i323(payload, 16, 500),
+    skipCount: i323(payload, 20, 1),
+    skipFirst: i323(payload, 24, 0)
   };
 }
 function decodeAvsStarfield(payload) {
   return {
-    enabled: i324(payload, 0, 1) !== 0,
-    color: i324(payload, 4, 16777215) & 16777215,
-    additive: i324(payload, 8, 0) !== 0,
-    average: i324(payload, 12, 0) !== 0,
+    enabled: i323(payload, 0, 1) !== 0,
+    color: i323(payload, 4, 16777215) & 16777215,
+    additive: i323(payload, 8, 0) !== 0,
+    average: i323(payload, 12, 0) !== 0,
     speed: f32(payload, 16, 6),
-    maximumStars: i324(payload, 20, 350),
-    onBeat: i324(payload, 24, 0) !== 0,
+    maximumStars: i323(payload, 20, 350),
+    onBeat: i323(payload, 24, 0) !== 0,
     beatSpeed: f32(payload, 28, 4),
-    beatDurationFrames: i324(payload, 32, 15)
+    beatDurationFrames: i323(payload, 32, 15)
   };
 }
 function registerAvsBeatParticleEffects(registry, options = {}) {
@@ -13996,7 +14985,7 @@ function registerStarfield(registry, options) {
         currentSpeed: Math.fround(config.speed),
         beatIncrement: 0,
         beatFrames: 0,
-        randomState: hashPath4(context.component.path)
+        randomState: hashPath5(context.component.path)
       };
       states.set(context.component.path, state);
     }
@@ -14075,7 +15064,7 @@ function registerMovingParticle(registry, options) {
         velocity: [-0.01551, 0],
         position: [-0.6, 0.3],
         size: config.size,
-        randomState: hashPath4(context.component.path)
+        randomState: hashPath5(context.component.path)
       };
       states.set(context.component.path, state);
     }
@@ -14158,7 +15147,7 @@ function registerCustomBpm(registry, options) {
   });
 }
 function randomModulo33(state, hook) {
-  const value = hook ? Math.trunc(hook()) >>> 0 : nextRandom2(state);
+  const value = hook ? Math.trunc(hook()) >>> 0 : nextRandom3(state);
   return value % 33;
 }
 function randomBound(state, hook, bound) {
@@ -14166,7 +15155,7 @@ function randomBound(state, hook, bound) {
   const value = hook ? Math.trunc(hook()) >>> 0 : nextStarRandom(state);
   return value % bound;
 }
-function nextRandom2(state) {
+function nextRandom3(state) {
   let value = state.randomState || 1831565813;
   value ^= value << 13;
   value ^= value >>> 17;
@@ -14185,13 +15174,13 @@ function nextStarRandom(state) {
 function defaultNow() {
   return typeof performance === "undefined" ? Date.now() : performance.now();
 }
-function i324(payload, offset, fallback) {
+function i323(payload, offset, fallback) {
   return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
 }
 function f32(payload, offset, fallback) {
   return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getFloat32(offset, true) : fallback;
 }
-function hashPath4(path) {
+function hashPath5(path) {
   let hash = 2166136261;
   for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
   return hash >>> 0;
@@ -14202,7 +15191,7 @@ var TEXT2 = new TextDecoder("windows-1252");
 function decodeAvsBump(payload) {
   let offset = 0;
   const read = (fallback) => {
-    const value = i325(payload, offset, fallback);
+    const value = i324(payload, offset, fallback);
     offset += 4;
     return value;
   };
@@ -14247,7 +15236,7 @@ function registerAvsBump(registry) {
     if (!config.enabled) return;
     let state = states.get(context.component.path);
     if (!state) {
-      const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath5(context.component.path) });
+      const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath6(context.component.path) });
       vm.set("bi", 1);
       state = {
         vm,
@@ -14277,12 +15266,12 @@ function registerAvsBump(registry) {
       state.beatFrames = config.beatDurationFrames;
     } else if (!state.beatFrames) state.currentDepth = config.depth;
     context.output.clear();
-    const lightX = clamp15(Math.trunc(state.vm.get("x") * context.input.width / (config.oldStyle ? 100 : 1)), 0, context.input.width);
-    const lightY = clamp15(Math.trunc(state.vm.get("y") * context.input.height / (config.oldStyle ? 100 : 1)), 0, context.input.height);
+    const lightX = clamp16(Math.trunc(state.vm.get("x") * context.input.width / (config.oldStyle ? 100 : 1)), 0, context.input.width);
+    const lightY = clamp16(Math.trunc(state.vm.get("y") * context.input.height / (config.oldStyle ? 100 : 1)), 0, context.input.height);
     if (config.showLight && lightX < context.input.width && lightY < context.input.height) {
       context.output.pixels[lightX + lightY * context.input.width] = 16777215;
     }
-    const intensity = clamp15(state.vm.get("bi"), 0, 1);
+    const intensity = clamp16(state.vm.get("bi"), 0, 1);
     state.vm.set("bi", intensity);
     state.currentDepth = Math.trunc(state.currentDepth * intensity);
     shadeBump(context, depthSurface.pixels, config, state.currentDepth, lightX, lightY);
@@ -14340,7 +15329,7 @@ function configureVm(vm, context) {
 }
 function readString(payload, offset) {
   if (offset + 4 > payload.length) return { value: "", next: payload.length };
-  const length = i325(payload, offset, 0);
+  const length = i324(payload, offset, 0);
   const start = offset + 4;
   if (length <= 0 || start + length > payload.length) return { value: "", next: start };
   return { value: nulText3(payload.subarray(start, start + length)), next: start + length };
@@ -14356,17 +15345,17 @@ function compileOrNull2(source3) {
 function execute2(program, vm) {
   return program ? vm.execute(program) : 0;
 }
-function i325(payload, offset, fallback) {
+function i324(payload, offset, fallback) {
   return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
 }
 function nulText3(bytes) {
   const end = bytes.indexOf(0);
   return TEXT2.decode(end < 0 ? bytes : bytes.subarray(0, end));
 }
-function clamp15(value, minimum, maximum) {
+function clamp16(value, minimum, maximum) {
   return value < minimum ? minimum : value > maximum ? maximum : value;
 }
-function hashPath5(path) {
+function hashPath6(path) {
   let hash = 2166136261;
   for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
   return hash >>> 0;
@@ -14389,7 +15378,7 @@ function decodeAvsDynamicMovement(payload) {
     offset = 1024;
   }
   const read = (fallback) => {
-    const value = i326(payload, offset, fallback);
+    const value = i325(payload, offset, fallback);
     offset += 4;
     return value;
   };
@@ -14414,7 +15403,7 @@ function registerAvsDynamicMovement(registry) {
     let state = states.get(context.component.path);
     if (!state) {
       const config = decodeAvsDynamicMovement(context.component.payload);
-      const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath6(context.component.path) });
+      const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath7(context.component.path) });
       state = {
         config,
         vm,
@@ -14458,8 +15447,8 @@ function renderDynamicMovement(context, config, state) {
   }
   execute3(state.programs[1], vm);
   if (context.beat) execute3(state.programs[2], vm);
-  const columns = clamp16(Math.trunc(config.gridWidth) + 1, 2, 256);
-  const rows = clamp16(Math.trunc(config.gridHeight) + 1, 2, 256);
+  const columns = clamp17(Math.trunc(config.gridWidth) + 1, 2, 256);
+  const rows = clamp17(Math.trunc(config.gridHeight) + 1, 2, 256);
   const gridSize = columns * rows;
   if (state.gridX.length !== gridSize) {
     state.gridX = new Float64Array(gridSize);
@@ -14498,7 +15487,7 @@ function renderDynamicMovement(context, config, state) {
       const index = gx + gy * columns;
       gridX[index] = x;
       gridY[index] = y;
-      gridAlpha[index] = clamp16(vm.get("alpha"), 0, 1);
+      gridAlpha[index] = clamp17(vm.get("alpha"), 0, 1);
     }
   }
   const cellXs = state.cellX;
@@ -14521,37 +15510,199 @@ function renderDynamicMovement(context, config, state) {
     );
     return { swap: true };
   }
+  if (!config.noMove) {
+    if (config.blend) {
+      renderBilinearBlendGrid(
+        context,
+        source3.pixels,
+        gridX,
+        gridY,
+        gridAlpha,
+        cellXs,
+        fractionXs,
+        cellYs,
+        fractionYs,
+        columns,
+        config.wrap
+      );
+    } else {
+      renderBilinearReplaceGrid(
+        context,
+        source3.pixels,
+        gridX,
+        gridY,
+        cellXs,
+        fractionXs,
+        cellYs,
+        fractionYs,
+        columns,
+        config.wrap
+      );
+    }
+    return { swap: true };
+  }
+  renderNoMoveGrid(
+    context,
+    config.buffer === 0 ? null : source3.pixels,
+    gridAlpha,
+    cellXs,
+    fractionXs,
+    cellYs,
+    fractionYs,
+    columns
+  );
+  return;
+}
+function renderNoMoveGrid(context, maskSource, gridAlpha, cellXs, fractionXs, cellYs, fractionYs, columns) {
+  const width = context.input.width;
+  const height = context.input.height;
+  const input = context.input.pixels;
+  const blendTable = AVS_BLEND_TABLE;
+  let index = 0;
   for (let y = 0; y < height; y++) {
     const cellY = cellYs[y];
     const fy = fractionYs[y];
-    for (let x = 0; x < width; x++) {
-      const cellX = cellXs[x];
+    const inverseY = 1 - fy;
+    const row = cellY * columns;
+    for (let x = 0; x < width; x++, index++) {
       const fx = fractionXs[x];
-      const topLeft = cellX + cellY * columns;
+      const topLeft = cellXs[x] + row;
       const topRight = topLeft + 1;
       const bottomLeft = topLeft + columns;
       const bottomRight = bottomLeft + 1;
-      const mappedX = bilerp(gridX[topLeft], gridX[topRight], gridX[bottomLeft], gridX[bottomRight], fx, fy);
-      const mappedY = bilerp(gridY[topLeft], gridY[topRight], gridY[bottomLeft], gridY[bottomRight], fx, fy);
-      const alpha = config.noMove || config.blend ? Math.trunc(clamp16(bilerp(
-        gridAlpha[topLeft],
-        gridAlpha[topRight],
-        gridAlpha[bottomLeft],
-        gridAlpha[bottomRight],
-        fx,
-        fy
-      ), 0, 1) * 255) : 0;
-      const index = x + y * width;
-      if (config.noMove) {
-        const maskSource = config.buffer === 0 ? 0 : source3.pixels[index];
-        context.input.pixels[index] = blendPixel(maskSource, context.input.pixels[index], "adjustable", alpha);
-        continue;
-      }
-      const sampled = sample(source3.pixels, width, height, mappedX, mappedY, config.wrap, config.bilinear);
-      context.output.pixels[index] = config.blend ? blendPixel(sampled, context.input.pixels[index], "adjustable", alpha) : sampled;
+      const rawAlpha = (gridAlpha[topLeft] + (gridAlpha[topRight] - gridAlpha[topLeft]) * fx) * inverseY + (gridAlpha[bottomLeft] + (gridAlpha[bottomRight] - gridAlpha[bottomLeft]) * fx) * fy;
+      const alpha = Math.trunc(clamp17(rawAlpha, 0, 1) * 255);
+      const inverseAlpha = 255 - alpha;
+      const source3 = maskSource?.[index] ?? 0;
+      const current = input[index];
+      const low = blendTable[(source3 & 255) << 8 | alpha] + blendTable[(current & 255) << 8 | inverseAlpha];
+      const middle = blendTable[(source3 >>> 8 & 255) << 8 | alpha] + blendTable[(current >>> 8 & 255) << 8 | inverseAlpha];
+      const high = blendTable[(source3 >>> 16 & 255) << 8 | alpha] + blendTable[(current >>> 16 & 255) << 8 | inverseAlpha];
+      input[index] = low | middle << 8 | high << 16;
     }
   }
-  return config.noMove ? void 0 : { swap: true };
+}
+function renderBilinearReplaceGrid(context, source3, gridX, gridY, cellXs, fractionXs, cellYs, fractionYs, columns, wrap2) {
+  const width = context.input.width;
+  const height = context.input.height;
+  const destination = context.output.pixels;
+  const maxX = Math.max(0, width - 2);
+  const maxY = Math.max(0, height - 2);
+  const spanX = Math.max(1, maxX);
+  const spanY = Math.max(1, maxY);
+  const blendTable = AVS_BLEND_TABLE;
+  let index = 0;
+  for (let y = 0; y < height; y++) {
+    const cellY = cellYs[y];
+    const fy = fractionYs[y];
+    const inverseY = 1 - fy;
+    const row = cellY * columns;
+    for (let x = 0; x < width; x++, index++) {
+      const fx = fractionXs[x];
+      const topLeft = cellXs[x] + row;
+      const topRight = topLeft + 1;
+      const bottomLeft = topLeft + columns;
+      const bottomRight = bottomLeft + 1;
+      let mappedX = (gridX[topLeft] + (gridX[topRight] - gridX[topLeft]) * fx) * inverseY + (gridX[bottomLeft] + (gridX[bottomRight] - gridX[bottomLeft]) * fx) * fy;
+      let mappedY = (gridY[topLeft] + (gridY[topRight] - gridY[topLeft]) * fx) * inverseY + (gridY[bottomLeft] + (gridY[bottomRight] - gridY[bottomLeft]) * fx) * fy;
+      if (wrap2) {
+        mappedX = (mappedX % spanX + spanX) % spanX;
+        mappedY = (mappedY % spanY + spanY) % spanY;
+      } else {
+        mappedX = clamp17(mappedX, 0, maxX);
+        mappedY = clamp17(mappedY, 0, maxY);
+      }
+      const ix = Math.trunc(mappedX);
+      const iy = Math.trunc(mappedY);
+      if (width < 2 || height < 2) {
+        destination[index] = source3[ix + iy * width];
+        continue;
+      }
+      const sampleX = Math.trunc((mappedX - ix) * 256) & 255;
+      const sampleY = Math.trunc((mappedY - iy) * 256) & 255;
+      const inverseX = 255 - sampleX;
+      const inverseSampleY = 255 - sampleY;
+      const weight0 = blendTable[inverseX << 8 | inverseSampleY];
+      const weight1 = blendTable[sampleX << 8 | inverseSampleY];
+      const weight2 = blendTable[inverseX << 8 | sampleY];
+      const weight3 = blendTable[sampleX << 8 | sampleY];
+      const offset = ix + iy * width;
+      const pixel0 = source3[offset];
+      const pixel1 = source3[offset + 1];
+      const pixel2 = source3[offset + width];
+      const pixel3 = source3[offset + width + 1];
+      const low = blendTable[(pixel0 & 255) << 8 | weight0] + blendTable[(pixel1 & 255) << 8 | weight1] + blendTable[(pixel2 & 255) << 8 | weight2] + blendTable[(pixel3 & 255) << 8 | weight3];
+      const middle = blendTable[(pixel0 >>> 8 & 255) << 8 | weight0] + blendTable[(pixel1 >>> 8 & 255) << 8 | weight1] + blendTable[(pixel2 >>> 8 & 255) << 8 | weight2] + blendTable[(pixel3 >>> 8 & 255) << 8 | weight3];
+      const high = blendTable[(pixel0 >>> 16 & 255) << 8 | weight0] + blendTable[(pixel1 >>> 16 & 255) << 8 | weight1] + blendTable[(pixel2 >>> 16 & 255) << 8 | weight2] + blendTable[(pixel3 >>> 16 & 255) << 8 | weight3];
+      destination[index] = low & 255 | (middle & 255) << 8 | (high & 255) << 16;
+    }
+  }
+}
+function renderBilinearBlendGrid(context, source3, gridX, gridY, gridAlpha, cellXs, fractionXs, cellYs, fractionYs, columns, wrap2) {
+  const width = context.input.width;
+  const height = context.input.height;
+  const input = context.input.pixels;
+  const destination = context.output.pixels;
+  const maxX = Math.max(0, width - 2);
+  const maxY = Math.max(0, height - 2);
+  const spanX = Math.max(1, maxX);
+  const spanY = Math.max(1, maxY);
+  const blendTable = AVS_BLEND_TABLE;
+  let index = 0;
+  for (let y = 0; y < height; y++) {
+    const cellY = cellYs[y];
+    const fy = fractionYs[y];
+    const inverseY = 1 - fy;
+    const row = cellY * columns;
+    for (let x = 0; x < width; x++, index++) {
+      const fx = fractionXs[x];
+      const topLeft = cellXs[x] + row;
+      const topRight = topLeft + 1;
+      const bottomLeft = topLeft + columns;
+      const bottomRight = bottomLeft + 1;
+      let mappedX = (gridX[topLeft] + (gridX[topRight] - gridX[topLeft]) * fx) * inverseY + (gridX[bottomLeft] + (gridX[bottomRight] - gridX[bottomLeft]) * fx) * fy;
+      let mappedY = (gridY[topLeft] + (gridY[topRight] - gridY[topLeft]) * fx) * inverseY + (gridY[bottomLeft] + (gridY[bottomRight] - gridY[bottomLeft]) * fx) * fy;
+      if (wrap2) {
+        mappedX = (mappedX % spanX + spanX) % spanX;
+        mappedY = (mappedY % spanY + spanY) % spanY;
+      } else {
+        mappedX = clamp17(mappedX, 0, maxX);
+        mappedY = clamp17(mappedY, 0, maxY);
+      }
+      const ix = Math.trunc(mappedX);
+      const iy = Math.trunc(mappedY);
+      let sampled;
+      if (width < 2 || height < 2) {
+        sampled = source3[ix + iy * width];
+      } else {
+        const sampleX = Math.trunc((mappedX - ix) * 256) & 255;
+        const sampleY = Math.trunc((mappedY - iy) * 256) & 255;
+        const inverseX = 255 - sampleX;
+        const inverseSampleY = 255 - sampleY;
+        const weight0 = blendTable[inverseX << 8 | inverseSampleY];
+        const weight1 = blendTable[sampleX << 8 | inverseSampleY];
+        const weight2 = blendTable[inverseX << 8 | sampleY];
+        const weight3 = blendTable[sampleX << 8 | sampleY];
+        const offset = ix + iy * width;
+        const pixel0 = source3[offset];
+        const pixel1 = source3[offset + 1];
+        const pixel2 = source3[offset + width];
+        const pixel3 = source3[offset + width + 1];
+        const low2 = blendTable[(pixel0 & 255) << 8 | weight0] + blendTable[(pixel1 & 255) << 8 | weight1] + blendTable[(pixel2 & 255) << 8 | weight2] + blendTable[(pixel3 & 255) << 8 | weight3];
+        const middle2 = blendTable[(pixel0 >>> 8 & 255) << 8 | weight0] + blendTable[(pixel1 >>> 8 & 255) << 8 | weight1] + blendTable[(pixel2 >>> 8 & 255) << 8 | weight2] + blendTable[(pixel3 >>> 8 & 255) << 8 | weight3];
+        const high2 = blendTable[(pixel0 >>> 16 & 255) << 8 | weight0] + blendTable[(pixel1 >>> 16 & 255) << 8 | weight1] + blendTable[(pixel2 >>> 16 & 255) << 8 | weight2] + blendTable[(pixel3 >>> 16 & 255) << 8 | weight3];
+        sampled = low2 & 255 | (middle2 & 255) << 8 | (high2 & 255) << 16;
+      }
+      const rawAlpha = (gridAlpha[topLeft] + (gridAlpha[topRight] - gridAlpha[topLeft]) * fx) * inverseY + (gridAlpha[bottomLeft] + (gridAlpha[bottomRight] - gridAlpha[bottomLeft]) * fx) * fy;
+      const alpha = Math.trunc(clamp17(rawAlpha, 0, 1) * 255);
+      const inverseAlpha = 255 - alpha;
+      const current = input[index];
+      const low = blendTable[(sampled & 255) << 8 | alpha] + blendTable[(current & 255) << 8 | inverseAlpha];
+      const middle = blendTable[(sampled >>> 8 & 255) << 8 | alpha] + blendTable[(current >>> 8 & 255) << 8 | inverseAlpha];
+      const high = blendTable[(sampled >>> 16 & 255) << 8 | alpha] + blendTable[(current >>> 16 & 255) << 8 | inverseAlpha];
+      destination[index] = low | middle << 8 | high << 16;
+    }
+  }
 }
 function renderNearestGrid(context, config, source3, gridX, gridY, gridAlpha, cellXs, fractionXs, cellYs, fractionYs, columns) {
   const width = context.input.width;
@@ -14578,11 +15729,15 @@ function renderNearestGrid(context, config, source3, gridX, gridY, gridAlpha, ce
       let mappedX = (gridX[topLeft] + (gridX[topRight] - gridX[topLeft]) * fx) * inverseY + (gridX[bottomLeft] + (gridX[bottomRight] - gridX[bottomLeft]) * fx) * fy;
       let mappedY = (gridY[topLeft] + (gridY[topRight] - gridY[topLeft]) * fx) * inverseY + (gridY[bottomLeft] + (gridY[bottomRight] - gridY[bottomLeft]) * fx) * fy;
       if (config.wrap) {
-        mappedX = (mappedX % spanX + spanX) % spanX;
-        mappedY = (mappedY % spanY + spanY) % spanY;
+        if (!(mappedX >= 0 && mappedX < spanX && Number.isInteger(mappedX))) {
+          mappedX = (mappedX % spanX + spanX) % spanX;
+        }
+        if (!(mappedY >= 0 && mappedY < spanY && Number.isInteger(mappedY))) {
+          mappedY = (mappedY % spanY + spanY) % spanY;
+        }
       } else {
-        mappedX = clamp16(mappedX, 0, maxX);
-        mappedY = clamp16(mappedY, 0, maxY);
+        mappedX = clamp17(mappedX, 0, maxX);
+        mappedY = clamp17(mappedY, 0, maxY);
       }
       const sampled = source3[Math.trunc(mappedX) + Math.trunc(mappedY) * width];
       if (!config.blend) {
@@ -14590,7 +15745,7 @@ function renderNearestGrid(context, config, source3, gridX, gridY, gridAlpha, ce
         continue;
       }
       const rawAlpha = (gridAlpha[topLeft] + (gridAlpha[topRight] - gridAlpha[topLeft]) * fx) * inverseY + (gridAlpha[bottomLeft] + (gridAlpha[bottomRight] - gridAlpha[bottomLeft]) * fx) * fy;
-      const alpha = Math.trunc(clamp16(rawAlpha, 0, 1) * 255);
+      const alpha = Math.trunc(clamp17(rawAlpha, 0, 1) * 255);
       const inverse = 255 - alpha;
       const current = input[index];
       const low = blendTable[(sampled & 255) << 8 | alpha] + blendTable[(current & 255) << 8 | inverse];
@@ -14630,44 +15785,9 @@ function prepareInterpolationAxis(state, width, height, columns, rows) {
     }
   }
 }
-function sample(pixels, width, height, rawX, rawY, wrap2, bilinear3) {
-  const maxX = bilinear3 ? Math.max(0, width - 2) : width - 1;
-  const maxY = bilinear3 ? Math.max(0, height - 2) : height - 1;
-  let x = rawX;
-  let y = rawY;
-  if (wrap2) {
-    const spanX = Math.max(1, maxX);
-    const spanY = Math.max(1, maxY);
-    x = (x % spanX + spanX) % spanX;
-    y = (y % spanY + spanY) % spanY;
-  } else {
-    x = clamp16(x, 0, maxX);
-    y = clamp16(y, 0, maxY);
-  }
-  const ix = Math.trunc(x);
-  const iy = Math.trunc(y);
-  if (!bilinear3 || width < 2 || height < 2) return pixels[ix + iy * width];
-  const fx = Math.trunc((x - ix) * 256) & 255;
-  const fy = Math.trunc((y - iy) * 256) & 255;
-  const inverseX = 255 - fx;
-  const inverseY = 255 - fy;
-  const w0 = table3(inverseX, inverseY);
-  const w1 = table3(fx, inverseY);
-  const w2 = table3(inverseX, fy);
-  const w3 = table3(fx, fy);
-  const offset = ix + iy * width;
-  const p0 = pixels[offset];
-  const p1 = pixels[offset + 1];
-  const p2 = pixels[offset + width];
-  const p3 = pixels[offset + width + 1];
-  const low = table3(p0 & 255, w0) + table3(p1 & 255, w1) + table3(p2 & 255, w2) + table3(p3 & 255, w3);
-  const middle = table3(p0 >>> 8 & 255, w0) + table3(p1 >>> 8 & 255, w1) + table3(p2 >>> 8 & 255, w2) + table3(p3 >>> 8 & 255, w3);
-  const high = table3(p0 >>> 16 & 255, w0) + table3(p1 >>> 16 & 255, w1) + table3(p2 >>> 16 & 255, w2) + table3(p3 >>> 16 & 255, w3);
-  return low & 255 | (middle & 255) << 8 | (high & 255) << 16;
-}
 function readString2(payload, offset) {
   if (offset + 4 > payload.length) return { value: "", next: payload.length };
-  const length = u323(payload, offset, 0);
+  const length = u322(payload, offset, 0);
   const start = offset + 4;
   const end = Math.min(payload.length, start + length);
   return { value: nulText4(payload.subarray(start, end)), next: end };
@@ -14683,26 +15803,20 @@ function compileOrNull3(source3) {
 function execute3(program, vm) {
   return program ? vm.execute(program) : 0;
 }
-function i326(payload, offset, fallback) {
+function i325(payload, offset, fallback) {
   return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
 }
-function u323(payload, offset, fallback) {
+function u322(payload, offset, fallback) {
   return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(offset, true) : fallback;
 }
 function nulText4(bytes) {
   const end = bytes.indexOf(0);
   return TEXT3.decode(end < 0 ? bytes : bytes.subarray(0, end));
 }
-function bilerp(a, b, c, d, x, y) {
-  return (a + (b - a) * x) * (1 - y) + (c + (d - c) * x) * y;
-}
-function table3(x, y) {
-  return AVS_BLEND_TABLE[x << 8 | y];
-}
-function clamp16(value, minimum, maximum) {
+function clamp17(value, minimum, maximum) {
   return value < minimum ? minimum : value > maximum ? maximum : value;
 }
-function hashPath6(path) {
+function hashPath7(path) {
   let hash = 2166136261;
   for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
   return hash >>> 0;
@@ -14795,13 +15909,13 @@ function rotoBlit(context, zoom, degrees, blend2, subpixel) {
   let tStart = -Math.trunc((width - 1) / 2) * dtDx - Math.trunc((height - 1) / 2) * dtDy + (height - 1) * (32768 + (1 << 20));
   let output = 0;
   for (let row = height; row > 0; row--) {
-    let s = modulo3(sStart, ds), t = modulo3(tStart, dt);
+    let s = modulo4(sStart, ds), t = modulo4(tStart, dt);
     for (let x = width; x > 0; x--) {
-      const sample2 = subpixel ? bilinear2(context, s, t) : context.input.pixels[(s >> 16) + (t >> 16) * width];
-      context.output.pixels[output] = blend2 ? blendPixel(sample2, context.input.pixels[output], "average") : sample2;
+      const sample = subpixel ? bilinear2(context, s, t) : context.input.pixels[(s >> 16) + (t >> 16) * width];
+      context.output.pixels[output] = blend2 ? blendPixel(sample, context.input.pixels[output], "average") : sample;
       output++;
-      s = modulo3(s + dsDx, ds);
-      t = modulo3(t + dtDx, dt);
+      s = modulo4(s + dsDx, ds);
+      t = modulo4(t + dtDx, dt);
     }
     sStart += dsDy;
     tStart += dtDy;
@@ -14810,7 +15924,7 @@ function rotoBlit(context, zoom, degrees, blend2, subpixel) {
 function bilinear2(context, s, t) {
   const x = s >> 16, y = t >> 16, fx = s >> 8 & 255, fy = t >> 8 & 255, width = context.input.width;
   const pixels = context.input.pixels, base2 = x + y * width;
-  const weights = [table4(255 - fx, 255 - fy), table4(fx, 255 - fy), table4(255 - fx, fy), table4(fx, fy)];
+  const weights = [table3(255 - fx, 255 - fy), table3(fx, 255 - fy), table3(255 - fx, fy), table3(fx, fy)];
   const samples = [pixels[base2], pixels[base2 + 1], pixels[base2 + width], pixels[base2 + width + 1]];
   return channels(samples, weights);
 }
@@ -14822,16 +15936,16 @@ function interference(context, points, alpha, rgb2) {
       for (let index = 0; index < points.length; index++) {
         const pixel = displaced(context, x, y, points[index]);
         const channel = index % 3;
-        values[channel] = Math.min(255, values[channel] + table4(pixel >>> channel * 8 & 255, alpha));
+        values[channel] = Math.min(255, values[channel] + table3(pixel >>> channel * 8 & 255, alpha));
       }
       context.output.pixels[x + y * width] = values[0] | values[1] << 8 | values[2] << 16;
     } else {
       let red = 0, green = 0, blue = 0;
       for (const point of points) {
         const pixel = displaced(context, x, y, point);
-        blue += table4(pixel & 255, alpha);
-        green += table4(pixel >>> 8 & 255, alpha);
-        red += table4(pixel >>> 16 & 255, alpha);
+        blue += table3(pixel & 255, alpha);
+        green += table3(pixel >>> 8 & 255, alpha);
+        red += table3(pixel >>> 16 & 255, alpha);
       }
       context.output.pixels[x + y * width] = Math.min(255, blue) | Math.min(255, green) << 8 | Math.min(255, red) << 16;
     }
@@ -14923,7 +16037,7 @@ function channels(samples, weights) {
   let out = 0;
   for (let channel = 0; channel < 3; channel++) {
     let value = 0;
-    for (let i = 0; i < 4; i++) value += table4(samples[i] >>> channel * 8 & 255, weights[i]);
+    for (let i = 0; i < 4; i++) value += table3(samples[i] >>> channel * 8 & 255, weights[i]);
     out |= (value & 255) << channel * 8;
   }
   return out;
@@ -14933,10 +16047,10 @@ function mixColor(a, b, numerator, denominator) {
   for (let channel = 0; channel < 3; channel++) out |= Math.trunc(((a >>> channel * 8 & 255) * (denominator - numerator) + (b >>> channel * 8 & 255) * numerator) / denominator) << channel * 8;
   return out;
 }
-function table4(x, y) {
+function table3(x, y) {
   return Math.trunc(x / 255 * y);
 }
-function modulo3(value, divisor) {
+function modulo4(value, divisor) {
   const result = value % divisor;
   return result < 0 ? result + divisor : result;
 }
@@ -14945,421 +16059,6 @@ function int5(context, offset, fallback) {
 }
 function float(context, offset, fallback) {
   return offset + 4 <= context.component.payload.length ? new DataView(context.component.payload.buffer, context.component.payload.byteOffset, context.component.payload.byteLength).getFloat32(offset, true) : fallback;
-}
-
-// src/avs/effects/movement.ts
-var TEXT4 = new TextDecoder("windows-1252");
-var CUSTOM_EFFECT = 32767;
-var LAST_BUILTIN_EFFECT = 23;
-var OFFSET_MASK = (1 << 22) - 1;
-var EVALUATED_BUILTINS = {
-  18: {
-    source: "d=d*(1-(sin((r-$pi*.5)*7)*.03));r=r+(cos(d*12)*.03)",
-    rectangular: false
-  },
-  19: {
-    source: "d=d*(1-(sin((r-$pi*.5)*12)*.05));r=r+(cos(d*18)*.05);d=d*(1-((d-.4)*.03));r=r+((d-.4)*.13)",
-    rectangular: false
-  },
-  20: { source: "x=x+(cos(y*18)*.02);y=y+(sin(x*14)*.03)", rectangular: true },
-  21: {
-    source: "x=x+(cos(abs(y-.5)*8)*.02);y=y+(sin(abs(x-.5)*8)*.05);x=x*.95;y=y*.95",
-    rectangular: true
-  },
-  22: {
-    source: "y=y*(1+(sin(r+$pi/2)*.3));x=x*(1+(cos(r+$pi/2)*.3));x=x*.995;y=y*.995",
-    rectangular: true
-  },
-  23: { source: "y=(r*6)/$pi;x=d", rectangular: true }
-};
-function decodeAvsMovement(payload) {
-  let offset = 0;
-  let effect3 = readI322(payload, offset, 1);
-  offset += 4;
-  let expression = "";
-  let rectangular = false;
-  if (effect3 === CUSTOM_EFFECT) {
-    if (asciiEquals(payload, offset, "!rect ")) {
-      offset += 6;
-      rectangular = true;
-    }
-    if (payload[offset] === 1) {
-      offset++;
-      const length = readI322(payload, offset, 0);
-      offset += 4;
-      if (length > 0 && offset + length <= payload.length) {
-        expression = nulText5(payload.subarray(offset, offset + length));
-        offset += length;
-      }
-    } else {
-      const length = 256 - (rectangular ? 6 : 0);
-      if (offset + length <= payload.length) {
-        expression = nulText5(payload.subarray(offset, offset + length));
-        offset += length;
-      }
-    }
-  }
-  const blend2 = readI322(payload, offset, 0) !== 0;
-  offset += 4;
-  const sourceMapped = readI322(payload, offset, 0);
-  offset += 4;
-  rectangular = readI322(payload, offset, rectangular ? 1 : 0) !== 0;
-  offset += 4;
-  const subpixel = readI322(payload, offset, 0) !== 0;
-  offset += 4;
-  const wrap2 = readI322(payload, offset, 0) !== 0;
-  offset += 4;
-  if (effect3 === 0 && offset + 4 <= payload.length) effect3 = readI322(payload, offset, 0);
-  if (effect3 !== CUSTOM_EFFECT && effect3 > LAST_BUILTIN_EFFECT || effect3 < 0) effect3 = 0;
-  return { effect: effect3, expression, blend: blend2, sourceMapped, rectangular, subpixel, wrap: wrap2 };
-}
-function registerAvsMovement(registry, global = new AvsEelGlobalState()) {
-  const states = /* @__PURE__ */ new Map();
-  registry.registerBuiltin(15, (context) => {
-    let state = states.get(context.component.path);
-    if (!state) {
-      const config = decodeAvsMovement(context.component.payload);
-      state = {
-        config,
-        program: movementProgram(config),
-        sourceMapped: config.sourceMapped,
-        width: 0,
-        height: 0,
-        table: null,
-        randomState: hashPath7(context.component.path)
-      };
-      states.set(context.component.path, state);
-    }
-    if (state.config.effect === 0) return;
-    if (!state.table || state.width !== context.input.width || state.height !== context.input.height) {
-      state.table = buildMovementTable(context, state, global);
-      state.width = context.input.width;
-      state.height = context.input.height;
-    }
-    if (context.preinit) return;
-    if ((state.sourceMapped & 2) !== 0 && context.beat) state.sourceMapped ^= 1;
-    if ((state.sourceMapped & 1) !== 0) renderForward(context, state.table, state.config.blend);
-    else renderInverse(context, state.table, state.config.blend);
-    return { swap: true };
-  });
-  return registry;
-}
-function movementProgram(config) {
-  const source3 = config.effect === CUSTOM_EFFECT ? config.expression : EVALUATED_BUILTINS[config.effect]?.source;
-  if (!source3?.trim()) return null;
-  try {
-    return compileAvsEel(source3);
-  } catch {
-    return null;
-  }
-}
-function buildMovementTable(context, state, global) {
-  const { width, height } = context.input;
-  const count = width * height;
-  const config = state.config;
-  const bilinear3 = config.subpixel && width > 1 && height > 1 && count < 1 << 22 && (config.effect === CUSTOM_EFFECT || config.effect >= 3 && config.effect <= 23 && config.effect !== 7);
-  const table6 = {
-    offsets: new Uint32Array(count),
-    xWeights: new Uint8Array(count),
-    yWeights: new Uint8Array(count),
-    bilinear: bilinear3
-  };
-  if (config.effect === 1) {
-    for (let i = 0; i < count; i++) {
-      const dx = nextRandom3(state) % 3 - 1;
-      const dy = nextRandom3(state) % 3 - 1;
-      table6.offsets[i] = clamp17(i + dx + dy * width, 0, count - 1);
-    }
-    return table6;
-  }
-  if (config.effect === 2) {
-    const shift = Math.trunc(width / 64);
-    for (let y = 0; y < height; y++) {
-      let sourceX = shift;
-      for (let x = 0; x < width; x++) {
-        table6.offsets[x + y * width] = sourceX + y * width;
-        sourceX++;
-        if (sourceX >= width) sourceX -= width;
-      }
-    }
-    return table6;
-  }
-  if (config.effect === 7) {
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        let sourceX = x;
-        let sourceY = y;
-        if ((x & 2) === 0 && (y & 2) === 0) {
-          sourceX = Math.trunc(width / 2 + ((x & ~1) - width / 2) * 7 / 8);
-          sourceY = Math.trunc(height / 2 + ((y & ~1) - height / 2) * 7 / 8);
-        }
-        table6.offsets[x + y * width] = clamp17(sourceX, 0, width - 1) + clamp17(sourceY, 0, height - 1) * width;
-      }
-    }
-    return table6;
-  }
-  if (state.program) buildEvaluatedTable(context, state, table6, global);
-  else if (config.effect >= 3 && config.effect <= 17) buildNativeTable(state, table6, width, height);
-  else fillIdentity(table6, width, height);
-  return table6;
-}
-function buildNativeTable(state, table6, width, height) {
-  const halfWidth = Math.trunc(width / 2);
-  const halfHeight = Math.trunc(height / 2);
-  const maxDistance = Math.sqrt(width * width + height * height) / 2;
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const xd = x - halfWidth;
-      const yd = y - halfHeight;
-      let distance = Math.hypot(xd, yd);
-      let angle = Math.atan2(yd, xd);
-      let xOffset = 0;
-      switch (state.config.effect) {
-        case 3:
-          angle += 0.1 - 0.2 * distance / maxDistance;
-          distance *= 0.96;
-          break;
-        case 4:
-          distance *= 0.99 * (1 - Math.sin(angle) / 32);
-          angle += 0.03 * Math.sin(distance / maxDistance * Math.PI * 4);
-          break;
-        case 5:
-          distance *= 0.94 + Math.cos(angle * 32) * 0.06;
-          break;
-        case 6:
-          distance *= 1.01 + Math.cos(angle * 4) * 0.04;
-          angle += 0.03 * Math.sin(distance / maxDistance * Math.PI * 4);
-          break;
-        case 8:
-          angle += 0.1 * Math.sin(distance / maxDistance * Math.PI * 5);
-          break;
-        case 9: {
-          const t = Math.sin(distance / maxDistance * Math.PI);
-          distance -= 8 * t ** 5;
-          break;
-        }
-        case 10: {
-          const t = Math.sin(distance / maxDistance * Math.PI);
-          distance -= 8 * t ** 5;
-          const swirl = Math.cos(distance / maxDistance * Math.PI / 2);
-          angle += 0.1 * swirl ** 3;
-          break;
-        }
-        case 11:
-          distance *= 0.95 + Math.cos(angle * 5 - Math.PI / 2.5) * 0.03;
-          break;
-        case 12:
-          angle += 0.04;
-          distance *= 0.96 + Math.cos(distance / maxDistance * Math.PI) * 0.05;
-          break;
-        case 13: {
-          const t = Math.cos(distance / maxDistance * Math.PI);
-          angle += 0.07 * t;
-          distance *= 0.98 + t * 0.1;
-          break;
-        }
-        case 14:
-          angle += 0.1 - 0.2 * distance / maxDistance;
-          distance *= 0.96;
-          xOffset = 8;
-          break;
-        case 15:
-          distance = maxDistance * 0.15;
-          break;
-        case 16:
-          angle = Math.cos(angle * 3);
-          break;
-        case 17:
-          distance *= 1 - (distance / maxDistance - 0.35) * 0.5;
-          angle += 0.1;
-          break;
-      }
-      const sampleX = halfWidth + Math.cos(angle) * distance + 0.5 + xOffset * width / 256;
-      const sampleY = halfHeight + Math.sin(angle) * distance + 0.5;
-      storeCoordinate(table6, x + y * width, sampleX, sampleY, width, height, state.config.wrap);
-    }
-  }
-}
-function buildEvaluatedTable(context, state, table6, global) {
-  const { width, height } = context.input;
-  const halfWidth = Math.trunc(width / 2);
-  const halfHeight = Math.trunc(height / 2);
-  const maxDistance = Math.sqrt(width * width + height * height) / 2;
-  const vm = new AvsEelVm({ global, seed: state.randomState });
-  vm.setHost({
-    getosc: (band, span, channel) => avsAudioSample(context.audio, "osc", band, span, channel),
-    getspec: (band, span, channel) => avsAudioSample(context.audio, "spec", band, span, channel)
-  });
-  vm.set("sw", width);
-  vm.set("sh", height);
-  const rectangular = state.config.effect === CUSTOM_EFFECT ? state.config.rectangular : EVALUATED_BUILTINS[state.config.effect]?.rectangular === true;
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const xd = x - halfWidth;
-      const yd = y - halfHeight;
-      vm.set("x", halfWidth === 0 ? 0 : xd / halfWidth);
-      vm.set("y", halfHeight === 0 ? 0 : yd / halfHeight);
-      vm.set("d", maxDistance === 0 ? 0 : Math.hypot(xd, yd) / maxDistance);
-      vm.set("r", Math.atan2(yd, xd) + Math.PI / 2);
-      vm.execute(state.program);
-      let sampleX;
-      let sampleY;
-      if (rectangular) {
-        sampleX = (vm.get("x") + 1) * halfWidth;
-        sampleY = (vm.get("y") + 1) * halfHeight;
-      } else {
-        const distance = vm.get("d") * maxDistance;
-        const angle = vm.get("r") - Math.PI / 2;
-        sampleX = halfWidth + Math.cos(angle) * distance;
-        sampleY = halfHeight + Math.sin(angle) * distance;
-      }
-      if (!table6.bilinear) {
-        sampleX += 0.5;
-        sampleY += 0.5;
-      }
-      storeCoordinate(table6, x + y * width, sampleX, sampleY, width, height, state.config.wrap);
-    }
-  }
-}
-function storeCoordinate(table6, destination, rawX, rawY, width, height, wrap2) {
-  if (!table6.bilinear) {
-    let x2 = Math.trunc(rawX);
-    let y2 = Math.trunc(rawY);
-    if (wrap2) {
-      x2 = modulo4(x2, width);
-      y2 = modulo4(y2, height);
-    } else {
-      x2 = clamp17(x2, 0, width - 1);
-      y2 = clamp17(y2, 0, height - 1);
-    }
-    table6.offsets[destination] = x2 + y2 * width;
-    return;
-  }
-  let x = Math.trunc(rawX);
-  let y = Math.trunc(rawY);
-  let xPartial = Math.trunc(32 * (rawX - x));
-  let yPartial = Math.trunc(32 * (rawY - y));
-  if (wrap2) {
-    x = modulo4(x, width - 1);
-    y = modulo4(y, height - 1);
-  } else {
-    if (x < 0) {
-      x = 0;
-      xPartial = 0;
-    } else if (x >= width - 1) {
-      x = width - 2;
-      xPartial = 31;
-    }
-    if (y < 0) {
-      y = 0;
-      yPartial = 0;
-    } else if (y >= height - 1) {
-      y = height - 2;
-      yPartial = 31;
-    }
-  }
-  const packed = (x + y * width | yPartial << 22 | xPartial << 27) >>> 0;
-  table6.offsets[destination] = packed & OFFSET_MASK;
-  table6.xWeights[destination] = packed >>> 24 & 31 << 3;
-  table6.yWeights[destination] = packed >>> 19 & 31 << 3;
-}
-function renderInverse(context, table6, blend2) {
-  const source3 = context.input.pixels;
-  const output = context.output.pixels;
-  const width = context.input.width;
-  if (table6.bilinear) {
-    if (blend2) {
-      for (let i = 0; i < output.length; i++) {
-        output[i] = averagePixel3(source3[i], sampleBilinear(
-          source3,
-          table6.offsets[i],
-          width,
-          table6.xWeights[i],
-          table6.yWeights[i]
-        ));
-      }
-    } else {
-      for (let i = 0; i < output.length; i++) {
-        output[i] = sampleBilinear(source3, table6.offsets[i], width, table6.xWeights[i], table6.yWeights[i]);
-      }
-    }
-  } else if (blend2) {
-    for (let i = 0; i < output.length; i++) output[i] = averagePixel3(source3[i], source3[table6.offsets[i]]);
-  } else {
-    for (let i = 0; i < output.length; i++) output[i] = source3[table6.offsets[i]];
-  }
-}
-function renderForward(context, table6, blend2) {
-  const source3 = context.input.pixels;
-  const output = context.output.pixels;
-  if (blend2) output.set(source3);
-  else output.fill(0);
-  for (let i = 0; i < source3.length; i++) {
-    const destination = table6.offsets[i];
-    output[destination] = maximumPixel2(source3[i], output[destination]);
-  }
-  if (blend2) {
-    for (let i = 0; i < output.length; i++) output[i] = averagePixel3(output[i], source3[i]);
-  }
-}
-function sampleBilinear(source3, offset, width, xp, yp) {
-  const blendTable = AVS_BLEND_TABLE;
-  const inverseX = 255 - xp;
-  const inverseY = 255 - yp;
-  const w0 = blendTable[inverseX << 8 | inverseY];
-  const w1 = blendTable[xp << 8 | inverseY];
-  const w2 = blendTable[inverseX << 8 | yp];
-  const w3 = blendTable[xp << 8 | yp];
-  const p0 = source3[offset];
-  const p1 = source3[offset + 1];
-  const p2 = source3[offset + width];
-  const p3 = source3[offset + width + 1];
-  const low = blendTable[(p0 & 255) << 8 | w0] + blendTable[(p1 & 255) << 8 | w1] + blendTable[(p2 & 255) << 8 | w2] + blendTable[(p3 & 255) << 8 | w3];
-  const middle = blendTable[(p0 >>> 8 & 255) << 8 | w0] + blendTable[(p1 >>> 8 & 255) << 8 | w1] + blendTable[(p2 >>> 8 & 255) << 8 | w2] + blendTable[(p3 >>> 8 & 255) << 8 | w3];
-  const high = blendTable[(p0 >>> 16 & 255) << 8 | w0] + blendTable[(p1 >>> 16 & 255) << 8 | w1] + blendTable[(p2 >>> 16 & 255) << 8 | w2] + blendTable[(p3 >>> 16 & 255) << 8 | w3];
-  return low & 255 | (middle & 255) << 8 | (high & 255) << 16;
-}
-function fillIdentity(table6, width, height) {
-  for (let i = 0; i < width * height; i++) table6.offsets[i] = i;
-}
-function averagePixel3(a, b) {
-  return (a >>> 1 & 8355711) + (b >>> 1 & 8355711) & 16777215;
-}
-function maximumPixel2(a, b) {
-  return Math.max(a & 255, b & 255) | Math.max(a >>> 8 & 255, b >>> 8 & 255) << 8 | Math.max(a >>> 16 & 255, b >>> 16 & 255) << 16;
-}
-function nextRandom3(state) {
-  let x = state.randomState || 1831565813;
-  x ^= x << 13;
-  x ^= x >>> 17;
-  x ^= x << 5;
-  state.randomState = x >>> 0;
-  return state.randomState;
-}
-function modulo4(value, modulus) {
-  if (modulus <= 0) return 0;
-  const result = value % modulus;
-  return result < 0 ? result + modulus : result;
-}
-function readI322(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
-}
-function asciiEquals(payload, offset, value) {
-  if (offset + value.length > payload.length) return false;
-  for (let i = 0; i < value.length; i++) if (payload[offset + i] !== value.charCodeAt(i)) return false;
-  return true;
-}
-function nulText5(bytes) {
-  const end = bytes.indexOf(0);
-  return TEXT4.decode(end < 0 ? bytes : bytes.subarray(0, end));
-}
-function clamp17(value, minimum, maximum) {
-  return value < minimum ? minimum : value > maximum ? maximum : value;
-}
-function hashPath7(path) {
-  let hash = 2166136261;
-  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
-  return hash >>> 0;
 }
 
 // src/avs/effects/low-count-builtins.ts
@@ -15685,7 +16384,17 @@ function infiniteRootBorder(context) {
 var AVS_CHANNEL_SHIFT_APE_ID = "Channel Shift";
 var AVS_COLOR_REDUCTION_APE_ID = "Color Reduction";
 var AVS_MULTIPLIER_APE_ID = "Multiplier";
-var CHANNEL_MODES = [1183, 1020, 1018, 1022, 1019, 1021];
+var AVS_CHANNEL_SHIFT_MODES = [1183, 1020, 1018, 1022, 1019, 1021];
+function createAvsChannelShiftState(config, path) {
+  return { mode: config.mode, randomState: hashPath9(path) };
+}
+function resolveAvsChannelShiftMode(state, config, beat) {
+  if (beat && config.randomizeOnBeat) {
+    state.randomState = xorshift323(state.randomState);
+    state.mode = AVS_CHANNEL_SHIFT_MODES[state.randomState % AVS_CHANNEL_SHIFT_MODES.length];
+  }
+  return state.mode;
+}
 function decodeAvsChannelShift(payload) {
   const native = new Uint8Array(8);
   const view = new DataView(native.buffer);
@@ -15700,7 +16409,7 @@ function decodeAvsChannelShift(payload) {
 function decodeAvsColorReduction(payload) {
   if (payload.length !== 264) return { legacyFilename: "", levels: 0 };
   return {
-    legacyFilename: nulText6(payload.subarray(0, 260)),
+    legacyFilename: nulText5(payload.subarray(0, 260)),
     levels: readI323(payload, 260, 0)
   };
 }
@@ -15714,14 +16423,10 @@ function registerAvsNamedApeEffects(registry = new AvsEffectRegistry()) {
     const config = decodeAvsChannelShift(context.component.payload);
     let state = shifts.get(context.component.path);
     if (!state) {
-      state = { mode: config.mode, randomState: hashPath9(context.component.path) };
+      state = createAvsChannelShiftState(config, context.component.path);
       shifts.set(context.component.path, state);
     }
-    if (context.beat && config.randomizeOnBeat) {
-      state.randomState = xorshift323(state.randomState);
-      state.mode = CHANNEL_MODES[state.randomState % CHANNEL_MODES.length];
-    }
-    shiftChannels(context, state.mode);
+    shiftChannels(context, resolveAvsChannelShiftMode(state, config, context.beat));
   });
   registry.registerApe(AVS_COLOR_REDUCTION_APE_ID, (context) => {
     if (context.preinit) return;
@@ -15734,7 +16439,7 @@ function registerAvsNamedApeEffects(registry = new AvsEffectRegistry()) {
   return registry;
 }
 function shiftChannels(context, mode4) {
-  if (mode4 === 1183 || !CHANNEL_MODES.includes(mode4)) return;
+  if (mode4 === 1183 || !AVS_CHANNEL_SHIFT_MODES.includes(mode4)) return;
   for (let i = 0; i < context.input.pixels.length; i++) {
     const pixel = context.input.pixels[i];
     const red = pixel >>> 16 & 255;
@@ -15808,7 +16513,7 @@ function channels3(pixel, fn) {
 function readI323(payload, offset, fallback) {
   return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
 }
-function nulText6(bytes) {
+function nulText5(bytes) {
   const end = bytes.indexOf(0);
   return new TextDecoder("windows-1252").decode(end < 0 ? bytes : bytes.subarray(0, end));
 }
@@ -15829,7 +16534,7 @@ function xorshift323(value) {
 }
 
 // src/avs/effects/scripted-transforms.ts
-var TEXT5 = new TextDecoder("windows-1252");
+var TEXT4 = new TextDecoder("windows-1252");
 function decodeAvsDynamicColorModifier(payload) {
   const decoded = decodeScripts(payload, 4);
   return {
@@ -15837,7 +16542,7 @@ function decodeAvsDynamicColorModifier(payload) {
     frame: decoded.scripts[1],
     beat: decoded.scripts[2],
     init: decoded.scripts[3],
-    recompute: i327(payload, decoded.offset, 1) !== 0
+    recompute: i326(payload, decoded.offset, 1) !== 0
   };
 }
 function decodeAvsDynamicShift(payload) {
@@ -15846,8 +16551,8 @@ function decodeAvsDynamicShift(payload) {
     init: decoded.scripts[0],
     frame: decoded.scripts[1],
     beat: decoded.scripts[2],
-    blend: i327(payload, decoded.offset, 0) !== 0,
-    subpixel: i327(payload, decoded.offset + 4, 1) !== 0
+    blend: i326(payload, decoded.offset, 0) !== 0,
+    subpixel: i326(payload, decoded.offset + 4, 1) !== 0
   };
 }
 function decodeAvsDynamicDistanceModifier(payload) {
@@ -15857,17 +16562,17 @@ function decodeAvsDynamicDistanceModifier(payload) {
     frame: decoded.scripts[1],
     beat: decoded.scripts[2],
     init: decoded.scripts[3],
-    blend: i327(payload, decoded.offset, 0) !== 0,
-    subpixel: i327(payload, decoded.offset + 4, 0) !== 0
+    blend: i326(payload, decoded.offset, 0) !== 0,
+    subpixel: i326(payload, decoded.offset + 4, 0) !== 0
   };
 }
 function decodeAvsUniqueTone(payload) {
   return {
-    enabled: i327(payload, 0, 1) !== 0,
-    color: i327(payload, 4, 16777215) & 16777215,
-    additive: i327(payload, 8, 0) !== 0,
-    average: i327(payload, 12, 0) !== 0,
-    invert: i327(payload, 16, 0) !== 0
+    enabled: i326(payload, 0, 1) !== 0,
+    color: i326(payload, 4, 16777215) & 16777215,
+    additive: i326(payload, 8, 0) !== 0,
+    average: i326(payload, 12, 0) !== 0,
+    invert: i326(payload, 16, 0) !== 0
   };
 }
 function registerAvsScriptedTransforms(registry) {
@@ -16106,7 +16811,7 @@ function registerUniqueTone(registry) {
       const original = pixels[i];
       let depth = Math.max(original & 255, original >>> 8 & 255, original >>> 16 & 255);
       if (config.invert) depth = 255 - depth;
-      const tone = table5(depth, blue) | table5(depth, green) << 8 | table5(depth, red) << 16;
+      const tone = table4(depth, blue) | table4(depth, green) << 8 | table4(depth, red) << 16;
       pixels[i] = config.additive ? blendPixel(tone, original, "additive") : config.average ? averagePixel4(original, tone) : tone;
     }
   });
@@ -16126,10 +16831,10 @@ function decodeScripts(payload, count) {
     let offset = 1;
     for (let i = 0; i < count; i++) {
       if (offset + 4 > payload.length) return { scripts, offset: payload.length };
-      const length = i327(payload, offset, 0);
+      const length = i326(payload, offset, 0);
       offset += 4;
       if (length > 0 && offset + length <= payload.length) {
-        scripts[i] = nulText7(payload.subarray(offset, offset + length));
+        scripts[i] = nulText6(payload.subarray(offset, offset + length));
         offset += length;
       }
     }
@@ -16137,7 +16842,7 @@ function decodeScripts(payload, count) {
   }
   const bytes = count * 256;
   if (payload.length >= bytes) {
-    for (let i = 0; i < count; i++) scripts[i] = nulText7(payload.subarray(i * 256, (i + 1) * 256));
+    for (let i = 0; i < count; i++) scripts[i] = nulText6(payload.subarray(i * 256, (i + 1) * 256));
     return { scripts, offset: bytes };
   }
   return { scripts, offset: 0 };
@@ -16173,12 +16878,12 @@ function avsIntegerSquareRoot(value) {
   return Math.trunc(Math.sqrt(n));
 }
 function sampleBilinear2(source3, offset, width, xp, yp) {
-  const weights = [table5(255 - xp, 255 - yp), table5(xp, 255 - yp), table5(255 - xp, yp), table5(xp, yp)];
+  const weights = [table4(255 - xp, 255 - yp), table4(xp, 255 - yp), table4(255 - xp, yp), table4(xp, yp)];
   const pixels = [source3[offset], source3[offset + 1], source3[offset + width], source3[offset + width + 1]];
   let result = 0;
   for (let shift = 0; shift <= 16; shift += 8) {
     let value = 0;
-    for (let i = 0; i < 4; i++) value += table5(pixels[i] >>> shift & 255, weights[i]);
+    for (let i = 0; i < 4; i++) value += table4(pixels[i] >>> shift & 255, weights[i]);
     result |= (value & 255) << shift;
   }
   return result;
@@ -16189,15 +16894,15 @@ function eelChannel(value) {
 function averagePixel4(a, b) {
   return (a >>> 1 & 8355711) + (b >>> 1 & 8355711) & 16777215;
 }
-function table5(x, y) {
+function table4(x, y) {
   return Math.trunc(x / 255 * y);
 }
-function i327(payload, offset, fallback) {
+function i326(payload, offset, fallback) {
   return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
 }
-function nulText7(bytes) {
+function nulText6(bytes) {
   const end = bytes.indexOf(0);
-  return TEXT5.decode(end < 0 ? bytes : bytes.subarray(0, end));
+  return TEXT4.decode(end < 0 ? bytes : bytes.subarray(0, end));
 }
 function clamp19(value, minimum, maximum) {
   return value < minimum ? minimum : value > maximum ? maximum : value;
@@ -16209,7 +16914,7 @@ function hashPath10(path) {
 }
 
 // src/avs/effects/superscope.ts
-var TEXT6 = new TextDecoder("windows-1252");
+var TEXT5 = new TextDecoder("windows-1252");
 var MAX_POINTS = 128 * 1024;
 function decodeAvsSuperScope(payload) {
   let offset = 0;
@@ -16222,7 +16927,7 @@ function decodeAvsSuperScope(payload) {
       offset = decoded.next;
     }
   } else if (payload.length >= 1024) {
-    scripts = [0, 256, 512, 768].map((start) => nulText8(payload.subarray(start, start + 256)));
+    scripts = [0, 256, 512, 768].map((start) => nulText7(payload.subarray(start, start + 256)));
     offset = 1024;
   }
   const channel = readI324(payload, offset, 2);
@@ -16253,16 +16958,28 @@ function registerAvsSuperScope(registry, global = registry.eelGlobal) {
     if (!state) {
       const config = decodeAvsSuperScope(context.component.payload);
       const vm = new AvsEelVm({ global, seed: hashPath11(context.component.path) });
+      const host = { audio: context.audio };
+      vm.setHost({
+        getosc: (band, width, channel) => avsAudioSample(host.audio, "osc", band, width, channel),
+        getspec: (band, width, channel) => avsAudioSample(host.audio, "spec", band, width, channel)
+      });
       vm.set("n", 100);
+      const programs = [
+        compileOrNull4(config.point),
+        compileOrNull4(config.frame),
+        compileOrNull4(config.beat),
+        compileOrNull4(config.init)
+      ];
       state = {
         config,
         vm,
-        programs: [
-          compileOrNull4(config.point),
-          compileOrNull4(config.frame),
-          compileOrNull4(config.beat),
-          compileOrNull4(config.init)
+        executors: [
+          programs[0]?.bind(vm) ?? null,
+          programs[1]?.bind(vm) ?? null,
+          programs[2]?.bind(vm) ?? null,
+          programs[3]?.bind(vm) ?? null
         ],
+        host,
         initialized: false,
         colorPosition: 0,
         centeredAudio: new Uint8Array(576),
@@ -16279,10 +16996,7 @@ function renderSuperScope(context, config, state) {
   if (config.colors.length === 0) return;
   const { vm } = state;
   const variables = state.variables;
-  vm.setHost({
-    getosc: (band, width, channel) => avsAudioSample(context.audio, "osc", band, width, channel),
-    getspec: (band, width, channel) => avsAudioSample(context.audio, "spec", band, width, channel)
-  });
+  state.host.audio = context.audio;
   state.colorPosition++;
   if (state.colorPosition >= config.colors.length * 64) state.colorPosition = 0;
   const color = interpolatedColor(config.colors, state.colorPosition);
@@ -16296,16 +17010,42 @@ function renderSuperScope(context, config, state) {
   setBinding(variables.linesize, context.line.lineWidth >>> 0 & 255);
   setBinding(variables.drawmode, config.lines ? 1 : 0);
   if (!state.initialized) {
-    execute5(state.programs[3], vm);
+    execute5(state.executors[3]);
     state.initialized = true;
   }
-  execute5(state.programs[1], vm);
-  if (context.beat) execute5(state.programs[2], vm);
-  if (!state.programs[0]) return;
+  execute5(state.executors[1]);
+  if (context.beat) execute5(state.executors[2]);
+  const executePoint = state.executors[0];
+  if (!executePoint) return;
   const count = Math.min(MAX_POINTS, Math.trunc(getBinding(variables.n)));
   if (count <= 0) return;
   const data = scopeChannel(context, config.channel, state.centeredAudio);
   const xor = (config.channel & 4) !== 0 ? 0 : 128;
+  runSuperScopePoints(context, variables, executePoint, data, xor, count);
+}
+function runSuperScopePoints(context, variables, executePoint, data, xor, count) {
+  const vValues = variables.v.values;
+  const vIndex = variables.v.index;
+  const iValues = variables.i.values;
+  const iIndex = variables.i.index;
+  const skipValues = variables.skip.values;
+  const skipIndex = variables.skip.index;
+  const xValues = variables.x.values;
+  const xIndex = variables.x.index;
+  const yValues = variables.y.values;
+  const yIndex = variables.y.index;
+  const blueValues = variables.blue.values;
+  const blueIndex = variables.blue.index;
+  const greenValues = variables.green.values;
+  const greenIndex = variables.green.index;
+  const redValues = variables.red.values;
+  const redIndex = variables.red.index;
+  const drawmodeValues = variables.drawmode.values;
+  const drawmodeIndex = variables.drawmode.index;
+  const linesizeValues = variables.linesize.values;
+  const linesizeIndex = variables.linesize.index;
+  const inputWidth = context.input.width;
+  const inputHeight = context.input.height;
   let canDraw = false;
   let lastX = 0;
   let lastY = 0;
@@ -16315,18 +17055,18 @@ function renderSuperScope(context, config, state) {
     const fraction = audioPosition - sourceIndex;
     const a = data[Math.min(575, sourceIndex)] ^ xor;
     const b = data[Math.min(575, sourceIndex + 1)] ^ xor;
-    setBinding(variables.v, (a * (1 - fraction) + b * fraction) / 128 - 1);
-    setBinding(variables.i, count === 1 ? 0 : index / (count - 1));
-    setBinding(variables.skip, 0);
-    state.programs[0].execute(vm);
-    const x = Math.trunc((getBinding(variables.x) + 1) * context.input.width * 0.5);
-    const y = Math.trunc((getBinding(variables.y) + 1) * context.input.height * 0.5);
-    if (getBinding(variables.skip) < 1e-5) {
-      const drawColor = makeByte(getBinding(variables.blue)) | makeByte(getBinding(variables.green)) << 8 | makeByte(getBinding(variables.red)) << 16;
-      if (getBinding(variables.drawmode) < 1e-5) {
+    vValues[vIndex] = (a * (1 - fraction) + b * fraction) / 128 - 1;
+    iValues[iIndex] = count === 1 ? 0 : index / (count - 1);
+    skipValues[skipIndex] = 0;
+    executePoint();
+    const x = Math.trunc(((xValues[xIndex] ?? 0) + 1) * inputWidth * 0.5);
+    const y = Math.trunc(((yValues[yIndex] ?? 0) + 1) * inputHeight * 0.5);
+    if ((skipValues[skipIndex] ?? 0) < 1e-5) {
+      const drawColor = makeByte(blueValues[blueIndex] ?? 0) | makeByte(greenValues[greenIndex] ?? 0) << 8 | makeByte(redValues[redIndex] ?? 0) << 16;
+      if ((drawmodeValues[drawmodeIndex] ?? 0) < 1e-5) {
         drawPoint(context, x, y, drawColor);
       } else if (canDraw && (drawColor !== 0 || context.line.blendMode !== 1)) {
-        drawLine2(context, lastX, lastY, x, y, drawColor, Math.trunc(getBinding(variables.linesize) + 0.5));
+        drawLine2(context, lastX, lastY, x, y, drawColor, Math.trunc((linesizeValues[linesizeIndex] ?? 0) + 0.5));
       }
     }
     canDraw = true;
@@ -16412,8 +17152,8 @@ function drawLine2(context, x1, y1, x2, y2, color, requestedWidth) {
     }
   }
 }
-function execute5(program, vm) {
-  return program ? vm.execute(program) : 0;
+function execute5(executor) {
+  return executor ? executor() : 0;
 }
 function bindVariables(vm) {
   return {
@@ -16462,7 +17202,7 @@ function readString3(payload, offset) {
   const length = readU32(payload, offset, 0);
   const start = offset + 4;
   const end = Math.min(payload.length, start + length);
-  return { value: nulText8(payload.subarray(start, end)), next: end };
+  return { value: nulText7(payload.subarray(start, end)), next: end };
 }
 function readI324(payload, offset, fallback) {
   return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
@@ -16470,9 +17210,9 @@ function readI324(payload, offset, fallback) {
 function readU32(payload, offset, fallback) {
   return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(offset, true) : fallback;
 }
-function nulText8(bytes) {
+function nulText7(bytes) {
   const end = bytes.indexOf(0);
-  return TEXT6.decode(end < 0 ? bytes : bytes.subarray(0, end));
+  return TEXT5.decode(end < 0 ? bytes : bytes.subarray(0, end));
 }
 function signed3(value) {
   return value < 128 ? value : value - 256;
@@ -16496,7 +17236,7 @@ var LOGFONTA_BYTES = 60;
 function decodeAvsText(payload) {
   let offset = 0;
   const read = (fallback) => {
-    const value = i328(payload, offset, fallback);
+    const value = i327(payload, offset, fallback);
     offset += 4;
     return value;
   };
@@ -16518,7 +17258,7 @@ function decodeAvsText(payload) {
   const textLength = read(0);
   let text = "";
   if (textLength > 0 && offset + textLength <= payload.length) {
-    text = nulText9(payload.subarray(offset, offset + textLength));
+    text = nulText8(payload.subarray(offset, offset + textLength));
     offset += textLength;
   }
   return {
@@ -16779,13 +17519,13 @@ var GLYPHS = {
 };
 function decodeFont(chooseFont, logFont) {
   return {
-    height: i328(logFont, 0, 0),
-    width: i328(logFont, 4, 0),
-    weight: i328(logFont, 16, 0),
+    height: i327(logFont, 0, 0),
+    width: i327(logFont, 4, 0),
+    weight: i327(logFont, 16, 0),
     italic: logFont[20] !== 0,
     underline: logFont[21] !== 0,
     strikeout: logFont[22] !== 0,
-    face: nulText9(logFont.subarray(28, 60)),
+    face: nulText8(logFont.subarray(28, 60)),
     rawChooseFont: chooseFont,
     rawLogFont: logFont
   };
@@ -16808,10 +17548,10 @@ function nextRandom4(state) {
   state.randomState = value >>> 0;
   return state.randomState;
 }
-function i328(payload, offset, fallback) {
+function i327(payload, offset, fallback) {
   return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
 }
-function nulText9(bytes) {
+function nulText8(bytes) {
   const end = bytes.indexOf(0);
   return WINDOWS_1252.decode(end < 0 ? bytes : bytes.subarray(0, end));
 }
@@ -16827,12 +17567,12 @@ function hashPath12(path) {
 // src/avs/effects/texer.ts
 var AVS_TEXER_APE_ID = "Texer";
 var AVS_TEXER_II_APE_ID = "Acko.net: Texer II";
-var TEXT7 = new TextDecoder("windows-1252");
+var TEXT6 = new TextDecoder("windows-1252");
 var MAX_TEXER_II_PARTICLES = 65536;
 function decodeAvsTexerConfig(payload) {
   const mode4 = readI325(payload, 276, 0);
   return {
-    image: payload.length >= 276 ? nulText10(payload.subarray(16, 276)) : "",
+    image: payload.length >= 276 ? nulText9(payload.subarray(16, 276)) : "",
     addToInput: (mode4 & 3) === 2,
     colorize: (mode4 & 12) === 8,
     particles: readI325(payload, 280, 100)
@@ -16849,7 +17589,7 @@ function decodeAvsTexer2Config(payload) {
   }
   return {
     version: rawVersion === 1 ? 1 : 0,
-    image: payload.length >= 264 ? nulText10(payload.subarray(4, 264)) : "",
+    image: payload.length >= 264 ? nulText9(payload.subarray(4, 264)) : "",
     resize: readI325(payload, 264, 0) !== 0,
     wrap: readI325(payload, 268, 0) !== 0,
     colorize: readI325(payload, 272, 1) !== 0,
@@ -16958,9 +17698,9 @@ function renderTexer2(context, config, bitmap, state) {
     vm.set("i", progress);
     progress += step;
     vm.set("skip", 0);
-    const sample2 = Math.trunc(index * 575 / count);
-    const left = signedByte2(context.audio.waveform[0][sample2]);
-    const right = signedByte2(context.audio.waveform[1][sample2]);
+    const sample = Math.trunc(index * 575 / count);
+    const left = signedByte2(context.audio.waveform[0][sample]);
+    const right = signedByte2(context.audio.waveform[1][sample]);
     vm.set("v", (left + right) / 256);
     execute6(state.programs[3], vm);
     if (vm.get("skip") !== 0) continue;
@@ -17004,6 +17744,10 @@ function drawTexer2Particle(context, config, bitmap, x, y, sizeX, sizeY, color, 
   else drawUnscaledParticle(context, bitmap, x, y, color, config.colorize, flipX, flipY);
 }
 function drawUnscaledParticle(context, bitmap, x, y, color, colorize, flipX, flipY) {
+  const pixels = context.input.pixels;
+  const width = context.input.width;
+  const blendMode = context.line.blendMode;
+  const adjustableAlpha = context.line.adjustableAlpha;
   const screenMaxX = context.input.width - 1;
   const screenMaxY = context.input.height - 1;
   const imageMaxX = bitmap.width - 1;
@@ -17022,20 +17766,20 @@ function drawUnscaledParticle(context, bitmap, x, y, color, colorize, flipX, fli
   if (right <= left || bottom <= top) return;
   for (let drawY = top; drawY <= bottom; drawY++, textureY++) {
     let tx = textureX;
+    let destination = drawY * width + left;
     for (let drawX = left; drawX <= right; drawX++, tx++) {
       let source3 = sampleBitmap(bitmap, tx, textureY, flipX, flipY);
       if (colorize) source3 = filterPixel(source3, color);
-      const destination = drawY * context.input.width + drawX;
-      context.input.pixels[destination] = blendTexerPixel(
-        source3,
-        context.input.pixels[destination],
-        context.line.blendMode,
-        context.line.adjustableAlpha
-      );
+      pixels[destination] = blendMode === 0 ? source3 & 16777215 : blendTexerPixel(source3, pixels[destination], blendMode, adjustableAlpha);
+      destination++;
     }
   }
 }
 function drawScaledParticle(context, bitmap, x, y, sizeX, sizeY, color, flipX, flipY) {
+  const pixels = context.input.pixels;
+  const width = context.input.width;
+  const blendMode = context.line.blendMode;
+  const adjustableAlpha = context.line.adjustableAlpha;
   const screenMaxX = context.input.width - 1;
   const screenMaxY = context.input.height - 1;
   const imageMaxX = bitmap.width - 1;
@@ -17076,15 +17820,11 @@ function drawScaledParticle(context, bitmap, x, y, sizeX, sizeY, color, flipX, f
   }
   if (right <= left || bottom <= top) return;
   for (let drawY = top, fy = cy; drawY <= bottom; drawY++, fy += stepY) {
+    let destination = drawY * width + left;
     for (let drawX = left, fx = cx; drawX <= right; drawX++, fx += stepX) {
       const source3 = filterPixel(sampleBilinearFixed(bitmap, fx, fy, flipX, flipY), color);
-      const destination = drawY * context.input.width + drawX;
-      context.input.pixels[destination] = blendTexerPixel(
-        source3,
-        context.input.pixels[destination],
-        context.line.blendMode,
-        context.line.adjustableAlpha
-      );
+      pixels[destination] = blendMode === 0 ? source3 & 16777215 : blendTexerPixel(source3, pixels[destination], blendMode, adjustableAlpha);
+      destination++;
     }
   }
 }
@@ -17093,10 +17833,16 @@ function sampleBilinearFixed(bitmap, fx, fy, flipX, flipY) {
   const y = clamp22(fy >> 16, 0, Math.max(0, bitmap.height - 2));
   const dx = fx >>> 8 & 255;
   const dy = fy >>> 8 & 255;
-  const a = sampleBitmap(bitmap, x, y, flipX, flipY);
-  const b = sampleBitmap(bitmap, x + 1, y, flipX, flipY);
-  const c = sampleBitmap(bitmap, x, y + 1, flipX, flipY);
-  const d = sampleBitmap(bitmap, x + 1, y + 1, flipX, flipY);
+  const x1 = Math.min(x + 1, bitmap.width - 1);
+  const y1 = Math.min(y + 1, bitmap.height - 1);
+  const sx0 = flipX ? bitmap.width - x - 1 : x;
+  const sx1 = flipX ? bitmap.width - x1 - 1 : x1;
+  const row0 = (flipY ? bitmap.height - y - 1 : y) * bitmap.width;
+  const row1 = (flipY ? bitmap.height - y1 - 1 : y1) * bitmap.width;
+  const a = bitmap.pixels[row0 + sx0];
+  const b = bitmap.pixels[row0 + sx1];
+  const c = bitmap.pixels[row1 + sx0];
+  const d = bitmap.pixels[row1 + sx1];
   const inverseX = 255 - dx;
   const inverseY = 255 - dy;
   return interpolateByte(a, b, c, d, dx, dy, inverseX, inverseY) | interpolateByte(a >>> 8, b >>> 8, c >>> 8, d >>> 8, dx, dy, inverseX, inverseY) << 8 | interpolateByte(a >>> 16, b >>> 16, c >>> 16, d >>> 16, dx, dy, inverseX, inverseY) << 16;
@@ -17175,11 +17921,11 @@ function readLengthString(payload, offset) {
   const length = readU322(payload, offset, 0);
   const start = offset + 4;
   const end = Math.min(payload.length, start + length);
-  return { value: nulText10(payload.subarray(start, end)), next: end };
+  return { value: nulText9(payload.subarray(start, end)), next: end };
 }
-function nulText10(bytes) {
+function nulText9(bytes) {
   const end = bytes.indexOf(0);
-  return TEXT7.decode(end < 0 ? bytes : bytes.subarray(0, end));
+  return TEXT6.decode(end < 0 ? bytes : bytes.subarray(0, end));
 }
 function readI325(payload, offset, fallback) {
   return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
@@ -17251,6 +17997,1267 @@ function createAvsCompatibilityRegistry(classicOptions = {}, texerOptions = {}) 
   return registry;
 }
 
+// src/avs/preset.ts
+var HEADER_BYTES2 = 24;
+var ROOT_CONFIG_BYTES = 1;
+var EFFECT_LIST_ID = -2;
+var DLL_RENDER_BASE = 16384;
+var TEXT7 = new TextDecoder("windows-1252");
+var EFFECT_LIST_CODE_ID = 16384;
+var EFFECT_LIST_CODE_NAME = "AVS 2.8+ Effect List Config";
+var AvsPresetError = class extends Error {
+  constructor(message, offset) {
+    super(`${message} (byte ${offset})`);
+    this.offset = offset;
+    this.name = "AvsPresetError";
+  }
+};
+function parseAvsPreset(input) {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  if (bytes.byteLength < HEADER_BYTES2 + ROOT_CONFIG_BYTES) {
+    throw new AvsPresetError("AVS preset is shorter than its header", bytes.byteLength);
+  }
+  const header = decode(bytes.subarray(0, HEADER_BYTES2));
+  let version;
+  if (header === AVS_PRESET_HEADER_V2) version = 2;
+  else if (header === AVS_PRESET_HEADER_V1) version = 1;
+  else throw new AvsPresetError(`Unsupported AVS preset signature ${JSON.stringify(header)}`, 0);
+  const components = readComponents(bytes, HEADER_BYTES2 + ROOT_CONFIG_BYTES, bytes.byteLength, "");
+  return {
+    version,
+    header,
+    clearEveryFrame: bytes[HEADER_BYTES2] === 1,
+    components,
+    byteLength: bytes.byteLength
+  };
+}
+function serializeAvsPreset(preset2) {
+  const chunks = [];
+  chunks.push(latin1(preset2.header));
+  chunks.push(Uint8Array.of(preset2.clearEveryFrame ? 1 : 0));
+  for (const component of preset2.components) chunks.push(serializeComponent(component));
+  const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
+}
+function serializeComponent(component) {
+  const isApe = component.apeId !== null;
+  const headerLength = isApe ? 40 : 8;
+  const out = new Uint8Array(headerLength + component.payload.length);
+  const view = new DataView(out.buffer);
+  view.setInt32(0, component.effectId, true);
+  let lengthOffset = 4;
+  if (isApe) {
+    const id = latin1(component.apeId);
+    out.set(id.subarray(0, 31), 4);
+    lengthOffset += 32;
+  }
+  view.setUint32(lengthOffset, component.payload.length, true);
+  out.set(component.payload, headerLength);
+  return out;
+}
+function readComponents(bytes, start, end, parent, absoluteBase = 0) {
+  const components = [];
+  let cursor = start;
+  let ordinal = 0;
+  while (cursor < end) {
+    if (end - cursor < 8) {
+      for (let i = cursor; i < end; i++) {
+        if (bytes[i] !== 0) throw new AvsPresetError("Truncated renderer record", absoluteBase + cursor);
+      }
+      break;
+    }
+    ordinal++;
+    const path = parent ? `${parent}.${ordinal}` : `${ordinal}`;
+    const effectId = i328(bytes, cursor);
+    const isApe = effectId !== EFFECT_LIST_ID && effectId >>> 0 >= DLL_RENDER_BASE;
+    const headerBytes = isApe ? 40 : 8;
+    requireBytes(cursor, headerBytes, end, "renderer header", absoluteBase);
+    const apeId = isApe ? nulText10(bytes.subarray(cursor + 4, cursor + 36)) : null;
+    const lengthOffset = cursor + 4 + (isApe ? 32 : 0);
+    const payloadLength = u323(bytes, lengthOffset);
+    const payloadStart = cursor + headerBytes;
+    const payloadEnd = payloadStart + payloadLength;
+    if (!Number.isSafeInteger(payloadEnd) || payloadEnd > end) {
+      throw new AvsPresetError(
+        `Renderer ${path} payload (${payloadLength} bytes) exceeds its container`,
+        absoluteBase + lengthOffset
+      );
+    }
+    const payload = bytes.slice(payloadStart, payloadEnd);
+    let list = null;
+    let listCode = null;
+    let children = [];
+    if (effectId === EFFECT_LIST_ID && payload.length > 0) {
+      list = readListSettings(payload, payloadStart);
+      let childOffset = list.byteLength;
+      const codeRecord = readEffectListCode(payload, childOffset, payloadStart);
+      if (codeRecord) {
+        listCode = codeRecord.code;
+        childOffset = codeRecord.nextOffset;
+      }
+      children = readComponents(payload, childOffset, payload.length, path, absoluteBase + payloadStart);
+    }
+    components.push({
+      effectId,
+      apeId,
+      payload,
+      fileOffset: absoluteBase + cursor,
+      path,
+      children,
+      list,
+      listCode
+    });
+    cursor = payloadEnd;
+  }
+  return components;
+}
+function readListSettings(payload, absoluteOffset) {
+  const extended = (payload[0] & 128) !== 0;
+  if (!extended) {
+    const mode5 = payload[0];
+    return {
+      mode: mode5,
+      // r_list.h stores a DISABLE bit. This inversion is easy to miss because
+      // most serialized modes are zero, meaning an enabled, uncleared list.
+      enabled: (mode5 & 2) === 0,
+      clearEveryFrame: (mode5 & 1) !== 0,
+      inputBlendMode: mode5 >>> 8 & 31,
+      // The output selector is stored with bit zero toggled for historical
+      // compatibility with the original list renderer.
+      outputBlendMode: mode5 >>> 16 & 31 ^ 1,
+      inputBlendValue: 128,
+      outputBlendValue: 128,
+      inputBuffer: 0,
+      outputBuffer: 0,
+      inputInvert: false,
+      outputInvert: false,
+      beatRender: false,
+      beatRenderFrames: 1,
+      byteLength: 1
+    };
+  }
+  requireBytes(0, 5, payload.length, "extended Effect List header", absoluteOffset);
+  const mode4 = u323(payload, 1);
+  const byteLength = payload[4] + 1;
+  if (byteLength < 5 || byteLength > payload.length) {
+    throw new AvsPresetError(`Invalid Effect List header length ${byteLength}`, absoluteOffset + 4);
+  }
+  const ext = (index, fallback) => 5 + index * 4 + 4 <= byteLength ? i328(payload, 5 + index * 4) : fallback;
+  return {
+    mode: mode4,
+    enabled: (mode4 & 2) === 0,
+    clearEveryFrame: (mode4 & 1) !== 0,
+    inputBlendMode: mode4 >>> 8 & 31,
+    outputBlendMode: mode4 >>> 16 & 31 ^ 1,
+    inputBlendValue: ext(0, 128),
+    outputBlendValue: ext(1, 128),
+    inputBuffer: ext(2, 0),
+    outputBuffer: ext(3, 0),
+    inputInvert: ext(4, 0) !== 0,
+    outputInvert: ext(5, 0) !== 0,
+    beatRender: ext(6, 0) !== 0,
+    beatRenderFrames: ext(7, 1),
+    byteLength
+  };
+}
+function readEffectListCode(payload, offset, absoluteOffset) {
+  if (payload.length - offset < 40) return null;
+  if (i328(payload, offset) !== EFFECT_LIST_CODE_ID) return null;
+  const name = nulText10(payload.subarray(offset + 4, offset + 36));
+  if (name !== EFFECT_LIST_CODE_NAME) return null;
+  const length = u323(payload, offset + 36);
+  const start = offset + 40;
+  const end = start + length;
+  if (end > payload.length) {
+    throw new AvsPresetError("Effect List code record exceeds its container", absoluteOffset + offset + 36);
+  }
+  const raw = payload.slice(start, end);
+  const decoded = decodeListCode(raw);
+  return { code: { ...decoded, raw }, nextOffset: end };
+}
+function decodeListCode(raw) {
+  if (raw.length < 4) return { enabled: false, init: "", frame: "" };
+  let cursor = 0;
+  const enabled = i328(raw, cursor) !== 0;
+  cursor += 4;
+  const readString4 = () => {
+    if (cursor + 4 > raw.length) return "";
+    const length = u323(raw, cursor);
+    cursor += 4;
+    const end = Math.min(raw.length, cursor + length);
+    const value = nulText10(raw.subarray(cursor, end));
+    cursor = end;
+    return value;
+  };
+  return { enabled, init: readString4(), frame: readString4() };
+}
+function requireBytes(offset, length, end, what, base2 = 0) {
+  if (offset < 0 || length < 0 || offset + length > end) {
+    throw new AvsPresetError(`Truncated ${what}`, base2 + offset);
+  }
+}
+function u323(bytes, offset) {
+  requireBytes(offset, 4, bytes.length, "uint32");
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(offset, true);
+}
+function i328(bytes, offset) {
+  requireBytes(offset, 4, bytes.length, "int32");
+  return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(offset, true);
+}
+function decode(bytes) {
+  return TEXT7.decode(bytes);
+}
+function latin1(value) {
+  const out = new Uint8Array(value.length);
+  for (let i = 0; i < value.length; i++) out[i] = value.charCodeAt(i) & 255;
+  return out;
+}
+function nulText10(bytes) {
+  const zero = bytes.indexOf(0);
+  return decode(zero < 0 ? bytes : bytes.subarray(0, zero));
+}
+
+// src/avs/editor-model.ts
+var BUILTIN_RENDERER_NAMES = [
+  "Simple",
+  "Dot Plane",
+  "Oscilloscope Star",
+  "Fade Out",
+  "Blitter Feedback",
+  "OnBeat Clear",
+  "Blur",
+  "Bass Spin",
+  "Moving Particle",
+  "Roto Blitter",
+  "SVP Loader",
+  "Color Fade",
+  "Color Clip",
+  "Rotating Stars",
+  "Ring",
+  "Movement",
+  "Scatter",
+  "Dot Grid",
+  "Buffer Save",
+  "Dot Fountain",
+  "Water",
+  "Comment",
+  "Brightness",
+  "Interleave",
+  "Grain",
+  "Clear Screen",
+  "Mirror",
+  "Starfield",
+  "Text",
+  "Bump",
+  "Mosaic",
+  "Water Bump",
+  "AVI",
+  "Custom BPM",
+  "Picture",
+  "Dynamic Distance Modifier",
+  "SuperScope",
+  "Invert",
+  "Unique Tone",
+  "Timescope",
+  "Set Render Mode",
+  "Interferences",
+  "Dynamic Shift",
+  "Dynamic Movement",
+  "Fast Brightness",
+  "Dynamic Color Modifier"
+];
+function createAvsEditorModel(preset2) {
+  return {
+    version: preset2.version,
+    header: preset2.header,
+    clearEveryFrame: preset2.clearEveryFrame,
+    byteLength: preset2.byteLength,
+    nodes: preset2.components.map(componentToNode)
+  };
+}
+function serializeAvsEditorModel(model) {
+  return serializeAvsPreset({
+    version: model.version,
+    header: model.header,
+    clearEveryFrame: model.clearEveryFrame,
+    components: model.nodes.map(nodeToComponent),
+    byteLength: model.byteLength
+  });
+}
+function setAvsEditorNodeEnabled(model, path, enabled) {
+  return updateNode(model, path, (node) => {
+    if (!node.listEnvelope || node.inspection.kind !== "effect-list") {
+      throw new Error(`Renderer ${path} does not have a source-faithful enable flag`);
+    }
+    const prefix = node.listEnvelope.prefix.slice();
+    const extended = (prefix[0] & 128) !== 0;
+    const mode4 = extended ? readU323(prefix, 1, node.inspection.settings.mode) : prefix[0];
+    const nextMode = enabled ? mode4 & ~2 : mode4 | 2;
+    if (extended) writeU32(prefix, 1, nextMode);
+    else prefix[0] = nextMode & 255;
+    return {
+      ...node,
+      enabled,
+      summary: `${enabled ? "Enabled" : "Disabled"} \xB7 ${node.children.length} renderer${node.children.length === 1 ? "" : "s"}`,
+      listEnvelope: { prefix, suffix: node.listEnvelope.suffix },
+      inspection: {
+        ...node.inspection,
+        settings: { ...node.inspection.settings, mode: nextMode, enabled }
+      }
+    };
+  });
+}
+function patchAvsEditorNodePayload(model, path, payload) {
+  return updateNode(model, path, (node) => {
+    if (node.listEnvelope) throw new Error(`Renderer ${path} is a list; edit its children or enable flag instead`);
+    const nextPayload = payload.slice();
+    const inspection = inspect(node.effectId, node.apeId, nextPayload, null);
+    return { ...node, payload: nextPayload, inspection, summary: inspectionSummary(inspection, 0) };
+  });
+}
+function patchAvsEditorNodeFields(model, path, patch) {
+  const node = findAvsEditorNode(model, path);
+  if (!node) throw new Error(`Unknown AVS editor path ${path}`);
+  if (node.inspection.kind !== patch.kind) {
+    throw new Error(`Renderer ${path} is ${node.inspection.kind}, not ${patch.kind}`);
+  }
+  const payload = node.payload.slice();
+  if (patch.kind === "blur") {
+    requirePayload(payload, 8, path, patch.kind);
+    if (patch.mode !== void 0) writeI32(payload, 0, integerInRange(patch.mode, 0, 3, "Blur mode"));
+    if (patch.roundUp !== void 0) writeI32(payload, 4, patch.roundUp ? 1 : 0);
+  } else if (patch.kind === "buffer-save") {
+    requirePayload(payload, 16, path, patch.kind);
+    if (patch.direction !== void 0) writeI32(payload, 0, integerInRange(patch.direction, 0, 3, "Buffer Save direction"));
+    if (patch.buffer !== void 0) writeI32(payload, 4, integerInRange(patch.buffer, 0, 7, "Buffer Save buffer"));
+    if (patch.blendMode !== void 0) writeI32(payload, 8, integerInRange(patch.blendMode, 0, 11, "Buffer Save blend mode"));
+    if (patch.adjustableAlpha !== void 0) writeI32(payload, 12, integerInRange(patch.adjustableAlpha, 0, 255, "Buffer Save alpha"));
+  } else {
+    requirePayload(payload, 4, path, patch.kind);
+    let mode4 = readU323(payload, 0, 0);
+    if (patch.enabled !== void 0) mode4 = patch.enabled ? mode4 | 2147483648 : mode4 & 2147483647;
+    if (patch.blendMode !== void 0) mode4 = mode4 & 4294967040 | integerInRange(patch.blendMode, 0, 9, "Set Render Mode blend mode");
+    if (patch.adjustableAlpha !== void 0) mode4 = mode4 & 4294902015 | integerInRange(patch.adjustableAlpha, 0, 255, "Set Render Mode alpha") << 8;
+    if (patch.lineWidth !== void 0) mode4 = mode4 & 4278255615 | integerInRange(patch.lineWidth, 0, 255, "Set Render Mode line width") << 16;
+    writeU32(payload, 0, mode4);
+  }
+  return patchAvsEditorNodePayload(model, path, payload);
+}
+function reorderAvsEditorChildren(model, parentPath, orderedPaths) {
+  if (parentPath === null) return { ...model, nodes: reorder(model.nodes, orderedPaths, "root") };
+  return updateNode(model, parentPath, (node) => ({
+    ...node,
+    children: reorder(node.children, orderedPaths, parentPath)
+  }));
+}
+function findAvsEditorNode(model, path) {
+  const visit = (nodes) => {
+    for (const node of nodes) {
+      if (node.path === path) return node;
+      const child = visit(node.children);
+      if (child) return child;
+    }
+    return null;
+  };
+  return visit(model.nodes);
+}
+function componentToNode(component) {
+  const children = component.children.map(componentToNode);
+  const envelope = component.list ? listEnvelope(component) : null;
+  const inspection = inspect(component.effectId, component.apeId, component.payload, component);
+  return {
+    path: component.path,
+    rendererName: rendererName(component.effectId, component.apeId),
+    summary: inspectionSummary(inspection, children.length),
+    effectId: component.effectId,
+    apeId: component.apeId,
+    enabled: component.list?.enabled ?? null,
+    payload: component.payload.slice(),
+    inspection,
+    children,
+    listEnvelope: envelope
+  };
+}
+function nodeToComponent(node) {
+  const children = node.children.map(nodeToComponent);
+  const payload = node.listEnvelope ? concatenate([node.listEnvelope.prefix, ...children.map(serializeComponentBytes), node.listEnvelope.suffix]) : node.payload.slice();
+  const settings = node.inspection.kind === "effect-list" ? node.inspection.settings : null;
+  return {
+    effectId: node.effectId,
+    apeId: node.apeId,
+    payload,
+    fileOffset: 0,
+    path: node.path,
+    children,
+    list: settings,
+    listCode: node.inspection.kind === "effect-list" ? node.inspection.code : null
+  };
+}
+function serializeComponentBytes(component) {
+  const ape = component.apeId !== null;
+  const headerLength = ape ? 40 : 8;
+  const output = new Uint8Array(headerLength + component.payload.length);
+  const view = new DataView(output.buffer);
+  view.setInt32(0, component.effectId, true);
+  let lengthOffset = 4;
+  if (ape) {
+    for (let index = 0; index < Math.min(31, component.apeId.length); index++) {
+      output[4 + index] = component.apeId.charCodeAt(index) & 255;
+    }
+    lengthOffset = 36;
+  }
+  view.setUint32(lengthOffset, component.payload.length, true);
+  output.set(component.payload, headerLength);
+  return output;
+}
+function listEnvelope(component) {
+  if (component.children.length === 0) return { prefix: component.payload.slice(), suffix: new Uint8Array() };
+  const payloadStart = component.fileOffset + 8;
+  const first = component.children[0];
+  const last2 = component.children[component.children.length - 1];
+  const prefixLength = first.fileOffset - payloadStart;
+  const lastLength = (last2.apeId === null ? 8 : 40) + last2.payload.length;
+  const suffixOffset = last2.fileOffset + lastLength - payloadStart;
+  if (prefixLength < 0 || suffixOffset < prefixLength || suffixOffset > component.payload.length) {
+    throw new Error(`Effect List ${component.path} has inconsistent source offsets`);
+  }
+  return {
+    prefix: component.payload.slice(0, prefixLength),
+    suffix: component.payload.slice(suffixOffset)
+  };
+}
+function inspect(effectId, apeId, payload, component) {
+  try {
+    if (component?.list) return { kind: "effect-list", settings: component.list, code: component.listCode };
+    if (effectId === 6) return { kind: "blur", mode: readI326(payload, 0, 1), roundUp: readI326(payload, 4, 0) !== 0 };
+    if (effectId === 15) return { kind: "movement", config: decodeAvsMovement(payload) };
+    if (effectId === 18) return {
+      kind: "buffer-save",
+      direction: readI326(payload, 0, 0),
+      buffer: readI326(payload, 4, 0),
+      blendMode: readI326(payload, 8, 0),
+      adjustableAlpha: readI326(payload, 12, 128)
+    };
+    if (effectId === 36) return { kind: "superscope", config: decodeAvsSuperScope(payload) };
+    if (effectId === 40) {
+      const mode4 = readU323(payload, 0, 2147549184);
+      return {
+        kind: "set-render-mode",
+        enabled: (mode4 & 2147483648) !== 0,
+        blendMode: mode4 & 255,
+        adjustableAlpha: mode4 >>> 8 & 255,
+        lineWidth: mode4 >>> 16 & 255
+      };
+    }
+    if (effectId === 43) return { kind: "dynamic-movement", config: decodeAvsDynamicMovement(payload) };
+    if (apeId === AVS_TEXER_APE_ID) return { kind: "texer", config: decodeAvsTexerConfig(payload) };
+    if (apeId === AVS_TEXER_II_APE_ID) return { kind: "texer-ii", config: decodeAvsTexer2Config(payload) };
+    if (apeId === AVS_CONVOLUTION_APE_ID) return { kind: "convolution", config: decodeAvsConvolutionConfig(payload) };
+    if (apeId === AVS_COLOR_MAP_APE_ID) return { kind: "color-map", config: decodeAvsColorMap(payload) };
+  } catch (error) {
+    return { kind: "opaque", byteLength: payload.length, decodeError: error instanceof Error ? error.message : String(error) };
+  }
+  return { kind: "opaque", byteLength: payload.length };
+}
+function rendererName(effectId, apeId) {
+  if (effectId === -2) return "Effect List";
+  if (apeId) return apeId;
+  return BUILTIN_RENDERER_NAMES[effectId] ?? `Unknown Renderer ${effectId}`;
+}
+function inspectionSummary(inspection, childCount) {
+  switch (inspection.kind) {
+    case "effect-list":
+      return `${inspection.settings.enabled ? "Enabled" : "Disabled"} \xB7 ${childCount} renderer${childCount === 1 ? "" : "s"}`;
+    case "superscope":
+      return `${inspection.config.lines ? "Lines" : "Points"} \xB7 ${inspection.config.colors.length} color${inspection.config.colors.length === 1 ? "" : "s"}`;
+    case "movement":
+      return `Effect ${inspection.config.effect} \xB7 ${inspection.config.subpixel ? "bilinear" : "nearest"}${inspection.config.wrap ? " \xB7 wrap" : ""}`;
+    case "dynamic-movement":
+      return `${inspection.config.gridWidth}\xD7${inspection.config.gridHeight} grid \xB7 ${inspection.config.bilinear ? "bilinear" : "nearest"}`;
+    case "blur":
+      return `${["Off", "Normal", "Light", "Heavy"][inspection.mode] ?? `Mode ${inspection.mode}`}${inspection.roundUp ? " \xB7 round up" : ""}`;
+    case "set-render-mode":
+      return `${inspection.enabled ? "Enabled" : "Disabled"} \xB7 blend ${inspection.blendMode} \xB7 width ${inspection.lineWidth}`;
+    case "buffer-save":
+      return `${inspection.direction === 0 ? "Save to" : inspection.direction === 1 ? "Restore from" : "Alternate"} buffer ${inspection.buffer + 1}`;
+    case "texer":
+      return `${inspection.config.image || "No bitmap"} \xB7 ${inspection.config.particles} particles`;
+    case "texer-ii":
+      return `${inspection.config.image || "Embedded bitmap"}${inspection.config.resize ? " \xB7 resize" : ""}${inspection.config.wrap ? " \xB7 wrap" : ""}`;
+    case "convolution":
+      return `7\xD77 kernel \xB7 scale ${inspection.config.scale}${inspection.config.twoPass ? " \xB7 two pass" : ""}`;
+    case "color-map": {
+      const active = inspection.config.maps.filter((map) => map.enabled).length;
+      return `${active} active map${active === 1 ? "" : "s"} \xB7 blend ${inspection.config.blendMode}`;
+    }
+    case "opaque":
+      return `${inspection.byteLength} raw byte${inspection.byteLength === 1 ? "" : "s"}`;
+  }
+}
+function updateNode(model, path, update) {
+  let found = false;
+  const visit = (nodes2) => nodes2.map((node) => {
+    if (node.path === path) {
+      found = true;
+      return update(node);
+    }
+    const children = visit(node.children);
+    return children === node.children ? node : { ...node, children };
+  });
+  const nodes = visit(model.nodes);
+  if (!found) throw new Error(`Unknown AVS editor path ${path}`);
+  return { ...model, nodes };
+}
+function reorder(nodes, order, parent) {
+  if (nodes.length !== order.length || new Set(order).size !== order.length) {
+    throw new Error(`Reorder for ${parent} must contain every child path exactly once`);
+  }
+  const byPath = new Map(nodes.map((node) => [node.path, node]));
+  const result = order.map((path) => byPath.get(path));
+  if (result.some((node) => !node)) throw new Error(`Reorder for ${parent} contains a foreign child path`);
+  return result;
+}
+function concatenate(parts) {
+  const output = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    output.set(part, offset);
+    offset += part.length;
+  }
+  return output;
+}
+function readI326(bytes, offset, fallback) {
+  return offset + 4 <= bytes.length ? new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getInt32(offset, true) : fallback;
+}
+function readU323(bytes, offset, fallback) {
+  return offset + 4 <= bytes.length ? new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(offset, true) : fallback >>> 0;
+}
+function writeU32(bytes, offset, value) {
+  if (offset + 4 > bytes.length) throw new Error("Truncated Effect List mode word");
+  new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setUint32(offset, value, true);
+}
+function writeI32(bytes, offset, value) {
+  if (offset + 4 > bytes.length) throw new Error("Truncated AVS field");
+  new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setInt32(offset, value, true);
+}
+function requirePayload(bytes, length, path, kind) {
+  if (bytes.length < length) throw new Error(`Renderer ${path} has a truncated ${kind} payload`);
+}
+function integerInRange(value, minimum, maximum, label) {
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new RangeError(`${label} must be an integer from ${minimum} through ${maximum}`);
+  }
+  return value;
+}
+
+// src/avs-editor.ts
+var DEFAULT_STYLE_HREF2 = new URL("./avs-editor.css", import.meta.url).href;
+var BUILTIN_EFFECT_NAMES = [
+  "Simple",
+  "Dot Plane",
+  "Oscilloscope Star",
+  "Fade Out",
+  "Blitter Feedback",
+  "OnBeat Clear",
+  "Blur",
+  "Bass Spin",
+  "Moving Particle",
+  "Roto Blitter",
+  "SVP Loader",
+  "Color Fade",
+  "Color Clip",
+  "Rotating Stars",
+  "Ring",
+  "Movement",
+  "Scatter",
+  "Dot Grid",
+  "Buffer Save",
+  "Dot Fountain",
+  "Water",
+  "Comment",
+  "Brightness",
+  "Interleave",
+  "Grain",
+  "Clear Screen",
+  "Mirror",
+  "Starfield",
+  "Text",
+  "Bump",
+  "Mosaic",
+  "Water Bump",
+  "AVI",
+  "Custom BPM",
+  "Picture",
+  "Dynamic Distance Modifier",
+  "SuperScope",
+  "Invert",
+  "Unique Tone",
+  "Timescope",
+  "Set Render Mode",
+  "Interferences",
+  "Dynamic Shift",
+  "Dynamic Movement",
+  "Fast Brightness",
+  "Dynamic Color Modifier"
+];
+function buildAvsEditorModel(preset2, getState) {
+  const flatNodes = [];
+  let listCount = 0;
+  let maxDepth = 0;
+  const visit = (components, parentPath, depth) => components.map((component, index) => {
+    const path = component.path || (parentPath ? `${parentPath}.${index + 1}` : `${index + 1}`);
+    const kind = component.list ? "list" : component.apeId ? "ape" : "builtin";
+    const state = getState?.(component, path) ?? {
+      enabled: component.list?.enabled ?? true,
+      muted: false,
+      soloed: false,
+      supported: true
+    };
+    const children = visit(component.children, path, depth + 1);
+    const node = {
+      component,
+      path,
+      parentPath,
+      ordinal: index + 1,
+      siblingCount: components.length,
+      depth,
+      kind,
+      name: effectName(component),
+      summary: effectSummary(component),
+      state,
+      children
+    };
+    flatNodes.push(node);
+    if (kind === "list") listCount++;
+    if (depth > maxDepth) maxDepth = depth;
+    return node;
+  });
+  const nodes = visit(preset2.components, null, 1);
+  flatNodes.sort(comparePaths);
+  return {
+    preset: preset2,
+    nodes,
+    flatNodes,
+    effectCount: flatNodes.length - listCount,
+    listCount,
+    maxDepth
+  };
+}
+function dispatchAvsEditorAction(callbacks, node, action) {
+  if (action.kind === "enabled") return callbacks.onSetEnabled?.(node.component, node.path, action.value);
+  if (action.kind === "muted") return callbacks.onSetMuted?.(node.component, node.path, action.value);
+  return callbacks.onSetSoloed?.(node.component, node.path, action.value);
+}
+function dispatchAvsEditorMove(callbacks, node, direction) {
+  return callbacks.onMove?.(node.component, node.path, node.parentPath, direction);
+}
+function dispatchAvsEditorSave(callbacks) {
+  return callbacks.onSave?.();
+}
+function parseAvsPayloadHex(source3) {
+  const tokens = source3.trim() ? source3.trim().split(/\s+/) : [];
+  if (tokens.some((token) => !/^[0-9a-f]{2}$/i.test(token))) {
+    throw new Error("Payload must be two-digit hexadecimal bytes separated by whitespace.");
+  }
+  return Uint8Array.from(tokens.map((token) => Number.parseInt(token, 16)));
+}
+var AvsEditor = class {
+  constructor(options) {
+    this.options = options;
+    this.preset = options.preset;
+    this.presetName = options.presetName ?? "Imported AVS preset";
+    this.callbacks = options;
+    this.collapsed = new Set(options.initiallyCollapsed ?? []);
+    this.decodedModel = createAvsEditorModel(options.preset);
+    this.visible = options.visible ?? true;
+    ensureStylesheet2(options.styleHref ?? DEFAULT_STYLE_HREF2);
+    this.render();
+    this.applyVisibility();
+  }
+  preset;
+  presetName;
+  callbacks;
+  collapsed;
+  decodedModel;
+  statusLine = null;
+  selectedPath = null;
+  visible;
+  disposed = false;
+  setPreset(preset2, presetName = this.presetName) {
+    this.preset = preset2;
+    this.presetName = presetName;
+    this.decodedModel = createAvsEditorModel(preset2);
+    const model = buildAvsEditorModel(preset2, this.callbacks.getNodeState);
+    if (!model.flatNodes.some((node) => node.path === this.selectedPath)) {
+      this.selectedPath = model.flatNodes[0]?.path ?? null;
+    }
+    this.render(model);
+  }
+  refresh() {
+    this.render();
+  }
+  /**
+   * Replace-mode hook for LayerUI integration. The host hides its native list
+   * and shows this editor in the exact same panel region while this is true.
+   */
+  setVisible(visible) {
+    this.visible = visible;
+    this.applyVisibility();
+  }
+  isVisible() {
+    return this.visible;
+  }
+  select(path) {
+    const model = buildAvsEditorModel(this.preset, this.callbacks.getNodeState);
+    const node = model.flatNodes.find((candidate) => candidate.path === path);
+    if (!node) return;
+    this.selectedPath = path;
+    this.callbacks.onSelect?.(node.component, node.path);
+    this.render(model);
+  }
+  dispose() {
+    this.disposed = true;
+    this.options.host.replaceChildren();
+  }
+  render(model = buildAvsEditorModel(this.preset, this.callbacks.getNodeState)) {
+    if (this.disposed) return;
+    if (!this.selectedPath && model.flatNodes.length) this.selectedPath = model.flatNodes[0].path;
+    const root = element("section", "avs-editor");
+    root.setAttribute("aria-label", "AVS preset graph");
+    const header = element("header", "avs-editor__header");
+    const titleBlock = element("div", "avs-editor__title-block");
+    const eyebrow = element("span", "avs-editor__eyebrow", `AVS ${this.preset.version === 2 ? "0.2" : "0.1"} / ordered graph`);
+    const title = element("h2", "avs-editor__title", this.presetName);
+    titleBlock.append(eyebrow, title);
+    const meter = element("div", "avs-editor__meter");
+    meter.setAttribute("aria-label", `${model.effectCount} effects in ${model.listCount} effect lists`);
+    meter.append(
+      stat(String(model.effectCount), "effects"),
+      stat(String(model.listCount), "lists"),
+      stat(String(model.maxDepth), "depth")
+    );
+    const actions = element("div", "avs-editor__actions");
+    if (this.options.onExitToNative) {
+      const exit = controlButton("avs-editor__action", "Native layers", "Return to native aaavs layers");
+      exit.addEventListener("click", () => {
+        this.setVisible(false);
+        this.options.onExitToNative?.();
+      });
+      actions.append(exit);
+    }
+    if (this.callbacks.onSave) {
+      const save = controlButton("avs-editor__action", "Save .avs", "Save the edited AVS preset");
+      save.addEventListener("click", () => this.runButtonAction(save, () => dispatchAvsEditorSave(this.callbacks), false));
+      actions.append(save);
+    }
+    if (this.callbacks.onAddToBank) {
+      const add3 = controlButton("avs-editor__action is-primary", "Add to My AVS", "Save the edited preset in My AVS bank");
+      add3.addEventListener("click", () => this.runButtonAction(add3, () => this.callbacks.onAddToBank?.(), false));
+      actions.append(add3);
+    }
+    header.append(titleBlock, meter);
+    if (actions.childElementCount) header.append(actions);
+    const workbench = element("div", "avs-editor__workbench");
+    const graph = element("div", "avs-editor__graph");
+    const graphHead = element("div", "avs-editor__section-head");
+    graphHead.append(
+      element("h3", "", "Render order"),
+      element("span", "", this.preset.clearEveryFrame ? "root clears every frame" : "root feedback retained")
+    );
+    graph.append(graphHead);
+    if (model.nodes.length) {
+      const tree = element("ul", "avs-editor__tree");
+      tree.setAttribute("role", "tree");
+      tree.setAttribute("aria-label", "Ordered AVS effects");
+      for (const node of model.nodes) tree.append(this.renderNode(node));
+      tree.addEventListener("keydown", (event) => this.handleTreeKey(event));
+      graph.append(tree);
+    } else {
+      graph.append(element("p", "avs-editor__empty", "This preset has no renderer records."));
+    }
+    const selected = model.flatNodes.find((node) => node.path === this.selectedPath) ?? model.flatNodes[0];
+    const inspector = selected ? this.renderInspector(selected) : this.renderEmptyInspector();
+    workbench.append(graph, inspector);
+    this.statusLine = element("p", "avs-editor__status");
+    this.statusLine.setAttribute("role", "status");
+    this.statusLine.setAttribute("aria-live", "polite");
+    root.append(header, this.statusLine, workbench);
+    this.options.host.replaceChildren(root);
+    this.applyVisibility();
+  }
+  renderNode(node) {
+    const item = element("li", "avs-editor__node");
+    item.setAttribute("role", "treeitem");
+    item.setAttribute("aria-level", String(node.depth));
+    item.setAttribute("aria-selected", String(node.path === this.selectedPath));
+    item.dataset.avsPath = node.path;
+    if (node.children.length) item.setAttribute("aria-expanded", String(!this.collapsed.has(node.path)));
+    if (!node.state.enabled) item.classList.add("is-disabled");
+    if (node.state.muted) item.classList.add("is-muted");
+    if (node.state.soloed) item.classList.add("is-soloed");
+    if (node.state.supported === false) item.classList.add("is-unsupported");
+    const row = element("div", "avs-editor__node-row");
+    if (node.children.length) {
+      const disclosure = controlButton("avs-editor__disclosure", this.collapsed.has(node.path) ? "\u25B8" : "\u25BE", `Toggle ${node.name}`);
+      disclosure.setAttribute("aria-expanded", String(!this.collapsed.has(node.path)));
+      disclosure.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (this.collapsed.has(node.path)) this.collapsed.delete(node.path);
+        else this.collapsed.add(node.path);
+        this.render();
+      });
+      row.append(disclosure);
+    } else {
+      const continuation = element("span", "avs-editor__continuation", "\u21B3");
+      continuation.setAttribute("aria-hidden", "true");
+      row.append(continuation);
+    }
+    const order = element("span", "avs-editor__order", String(node.ordinal).padStart(2, "0"));
+    const identity = element("button", "avs-editor__identity");
+    identity.type = "button";
+    identity.tabIndex = node.path === this.selectedPath ? 0 : -1;
+    identity.setAttribute("aria-label", `Inspect ${node.name}, path ${node.path}`);
+    identity.append(
+      element("strong", "avs-editor__node-name", node.name),
+      element("span", "avs-editor__node-summary", node.summary)
+    );
+    identity.addEventListener("click", () => this.select(node.path));
+    const controls = element("span", "avs-editor__node-controls");
+    controls.append(
+      this.stateButton(node, "enabled", "P", "Power", this.callbacks.onSetEnabled),
+      this.stateButton(node, "muted", "M", "Mute", this.callbacks.onSetMuted),
+      this.stateButton(node, "soloed", "S", "Solo", this.callbacks.onSetSoloed),
+      this.moveButton(node, -1, "\u2191", "Move earlier"),
+      this.moveButton(node, 1, "\u2193", "Move later")
+    );
+    row.append(order, identity, controls);
+    item.append(row);
+    if (node.children.length && !this.collapsed.has(node.path)) {
+      const children = element("ul", "avs-editor__children");
+      children.setAttribute("role", "group");
+      for (const child of node.children) children.append(this.renderNode(child));
+      item.append(children);
+    }
+    return item;
+  }
+  moveButton(node, direction, label, title) {
+    const button = controlButton("avs-editor__state avs-editor__move", label, `${title}: ${node.name}`);
+    button.disabled = !this.callbacks.onMove || (direction < 0 ? node.ordinal <= 1 : node.ordinal >= node.siblingCount);
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      this.runButtonAction(button, () => dispatchAvsEditorMove(this.callbacks, node, direction));
+    });
+    return button;
+  }
+  stateButton(node, kind, label, longLabel, callback) {
+    const button = controlButton(`avs-editor__state avs-editor__state--${kind}`, label, `${longLabel} ${node.name}`);
+    const active = kind === "enabled" ? node.state.enabled : kind === "muted" ? node.state.muted : node.state.soloed;
+    button.setAttribute("aria-pressed", String(active));
+    button.disabled = !callback;
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      this.runButtonAction(button, () => dispatchAvsEditorAction(this.callbacks, node, { kind, value: !active }));
+    });
+    return button;
+  }
+  renderInspector(node) {
+    const inspector = element("aside", "avs-editor__inspector");
+    inspector.setAttribute("aria-label", `Inspector for ${node.name}`);
+    const head = element("div", "avs-editor__inspector-head");
+    head.append(
+      element("span", "avs-editor__inspector-kind", node.kind === "list" ? "routing group" : node.kind),
+      element("h3", "", node.name),
+      element("code", "", node.path)
+    );
+    inspector.append(head);
+    const facts = element("dl", "avs-editor__facts");
+    fact(facts, "Renderer", node.component.apeId ?? `builtin ${node.component.effectId}`);
+    fact(facts, "Payload", `${node.component.payload.byteLength.toLocaleString()} bytes`);
+    fact(facts, "File offset", `${node.component.fileOffset.toLocaleString()} bytes`);
+    fact(facts, "Runtime", node.state.supported === false ? "unsupported / preserved" : "available");
+    fact(facts, "State", stateLabel(node.state));
+    inspector.append(facts);
+    if (node.component.list) {
+      const routing = element("section", "avs-editor__inspector-section");
+      routing.append(element("h4", "", "Framebuffer routing"));
+      const route = element("div", "avs-editor__route");
+      route.append(
+        routeStep("parent", listBlendLabel(node.component.list.inputBlendMode, node.component.list.inputBlendValue, node.component.list.inputBuffer, node.component.list.inputInvert)),
+        element("span", "avs-editor__route-arrow", "\u2192"),
+        routeStep(`list \xB7 ${node.children.length} children`, node.component.list.clearEveryFrame ? "clear each frame" : "retained"),
+        element("span", "avs-editor__route-arrow", "\u2192"),
+        routeStep("parent", listBlendLabel(node.component.list.outputBlendMode, node.component.list.outputBlendValue, node.component.list.outputBuffer, node.component.list.outputInvert))
+      );
+      routing.append(route);
+      if (node.component.list.beatRender) {
+        routing.append(element("p", "avs-editor__annotation", `Beat gate holds for ${node.component.list.beatRenderFrames} frame${node.component.list.beatRenderFrames === 1 ? "" : "s"}.`));
+      }
+      inspector.append(routing);
+    }
+    if (node.component.listCode) {
+      const codeSection = element("section", "avs-editor__inspector-section");
+      codeSection.append(element("h4", "", `Effect List code \xB7 ${node.component.listCode.enabled ? "enabled" : "disabled"}`));
+      codeSection.append(codeBlock("init", node.component.listCode.init), codeBlock("frame", node.component.listCode.frame));
+      inspector.append(codeSection);
+    }
+    const decoded = findAvsEditorNode(this.decodedModel, node.path);
+    if (decoded && decoded.inspection.kind !== "effect-list" && decoded.inspection.kind !== "opaque") {
+      inspector.append(renderDecodedInspection(decoded.inspection, this.callbacks.onPatchFields ? (patch) => this.callbacks.onPatchFields?.(node.component, node.path, patch) : void 0, (error) => this.reportError(error)));
+    }
+    if (!node.component.list && this.callbacks.onPatchPayload) {
+      inspector.append(this.renderPayloadEditor(node));
+    }
+    return inspector;
+  }
+  renderPayloadEditor(node) {
+    const section = element("details", "avs-editor__inspector-section avs-editor__payload-editor");
+    const summary = element("summary", "", "Raw payload \xB7 exact hex");
+    const note = element("p", "avs-editor__annotation", "Advanced: edits replace this renderer payload byte-for-byte. Unknown data is otherwise preserved unchanged.");
+    section.append(summary, note);
+    section.addEventListener("toggle", () => {
+      if (!section.open || section.dataset.loaded) return;
+      section.dataset.loaded = "true";
+      const input = element("textarea", "avs-editor__payload-hex");
+      input.spellcheck = false;
+      input.value = [...node.component.payload].map((byte) => byte.toString(16).padStart(2, "0")).join(" ");
+      const apply = controlButton("avs-editor__action", "Apply payload", `Apply raw payload for ${node.name}`);
+      apply.addEventListener("click", () => {
+        let bytes;
+        try {
+          bytes = parseAvsPayloadHex(input.value);
+        } catch (error) {
+          this.reportError(error);
+          return;
+        }
+        this.runButtonAction(apply, () => this.callbacks.onPatchPayload?.(node.component, node.path, bytes));
+      });
+      section.append(input, apply);
+    });
+    return section;
+  }
+  renderEmptyInspector() {
+    const inspector = element("aside", "avs-editor__inspector avs-editor__inspector--empty");
+    inspector.append(element("p", "", "Select an effect to inspect its native AVS record."));
+    return inspector;
+  }
+  handleTreeKey(event) {
+    if (!(event.target instanceof HTMLElement) || !event.target.matches(".avs-editor__identity")) return;
+    const tree = this.options.host.querySelector('[role="tree"]');
+    if (!tree) return;
+    const visible = [...tree.querySelectorAll('[role="treeitem"]')];
+    const current = event.target.closest('[role="treeitem"]');
+    if (!current) return;
+    const index = visible.indexOf(current);
+    let destination;
+    if (event.key === "ArrowDown") destination = visible[index + 1];
+    else if (event.key === "ArrowUp") destination = visible[index - 1];
+    else if (event.key === "Home") destination = visible[0];
+    else if (event.key === "End") destination = visible.at(-1);
+    else if (event.key === "ArrowRight") {
+      if (current.getAttribute("aria-expanded") === "false") {
+        this.collapsed.delete(current.dataset.avsPath);
+        this.render();
+        this.focusPath(current.dataset.avsPath);
+        event.preventDefault();
+        return;
+      }
+      destination = current.querySelector(':scope > .avs-editor__children > [role="treeitem"]') ?? void 0;
+    } else if (event.key === "ArrowLeft") {
+      if (current.getAttribute("aria-expanded") === "true") {
+        this.collapsed.add(current.dataset.avsPath);
+        this.render();
+        this.focusPath(current.dataset.avsPath);
+        event.preventDefault();
+        return;
+      }
+      destination = current.parentElement?.closest('[role="treeitem"]') ?? void 0;
+    } else return;
+    event.preventDefault();
+    if (destination?.dataset.avsPath) {
+      this.select(destination.dataset.avsPath);
+      this.focusPath(destination.dataset.avsPath);
+    }
+  }
+  focusPath(path) {
+    const item = [...this.options.host.querySelectorAll("[data-avs-path]")].find((candidate) => candidate.dataset.avsPath === path);
+    item?.querySelector(":scope > .avs-editor__node-row > .avs-editor__identity")?.focus();
+  }
+  runButtonAction(button, action, refresh = true) {
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    let result;
+    try {
+      result = action();
+    } catch (error) {
+      button.disabled = false;
+      button.removeAttribute("aria-busy");
+      this.reportError(error);
+      return;
+    }
+    if (!result || typeof result.then !== "function") {
+      button.removeAttribute("aria-busy");
+      if (refresh) this.refresh();
+      else button.disabled = false;
+      return;
+    }
+    void result.then(
+      () => {
+        if (refresh) this.refresh();
+        else {
+          button.disabled = false;
+          button.removeAttribute("aria-busy");
+        }
+      },
+      (error) => {
+        button.disabled = false;
+        button.removeAttribute("aria-busy");
+        this.reportError(error);
+      }
+    );
+  }
+  reportError(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (this.statusLine) {
+      this.statusLine.textContent = message;
+      this.statusLine.classList.add("is-error");
+    }
+    this.callbacks.onError?.(error);
+  }
+  applyVisibility() {
+    this.options.host.hidden = !this.visible;
+    this.options.host.setAttribute("aria-hidden", String(!this.visible));
+  }
+};
+function renderDecodedInspection(inspection, onPatch, onError) {
+  const section = element("section", "avs-editor__inspector-section");
+  section.append(element("h4", "", `Decoded ${inspection.kind.replaceAll("-", " ")}`));
+  const value = "config" in inspection ? inspection.config : inspection;
+  const facts = element("dl", "avs-editor__facts avs-editor__decoded");
+  for (const [key, raw] of Object.entries(value)) {
+    if (key === "kind") continue;
+    fact(facts, key.replaceAll(/([A-Z])/g, " $1"), inspectionValue(raw));
+  }
+  section.append(facts);
+  if (onPatch && (inspection.kind === "blur" || inspection.kind === "buffer-save" || inspection.kind === "set-render-mode")) {
+    const form = element("form", "avs-editor__parameter-form");
+    form.append(element("p", "avs-editor__annotation", "Source-faithful fields. Unrecognized payload bytes are preserved."));
+    if (inspection.kind === "blur") {
+      const mode4 = selectField("Mode", [
+        ["0", "Disabled"],
+        ["1", "Normal"],
+        ["2", "Light"],
+        ["3", "Heavy"]
+      ], String(inspection.mode));
+      const roundUp = checkboxField("Round upward", inspection.roundUp);
+      form.append(mode4.wrapper, roundUp.wrapper);
+      bindParameterForm(form, () => ({ kind: "blur", mode: Number(mode4.input.value), roundUp: roundUp.input.checked }), onPatch, onError);
+    } else if (inspection.kind === "buffer-save") {
+      const direction = selectField("Direction", [
+        ["0", "Save"],
+        ["1", "Restore"],
+        ["2", "Alternate save/restore"],
+        ["3", "Restore on beat"]
+      ], String(inspection.direction));
+      const buffer = numberField("Buffer", inspection.buffer, 0, 7);
+      const blendMode = numberField("Blend mode", inspection.blendMode, 0, 11);
+      const alpha = numberField("Adjustable alpha", inspection.adjustableAlpha, 0, 255);
+      form.append(direction.wrapper, buffer.wrapper, blendMode.wrapper, alpha.wrapper);
+      bindParameterForm(form, () => ({
+        kind: "buffer-save",
+        direction: Number(direction.input.value),
+        buffer: buffer.input.valueAsNumber,
+        blendMode: blendMode.input.valueAsNumber,
+        adjustableAlpha: alpha.input.valueAsNumber
+      }), onPatch, onError);
+    } else {
+      const enabled = checkboxField("Enabled", inspection.enabled);
+      const blendMode = numberField("Blend mode", inspection.blendMode, 0, 9);
+      const alpha = numberField("Adjustable alpha", inspection.adjustableAlpha, 0, 255);
+      const lineWidth = numberField("Line width", inspection.lineWidth, 0, 255);
+      form.append(enabled.wrapper, blendMode.wrapper, alpha.wrapper, lineWidth.wrapper);
+      bindParameterForm(form, () => ({
+        kind: "set-render-mode",
+        enabled: enabled.input.checked,
+        blendMode: blendMode.input.valueAsNumber,
+        adjustableAlpha: alpha.input.valueAsNumber,
+        lineWidth: lineWidth.input.valueAsNumber
+      }), onPatch, onError);
+    }
+    section.append(form);
+  }
+  return section;
+}
+function bindParameterForm(form, patch, onPatch, onError) {
+  const apply = controlButton("avs-editor__action", "Apply parameters", "Apply AVS effect parameters");
+  apply.type = "submit";
+  form.append(apply);
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    apply.disabled = true;
+    apply.setAttribute("aria-busy", "true");
+    try {
+      const result = onPatch(patch());
+      if (result && typeof result.then === "function") {
+        void result.then(
+          () => {
+            apply.disabled = false;
+            apply.removeAttribute("aria-busy");
+          },
+          (error) => {
+            apply.disabled = false;
+            apply.removeAttribute("aria-busy");
+            onError?.(error);
+          }
+        );
+      } else {
+        apply.disabled = false;
+        apply.removeAttribute("aria-busy");
+      }
+    } catch (error) {
+      apply.disabled = false;
+      apply.removeAttribute("aria-busy");
+      onError?.(error);
+    }
+  });
+}
+function numberField(label, value, min, max) {
+  const wrapper = element("label", "avs-editor__parameter");
+  wrapper.append(element("span", "", label));
+  const input = element("input");
+  input.type = "number";
+  input.min = String(min);
+  input.max = String(max);
+  input.step = "1";
+  input.value = String(value);
+  wrapper.append(input);
+  return { wrapper, input };
+}
+function checkboxField(label, checked) {
+  const wrapper = element("label", "avs-editor__parameter avs-editor__parameter--check");
+  const input = element("input");
+  input.type = "checkbox";
+  input.checked = checked;
+  wrapper.append(input, element("span", "", label));
+  return { wrapper, input };
+}
+function selectField(label, options, value) {
+  const wrapper = element("label", "avs-editor__parameter");
+  wrapper.append(element("span", "", label));
+  const input = element("select");
+  for (const [optionValue, optionLabel] of options) {
+    const option2 = element("option", "", optionLabel);
+    option2.value = optionValue;
+    input.append(option2);
+  }
+  input.value = value;
+  wrapper.append(input);
+  return { wrapper, input };
+}
+function inspectionValue(raw) {
+  if (typeof raw === "string") return raw.length > 240 ? `${raw.slice(0, 240)}\u2026` : raw || "\u2014";
+  if (ArrayBuffer.isView(raw)) {
+    const values = Array.from(raw);
+    return `${values.length} bytes \xB7 ${values.slice(0, 8).join(", ")}${values.length > 8 ? ", \u2026" : ""}`;
+  }
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) return "0 values";
+    const primitive = raw.every((value) => value === null || ["string", "number", "boolean"].includes(typeof value));
+    return primitive ? `${raw.length} values \xB7 ${raw.slice(0, 8).join(", ")}${raw.length > 8 ? ", \u2026" : ""}` : `${raw.length} structured item${raw.length === 1 ? "" : "s"}`;
+  }
+  if (typeof raw === "object" && raw !== null) {
+    const encoded = JSON.stringify(raw);
+    return encoded.length > 240 ? `${encoded.slice(0, 240)}\u2026` : encoded;
+  }
+  return String(raw);
+}
+function effectName(component) {
+  if (component.list) return "Effect List";
+  if (component.apeId) return component.apeId;
+  return BUILTIN_EFFECT_NAMES[component.effectId] ?? `Unknown renderer ${component.effectId}`;
+}
+function effectSummary(component) {
+  if (component.list) {
+    const list = component.list;
+    const inBlend = decodeAvsListBlend(list.inputBlendMode);
+    const outBlend = decodeAvsListBlend(list.outputBlendMode);
+    const flags = [list.clearEveryFrame ? "clear" : "retain"];
+    if (list.beatRender) flags.push(`beat\xD7${list.beatRenderFrames}`);
+    if (component.listCode) flags.push(component.listCode.enabled ? "EEL" : "EEL off");
+    return `${component.children.length} children \xB7 ${inBlend} in / ${outBlend} out \xB7 ${flags.join(" \xB7 ")}`;
+  }
+  const type = component.apeId ? "APE" : `ID ${component.effectId}`;
+  return `${type} \xB7 ${component.payload.byteLength} B`;
+}
+function listBlendLabel(code, value, buffer, invert) {
+  const blend2 = decodeAvsListBlend(code);
+  const detail = blend2 === "adjustable" ? ` ${value}/255` : blend2 === "buffer-depth" ? ` buffer ${buffer + 1}` : "";
+  return `${blend2}${detail}${invert ? " \xB7 inverted" : ""}`;
+}
+function stateLabel(state) {
+  if (!state.enabled) return "disabled";
+  if (state.muted) return "muted";
+  if (state.soloed) return "solo";
+  return "active";
+}
+function comparePaths(a, b) {
+  const left = a.path.split(".").map(Number);
+  const right = b.path.split(".").map(Number);
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    if (left[i] === void 0) return -1;
+    if (right[i] === void 0) return 1;
+    if (left[i] !== right[i]) return left[i] - right[i];
+  }
+  return 0;
+}
+function stat(value, label) {
+  const wrapper = element("span", "avs-editor__stat");
+  wrapper.append(element("b", "", value), element("small", "", label));
+  return wrapper;
+}
+function fact(list, label, value) {
+  list.append(element("dt", "", label), element("dd", "", value));
+}
+function routeStep(label, detail) {
+  const step = element("span", "avs-editor__route-step");
+  step.append(element("b", "", label), element("small", "", detail));
+  return step;
+}
+function codeBlock(label, source3) {
+  const wrapper = element("div", "avs-editor__code");
+  wrapper.append(element("span", "", label), element("pre", "", source3.trim() || "\u2014"));
+  return wrapper;
+}
+function controlButton(className, text, ariaLabel) {
+  const button = element("button", className, text);
+  button.type = "button";
+  button.setAttribute("aria-label", ariaLabel);
+  return button;
+}
+function element(tag, className = "", text = "") {
+  const value = document.createElement(tag);
+  if (className) value.className = className;
+  if (text) value.textContent = text;
+  return value;
+}
+function ensureStylesheet2(href) {
+  if (typeof document === "undefined" || document.querySelector(`link[data-aaavs-avs-editor="${CSS.escape(href)}"]`)) return;
+  const link = document.createElement("link");
+  link.rel = "stylesheet";
+  link.href = href;
+  link.dataset.aaavsAvsEditor = href;
+  document.head.append(link);
+}
+
+// src/avs/gpu-ordered-draw.ts
+var DEFAULT_BUDGET = 64 * 1024 * 1024;
+var DEFAULT_MAX_RECORDS = 4 * 128 * 1024;
+
 // src/avs/runtime.ts
 var AvsCompatibilityRuntime = class {
   preset;
@@ -17267,6 +19274,15 @@ var AvsCompatibilityRuntime = class {
   }
   get framebuffer() {
     return this.surface;
+  }
+  get controls() {
+    return this.executor.controls;
+  }
+  setControls(controls) {
+    this.executor.setControls(controls);
+  }
+  setComponentControl(path, control) {
+    this.executor.setComponentControl(path, control);
   }
   resize(width, height) {
     if (this.surface.width === width && this.surface.height === height) return;
@@ -17899,12 +19915,478 @@ async function fetchBundledAvsPreset(preset2) {
   return new Uint8Array(await response.arrayBuffer());
 }
 
+// src/avs/local-collection.ts
+var COLLECTION_ROOT = "./avs presets/";
+async function fetchLocalAvsCatalog() {
+  const base2 = typeof document === "undefined" ? "http://127.0.0.1/" : document.baseURI;
+  const catalogUrl = new URL(`${COLLECTION_ROOT}catalog/presets.json`, base2);
+  const validationUrl = new URL(`${COLLECTION_ROOT}catalog/parser-validation.json`, base2);
+  const [response, validationResponse] = await Promise.all([
+    fetch(catalogUrl, { cache: "no-store" }),
+    fetch(validationUrl, { cache: "no-store" })
+  ]);
+  if (!response.ok) throw new Error(`Local AVS collection unavailable (HTTP ${response.status})`);
+  if (!validationResponse.ok) throw new Error(`Local AVS parser metadata unavailable (HTTP ${validationResponse.status})`);
+  return parseLocalAvsCatalog(
+    await response.json(),
+    await validationResponse.json(),
+    base2
+  );
+}
+function parseLocalAvsCatalog(json, validation, baseUrl) {
+  if (!Array.isArray(json.presets)) throw new Error("Local AVS catalog has no preset list");
+  if (!Array.isArray(validation.results)) throw new Error("Local AVS parser metadata has no result list");
+  const parserByHash = new Map(validation.results.map((entry, index) => {
+    if (typeof entry.sha256 !== "string" || typeof entry.status !== "string") {
+      throw new Error(`Invalid local AVS parser metadata entry ${index}`);
+    }
+    return [entry.sha256, entry];
+  }));
+  return Object.freeze(json.presets.map((entry, index) => {
+    if (typeof entry.sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(entry.sha256) || typeof entry.display_name !== "string" || typeof entry.canonical_path !== "string" || typeof entry.bytes !== "number" || !Number.isSafeInteger(entry.bytes) || entry.bytes <= 0) {
+      throw new Error(`Invalid local AVS catalog entry ${index}`);
+    }
+    const parser = parserByHash.get(entry.sha256);
+    const parserStatus = parser?.status === "lossless" || parser?.status === "roundtrip-mismatch" || parser?.status === "parse-error" ? parser.status : "unknown";
+    const unavailableReason = parserStatus === "parse-error" ? typeof parser?.error === "string" ? parser.error : "The AVS parser rejected this historical preset" : void 0;
+    const relative = entry.canonical_path.split("/").map(encodeURIComponent).join("/");
+    return Object.freeze({
+      id: `local:${entry.sha256}`,
+      name: entry.display_name,
+      fileName: entry.canonical_path.split("/").at(-1),
+      sha256: entry.sha256,
+      bytes: entry.bytes,
+      url: new URL(`${COLLECTION_ROOT}${relative}`, baseUrl).href,
+      parserStatus,
+      autoEligible: parserStatus !== "parse-error",
+      ...unavailableReason ? { unavailableReason } : {}
+    });
+  }));
+}
+async function fetchLocalAvsPreset(preset2) {
+  const response = await fetch(preset2.url, { cache: "no-store" });
+  if (!response.ok) throw new Error(`Could not load ${preset2.name}: HTTP ${response.status}`);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength !== preset2.bytes) throw new Error(`Local AVS size mismatch for ${preset2.name}`);
+  return bytes;
+}
+
+// src/avs/personal-bank.ts
+var DB_NAME = "aaavs-personal-preset-bank";
+var STORE = "presets";
+var AvsPersonalBank = class {
+  database = null;
+  async list() {
+    const records = await this.request("readonly", (store) => store.getAll());
+    return records.map(stripData).sort((a, b) => a.name.localeCompare(b.name));
+  }
+  async get(id) {
+    const record = await this.request("readonly", (store) => store.get(id));
+    if (!record) throw new Error(`Personal AVS preset not found: ${id}`);
+    return { preset: stripData(record), bytes: new Uint8Array(record.data.slice(0)) };
+  }
+  async put(name, bytes, fileName = `${name}.avs`) {
+    if (bytes.byteLength === 0) throw new Error("Cannot save an empty AVS preset");
+    const sha256 = await sha256Hex(bytes);
+    const cleanName = name.trim() || "Untitled AVS preset";
+    const record = {
+      id: `personal:${sha256}`,
+      name: cleanName,
+      fileName: fileName.toLowerCase().endsWith(".avs") ? fileName : `${fileName}.avs`,
+      sha256,
+      bytes: bytes.byteLength,
+      updatedAt: Date.now(),
+      data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+    };
+    const sameName = (await this.list()).find((preset2) => preset2.name.localeCompare(cleanName, void 0, { sensitivity: "base" }) === 0);
+    if (sameName && sameName.id !== record.id) await this.remove(sameName.id);
+    await this.request("readwrite", (store) => store.put(record));
+    return stripData(record);
+  }
+  async remove(id) {
+    await this.request("readwrite", (store) => store.delete(id));
+  }
+  async exportBlob() {
+    const records = await this.request("readonly", (store) => store.getAll());
+    const bank = {
+      schema: "aaavs_personal_avs_bank_v1",
+      presets: records.map((record) => ({
+        name: record.name,
+        fileName: record.fileName,
+        sha256: record.sha256,
+        dataBase64: bytesToBase64(new Uint8Array(record.data))
+      }))
+    };
+    return new Blob([JSON.stringify(bank, null, 2)], { type: "application/json" });
+  }
+  async importFile(file) {
+    const value = JSON.parse(await file.text());
+    if (value.schema !== "aaavs_personal_avs_bank_v1" || !Array.isArray(value.presets)) {
+      throw new Error("Not an AAAVS personal AVS bank");
+    }
+    let imported = 0;
+    for (const entry of value.presets) {
+      if (!entry || typeof entry.name !== "string" || typeof entry.fileName !== "string" || typeof entry.sha256 !== "string" || typeof entry.dataBase64 !== "string") {
+        throw new Error(`Invalid personal bank entry ${imported}`);
+      }
+      const bytes = base64ToBytes(entry.dataBase64);
+      const digest = await sha256Hex(bytes);
+      if (digest !== entry.sha256) throw new Error(`Personal bank hash mismatch for ${entry.name}`);
+      await this.put(entry.name, bytes, entry.fileName);
+      imported++;
+    }
+    return imported;
+  }
+  async request(mode4, operation) {
+    const db = await (this.database ??= openDatabase());
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE, mode4);
+      const request2 = operation(transaction.objectStore(STORE));
+      request2.onsuccess = () => resolve(request2.result);
+      request2.onerror = () => reject(request2.error ?? new Error("Personal bank request failed"));
+      transaction.onabort = () => reject(transaction.error ?? new Error("Personal bank transaction aborted"));
+    });
+  }
+};
+function openDatabase() {
+  if (typeof indexedDB === "undefined") return Promise.reject(new Error("IndexedDB is unavailable; personal banks cannot persist here"));
+  return new Promise((resolve, reject) => {
+    const request2 = indexedDB.open(DB_NAME, 1);
+    request2.onupgradeneeded = () => request2.result.createObjectStore(STORE, { keyPath: "id" });
+    request2.onsuccess = () => resolve(request2.result);
+    request2.onerror = () => reject(request2.error ?? new Error("Could not open the personal AVS bank"));
+  });
+}
+function stripData(record) {
+  const { data: _data, ...preset2 } = record;
+  return preset2;
+}
+async function sha256Hex(bytes) {
+  const source3 = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", source3));
+  return [...digest].map((value) => value.toString(16).padStart(2, "0")).join("");
+}
+function bytesToBase64(bytes) {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 32768) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
+  }
+  return btoa(binary);
+}
+function base64ToBytes(value) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+// src/avs/preset-sources.ts
+var AvsPresetSourceRegistry = class {
+  sources = /* @__PURE__ */ new Map();
+  catalogs = /* @__PURE__ */ new Map();
+  autoBanks = /* @__PURE__ */ new Map();
+  listeners = /* @__PURE__ */ new Set();
+  constructor(sources) {
+    for (const source3 of sources) {
+      if (this.sources.has(source3.id)) throw new Error(`Duplicate AVS preset source ${source3.id}`);
+      this.sources.set(source3.id, source3);
+    }
+  }
+  async list(sourceId, refresh = false) {
+    const source3 = this.requireSource(sourceId);
+    if (refresh) {
+      this.catalogs.delete(sourceId);
+      this.autoBanks.delete(sourceId);
+      source3.invalidate?.();
+    }
+    let pending = this.catalogs.get(sourceId);
+    if (!pending) {
+      pending = source3.list().then((metadata) => Object.freeze(metadata.map((entry) => this.wrap(source3, entry))));
+      this.catalogs.set(sourceId, pending);
+      pending.catch(() => {
+        if (this.catalogs.get(sourceId) === pending) this.catalogs.delete(sourceId);
+      });
+    }
+    return pending;
+  }
+  async snapshot(sourceId, refresh = false) {
+    const source3 = this.requireSource(sourceId);
+    try {
+      return Object.freeze({ sourceId, label: source3.label, entries: await this.list(sourceId, refresh) });
+    } catch (error) {
+      return Object.freeze({
+        sourceId,
+        label: source3.label,
+        entries: Object.freeze([]),
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+  async snapshots(refresh = false) {
+    return Object.freeze(await Promise.all(
+      [...this.sources.keys()].map((sourceId) => this.snapshot(sourceId, refresh))
+    ));
+  }
+  async find(sourceId, id) {
+    return (await this.list(sourceId)).find((entry) => entry.id === id || entry.ledgerId === id);
+  }
+  async require(sourceId, id) {
+    const entry = await this.find(sourceId, id);
+    if (!entry) throw new Error(`Unknown ${sourceId} AVS preset: ${id}`);
+    return entry;
+  }
+  async autoBank(sourceId) {
+    let pending = this.autoBanks.get(sourceId);
+    if (!pending) {
+      pending = this.list(sourceId).then((entries) => {
+        const eligible = entries.filter((entry) => entry.autoEligible !== false);
+        return eligible.length === entries.length ? entries : Object.freeze(eligible);
+      });
+      this.autoBanks.set(sourceId, pending);
+      pending.catch(() => {
+        if (this.autoBanks.get(sourceId) === pending) this.autoBanks.delete(sourceId);
+      });
+    }
+    return pending;
+  }
+  invalidate(sourceId) {
+    if (sourceId) {
+      this.catalogs.delete(sourceId);
+      this.autoBanks.delete(sourceId);
+      this.sources.get(sourceId)?.invalidate?.();
+    } else {
+      this.catalogs.clear();
+      this.autoBanks.clear();
+      for (const source3 of this.sources.values()) source3.invalidate?.();
+    }
+    for (const listener of this.listeners) listener(sourceId);
+  }
+  subscribe(listener) {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+  wrap(source3, metadata) {
+    if (!metadata.id || !metadata.name || !metadata.fileName) {
+      throw new Error(`Invalid ${source3.id} AVS preset metadata`);
+    }
+    const ledgerId = `${source3.id}:${metadata.id}`;
+    return Object.freeze({
+      ...metadata,
+      sourceId: source3.id,
+      ledgerId,
+      autoEligible: metadata.autoEligible !== false,
+      load: async () => {
+        if (metadata.autoEligible === false && metadata.unavailableReason) {
+          throw new Error(`${metadata.name} is unavailable: ${metadata.unavailableReason}`);
+        }
+        const bytes = await source3.load(metadata.id);
+        if (metadata.byteLength !== void 0 && bytes.byteLength !== metadata.byteLength) {
+          throw new Error(`${metadata.name} byte length changed (${bytes.byteLength}, expected ${metadata.byteLength})`);
+        }
+        if (metadata.sha256) {
+          const actual = await sha256Hex2(bytes);
+          if (actual !== metadata.sha256.toLowerCase()) throw new Error(`${metadata.name} SHA-256 mismatch`);
+        }
+        return bytes;
+      }
+    });
+  }
+  requireSource(sourceId) {
+    const source3 = this.sources.get(sourceId);
+    if (!source3) throw new Error(`AVS preset source is not registered: ${sourceId}`);
+    return source3;
+  }
+};
+var PERSONAL_AVS_BANK = new AvsPersonalBank();
+var localCatalogCache = null;
+var AVS_PRESET_SOURCES = new AvsPresetSourceRegistry([
+  {
+    id: "bundled",
+    label: "Community + Winamp 5 Picks",
+    async list() {
+      return BUNDLED_AVS_PRESETS.map((preset2) => ({
+        id: preset2.id,
+        name: preset2.name,
+        fileName: preset2.fileName,
+        collection: preset2.collection,
+        autoEligible: true
+      }));
+    },
+    async load(id) {
+      const preset2 = BUNDLED_AVS_PRESETS.find((candidate) => candidate.id === id);
+      if (!preset2) throw new Error(`Unknown bundled AVS preset: ${id}`);
+      return fetchBundledAvsPreset(preset2);
+    }
+  },
+  {
+    id: "local",
+    label: "Full local collection",
+    async list() {
+      localCatalogCache = await fetchLocalAvsCatalog();
+      return localCatalogCache.map((preset2) => ({
+        id: preset2.id,
+        name: preset2.name,
+        fileName: preset2.fileName,
+        collection: "Full local collection",
+        sha256: preset2.sha256,
+        byteLength: preset2.bytes,
+        autoEligible: preset2.autoEligible,
+        ...preset2.unavailableReason ? { unavailableReason: preset2.unavailableReason } : {}
+      }));
+    },
+    async load(id) {
+      const catalog = localCatalogCache ??= await fetchLocalAvsCatalog();
+      const preset2 = catalog.find((candidate) => candidate.id === id);
+      if (!preset2) throw new Error(`Unknown local AVS preset: ${id}`);
+      return fetchLocalAvsPreset(preset2);
+    },
+    invalidate() {
+      localCatalogCache = null;
+    }
+  },
+  {
+    id: "personal",
+    label: "My AVS",
+    async list() {
+      return (await PERSONAL_AVS_BANK.list()).map((preset2) => ({
+        id: preset2.id,
+        name: preset2.name,
+        fileName: preset2.fileName,
+        collection: "My AVS",
+        sha256: preset2.sha256,
+        byteLength: preset2.bytes,
+        autoEligible: true
+      }));
+    },
+    async load(id) {
+      return (await PERSONAL_AVS_BANK.get(id)).bytes;
+    }
+  }
+]);
+async function sha256Hex2(bytes) {
+  const source3 = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", source3));
+  return [...digest].map((value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+// src/avs/live-director.ts
+var AvsLiveDirector = class {
+  constructor(seed = 2757385965) {
+    this.seed = seed;
+  }
+  enabled = false;
+  minBars = 2;
+  maxBars = 12;
+  bank = [];
+  currentId = "";
+  pendingId = "";
+  pendingEnergy = 0;
+  nextBar = Number.POSITIVE_INFINITY;
+  sequence = 0;
+  diagnostics() {
+    return {
+      enabled: this.enabled,
+      bankSize: this.bank.length,
+      currentId: this.currentId,
+      pendingId: this.pendingId,
+      nextBar: this.nextBar,
+      sequence: this.sequence
+    };
+  }
+  setBank(bank, currentId = this.currentId, bar = 0) {
+    this.bank = [...bank];
+    this.currentId = bank.some((preset2) => preset2.id === currentId) ? currentId : bank[0]?.id ?? "";
+    this.pendingId = "";
+    this.pendingEnergy = 0;
+    this.sequence = 0;
+    this.arm(bar, 0);
+  }
+  select(id, bar, energy = 0) {
+    this.currentId = id;
+    this.pendingId = "";
+    this.pendingEnergy = 0;
+    this.arm(bar, energy);
+  }
+  update(barPosition, energy, impact = 0) {
+    if (!this.enabled || this.pendingId || this.bank.length < 2 || barPosition + 1e-9 < this.nextBar) return null;
+    const bar = Math.floor(barPosition);
+    const hash = mix32(this.seed ^ Math.imul(++this.sequence, 2654435761) ^ Math.imul(bar, 2246822507));
+    const current = this.bank.findIndex((preset2) => preset2.id === this.currentId);
+    let index = hash % (this.bank.length - 1);
+    if (current >= 0 && index >= current) index++;
+    const selected = this.bank[index];
+    this.pendingId = selected.id;
+    this.pendingEnergy = Math.max(energy, impact);
+    this.nextBar = Number.POSITIVE_INFINITY;
+    return selected;
+  }
+  commit(id, bar, energy = this.pendingEnergy) {
+    if (this.pendingId && this.pendingId !== id) return;
+    this.currentId = id;
+    this.pendingId = "";
+    this.pendingEnergy = 0;
+    this.arm(bar, energy);
+  }
+  cancel(id, bar, energy = this.pendingEnergy) {
+    if (this.pendingId !== id) return;
+    this.pendingId = "";
+    this.pendingEnergy = 0;
+    this.arm(bar, energy);
+  }
+  arm(barPosition, energy) {
+    const bar = Math.floor(barPosition);
+    const intensity = clamp0110(energy);
+    const dwell = Math.round(this.maxBars - (this.maxBars - this.minBars) * intensity);
+    this.nextBar = bar + Math.max(this.minBars, Math.min(this.maxBars, dwell));
+  }
+};
+var AvsLiveLoadGuard = class {
+  revision = 0;
+  active = 0;
+  get busy() {
+    return this.active !== 0;
+  }
+  begin() {
+    const ticket = ++this.revision;
+    this.active = ticket;
+    return ticket;
+  }
+  isCurrent(ticket) {
+    return ticket === this.revision;
+  }
+  finish(ticket) {
+    if (this.active === ticket) this.active = 0;
+  }
+  supersede() {
+    this.revision++;
+    this.active = 0;
+  }
+};
+function resolveAvsLiveBarPosition(trackedBarPosition, trackedBpm, audioTime, fallbackBpm = 120) {
+  if (trackedBpm > 0 && Number.isFinite(trackedBarPosition)) return Math.max(0, trackedBarPosition);
+  if (!(audioTime > 0) || !(fallbackBpm > 0)) return 0;
+  return audioTime * fallbackBpm / 240;
+}
+function mix32(value) {
+  let x = value >>> 0;
+  x ^= x >>> 16;
+  x = Math.imul(x, 2146121005);
+  x ^= x >>> 15;
+  x = Math.imul(x, 2221713035);
+  return (x ^ x >>> 16) >>> 0;
+}
+function clamp0110(value) {
+  return value < 0 ? 0 : value > 1 ? 1 : value;
+}
+
 // src/avs-presentation.ts
 var AVS_QUALITY_TIERS = [
-  { scale: 1, fps: 30 },
-  { scale: 0.8, fps: 30 },
-  { scale: 0.67, fps: 24 },
-  { scale: 0.5, fps: 20 }
+  { scale: 1, fps: 165 },
+  { scale: 0.8, fps: 120 },
+  { scale: 0.67, fps: 60 },
+  { scale: 0.5, fps: 30 }
 ];
 var AvsFrameGovernor = class {
   tiers;
@@ -18090,6 +20572,10 @@ var AvsWorkerRenderer = class {
   loaded = false;
   disposed = false;
   emaMs = 0;
+  controlRevision = 0;
+  pendingControls = [];
+  gpuLane;
+  preset = null;
   unsupported = 0;
   lastRenderMs = 0;
   lastPresentMs = 0;
@@ -18097,6 +20583,14 @@ var AvsWorkerRenderer = class {
   lastUploadMs = 0;
   lastEncodeSubmitMs = 0;
   presenter = "cpu-image-data";
+  gpuEffectPasses = 0;
+  gpuEffectComponents = 0;
+  gpuFusedPointwiseOperations = 0;
+  gpuEffectPlan = "exact CPU fallback";
+  gpuEnhancedSuperScope = false;
+  gpuEnhancedDynamicMovement = false;
+  gpuEnhancedDynamicMovementResidentMap = false;
+  gpuEnhancedMovementEel = false;
   static supported() {
     return typeof Worker !== "undefined" && typeof OffscreenCanvas !== "undefined";
   }
@@ -18104,6 +20598,7 @@ var AvsWorkerRenderer = class {
     this.canvas = options.canvas;
     this.context = options.context;
     this.onFrame = options.onFrame;
+    this.gpuLane = options.gpuLane ?? "exact";
     this.worker = options.createWorker?.() ?? new Worker(new URL("./avs-render.worker.js", import.meta.url), { type: "module", name: "aaavs-compat-renderer" });
     this.worker.onmessage = (event) => this.receive(event.data);
     this.worker.onerror = (event) => {
@@ -18128,8 +20623,27 @@ var AvsWorkerRenderer = class {
     return new Promise((resolve, reject) => {
       this.loadResolve = resolve;
       this.loadReject = reject;
-      this.worker.postMessage({ type: "load", generation, preset: preset2, width, height }, [preset2]);
+      this.worker.postMessage({ type: "load", generation, preset: preset2, width, height, gpuLane: this.gpuLane }, [preset2]);
     });
+  }
+  /** Replace controls on the actual parsed worker graph. Safe before load completes. */
+  setControls(controls) {
+    if (this.disposed) return;
+    this.pendingControls = controls.map((control) => ({ ...control }));
+    if (!this.loaded) return;
+    this.worker.postMessage({
+      type: "controls",
+      generation: this.generation,
+      revision: ++this.controlRevision,
+      controls: this.pendingControls
+    });
+  }
+  setComponentControl(path, patch) {
+    const current = this.pendingControls.find((control) => control.path === path) ?? { path };
+    this.setControls([
+      ...this.pendingControls.filter((control) => control.path !== path),
+      { ...current, ...patch, path }
+    ]);
   }
   /** Dispatches at most one frame. False means an existing frame is still running. */
   render(audio2, width, height) {
@@ -18151,6 +20665,8 @@ var AvsWorkerRenderer = class {
     this.failLoad(new Error("AVS preset load superseded"));
     this.generation++;
     this.loaded = false;
+    this.preset = null;
+    this.pendingControls = [];
     this.gate.finish();
     this.worker.postMessage({ type: "clear", generation: this.generation });
   }
@@ -18181,6 +20697,14 @@ var AvsWorkerRenderer = class {
       this.lastUploadMs = message.uploadMs ?? 0;
       this.lastEncodeSubmitMs = message.encodeSubmitMs ?? 0;
       this.presenter = message.presenter ?? "cpu-image-data";
+      this.gpuEffectPasses = message.gpuEffectPasses ?? 0;
+      this.gpuEffectComponents = message.gpuEffectComponents ?? 0;
+      this.gpuFusedPointwiseOperations = message.gpuFusedPointwiseOperations ?? 0;
+      this.gpuEffectPlan = message.gpuEffectPlan ?? "exact CPU fallback";
+      this.gpuEnhancedSuperScope = message.gpuEnhancedSuperScope ?? false;
+      this.gpuEnhancedDynamicMovement = message.gpuEnhancedDynamicMovement ?? false;
+      this.gpuEnhancedDynamicMovementResidentMap = message.gpuEnhancedDynamicMovementResidentMap ?? false;
+      this.gpuEnhancedMovementEel = message.gpuEnhancedMovementEel ?? false;
       this.emaMs = this.emaMs === 0 ? message.renderMs : this.emaMs * 0.85 + message.renderMs * 0.15;
       this.unsupported = message.unsupported;
       this.onFrame?.();
@@ -18190,11 +20714,21 @@ var AvsWorkerRenderer = class {
     if (message.type === "ready") {
       this.loaded = true;
       this.unsupported = message.unsupported;
+      this.preset = message.preset;
+      if (this.pendingControls.length) {
+        this.worker.postMessage({
+          type: "controls",
+          generation: this.generation,
+          revision: ++this.controlRevision,
+          controls: this.pendingControls
+        });
+      }
       this.loadResolve?.();
       this.loadResolve = null;
       this.loadReject = null;
       return;
     }
+    if (message.type === "controls-applied") return;
     const error = new Error(message.message);
     this.failLoad(error);
     this.gate.finish();
@@ -18386,12 +20920,12 @@ var RationalTimebase = class {
     assertNonNegativeInteger(frame2, "frame");
     return frame2 * this.fpsDenominator / this.fpsNumerator;
   }
-  frameAtSample(sample2, rounding = "floor") {
-    assertNonNegativeInteger(sample2, "sample");
-    const numerator = BigInt(sample2) * BigInt(this.fpsNumerator);
+  frameAtSample(sample, rounding = "floor") {
+    assertNonNegativeInteger(sample, "sample");
+    const numerator = BigInt(sample) * BigInt(this.fpsNumerator);
     const denominator = BigInt(this.sampleRate) * BigInt(this.fpsDenominator);
     if (rounding === "nearest") return safeNumber((numerator + denominator / 2n) / denominator);
-    const nextNumerator = BigInt(sample2 + 1) * BigInt(this.fpsNumerator);
+    const nextNumerator = BigInt(sample + 1) * BigInt(this.fpsNumerator);
     return safeNumber((nextNumerator + denominator - 1n) / denominator - 1n);
   }
 };
@@ -18542,12 +21076,12 @@ function resolvePresetSchedule(options, timebase) {
   }
   return freezeLedger("auto", seed, entries);
 }
-function scheduleEntryAtSample(ledger, sample2) {
+function scheduleEntryAtSample(ledger, sample) {
   let lo = 0;
   let hi = ledger.entries.length - 1;
   while (lo < hi) {
     const mid = lo + hi + 1 >> 1;
-    if (ledger.entries[mid].sampleStart <= sample2) lo = mid;
+    if (ledger.entries[mid].sampleStart <= sample) lo = mid;
     else hi = mid - 1;
   }
   return ledger.entries[lo];
@@ -18582,24 +21116,22 @@ function analyzeOfflineTrack(buffer, options) {
   const { tempo: tempo2, schedule, timebase } = options;
   validateTempo(tempo2);
   const frameCount2 = timebase.frameCount(buffer.totalSamplesPerChannel);
+  const spectral = analyzeSpectralFeatures(buffer, timebase, frameCount2);
   const frames2 = [];
   const events = [];
   const samplesPerBeat = OFFLINE_SAMPLE_RATE * 60 / tempo2.bpm;
   const alphaLow = Math.exp(-2 * Math.PI * 180 / OFFLINE_SAMPLE_RATE);
   const alphaMid = Math.exp(-2 * Math.PI * 2500 / OFFLINE_SAMPLE_RATE);
   let lpLowL = 0, lpLowR = 0, lpMidL = 0, lpMidR = 0;
-  let previousMaster = 0, previousLow = 0, previousMid = 0, previousHigh = 0;
-  let onsetMean = 1e-6;
+  let spectralEventIndex = 0;
   let nextBeat = Math.max(0, Math.ceil(-tempo2.downbeatSample / samplesPerBeat));
   for (let frame2 = 0; frame2 < frameCount2; frame2++) {
     const range = timebase.frameRange(frame2, buffer.totalSamplesPerChannel);
     let sumL = 0, sumR = 0, peakL = 0, peakR = 0;
     let lowSq = 0, midSq = 0, highSq = 0;
-    let transientSample = range.start, transientStrength = 0;
-    for (let sample2 = range.start; sample2 < range.end; sample2++) {
-      const left = buffer.sample(0, sample2);
-      const right = buffer.sample(1, sample2);
-      const master = (left + right) * 0.5;
+    for (let sample = range.start; sample < range.end; sample++) {
+      const left = buffer.sample(0, sample);
+      const right = buffer.sample(1, sample);
       sumL += left * left;
       sumR += right * right;
       peakL = Math.max(peakL, Math.abs(left));
@@ -18614,29 +21146,19 @@ function analyzeOfflineTrack(buffer, options) {
       lowSq += low2 * low2;
       midSq += mid2 * mid2;
       highSq += high2 * high2;
-      const delta = Math.abs(master - previousMaster);
-      if (delta > transientStrength) {
-        transientStrength = delta;
-        transientSample = sample2;
-      }
-      previousMaster = master;
     }
     const count = Math.max(1, range.end - range.start);
     const rmsL = Math.sqrt(sumL / count), rmsR = Math.sqrt(sumR / count);
     const low = Math.sqrt(lowSq / count), mid = Math.sqrt(midSq / count), high = Math.sqrt(highSq / count);
-    const totalEnergy = low + mid + high;
-    const centroid = totalEnergy > 1e-12 ? (low * 90 + mid * 1e3 + high * 7e3) / totalEnergy / 24e3 : 0;
-    const flux = Math.max(0, low - previousLow) + Math.max(0, mid - previousMid) + Math.max(0, high - previousHigh);
-    const onset = clamp019(flux / Math.max(1e-5, onsetMean * 3));
-    onsetMean = onsetMean * 0.97 + flux * 0.03;
-    previousLow = low;
-    previousMid = mid;
-    previousHigh = high;
+    const centroid = spectral.centroid[frame2];
+    const flux = spectral.flux[frame2];
+    const onset = spectral.onset[frame2];
     const frameEvents = [];
-    if (onset > 0.34 && transientStrength > 0.015) {
-      const kind = low > mid * 1.15 && low > high * 1.5 ? "kick" : high > mid * 1.2 ? "hat" : "snare";
-      const confidence = clamp019(onset * 0.7 + transientStrength * 0.3);
-      pushEvent(events, frameEvents, kind, transientSample, frame2, confidence, onset);
+    while (spectralEventIndex < spectral.events.length && spectral.events[spectralEventIndex].sample < range.end) {
+      const event = spectral.events[spectralEventIndex++];
+      if (event.sample >= range.start) {
+        pushEvent(events, frameEvents, event.kind, event.sample, frame2, event.confidence, event.strength);
+      }
     }
     while (true) {
       const beatSample = tempo2.downbeatSample + cumulativeBeatBoundarySample(nextBeat, tempo2.bpm);
@@ -18652,7 +21174,7 @@ function analyzeOfflineTrack(buffer, options) {
     const barPosition = globalBeat / tempo2.meterNumerator;
     const entry = scheduleEntryAtSample(schedule, range.start);
     const previous = entry.index > 0 ? schedule.entries[entry.index - 1] : void 0;
-    const transitionProgress = entry.transitionSamples > 0 ? clamp019((range.start - entry.sampleStart) / entry.transitionSamples) : 1;
+    const transitionProgress = entry.transitionSamples > 0 ? clamp0111((range.start - entry.sampleStart) / entry.transitionSamples) : 1;
     const transitionActive = previous !== void 0 && transitionProgress < 1;
     frames2.push(Object.freeze({
       frame: frame2,
@@ -18668,7 +21190,7 @@ function analyzeOfflineTrack(buffer, options) {
       rms: Object.freeze({ master: Math.sqrt((sumL + sumR) / (count * 2)), left: rmsL, right: rmsR }),
       peak: Object.freeze({ master: Math.max(peakL, peakR), left: peakL, right: peakR }),
       energy: Object.freeze({ low, mid, high }),
-      spectral_centroid: clamp019(centroid),
+      spectral_centroid: clamp0111(centroid),
       spectral_flux: flux,
       onset_strength: onset,
       events: Object.freeze(frameEvents),
@@ -18693,10 +21215,165 @@ function analyzeOfflineTrack(buffer, options) {
     segments: Object.freeze(segments)
   });
 }
-function pushEvent(events, frameEvents, kind, sample2, frame2, confidence, strength) {
-  const event = Object.freeze({ id: `event_${events.length.toString().padStart(6, "0")}`, kind, sample: sample2, frame: frame2, confidence, strength });
+var OFFLINE_FFT_SIZE = 512;
+var OFFLINE_FFT_BINS = OFFLINE_FFT_SIZE / 2;
+var OFFLINE_FFT_HOP = 128;
+var OFFLINE_MIN_DB = -100;
+var OFFLINE_DB_RANGE = 70;
+var OFFLINE_EVENT_REFRACTORY_SAMPLES = Math.round(0.13 * OFFLINE_SAMPLE_RATE);
+function analyzeSpectralFeatures(buffer, timebase, frameCount2) {
+  const flux = new Float32Array(frameCount2);
+  const onset = new Float32Array(frameCount2);
+  const centroid = new Float32Array(frameCount2);
+  const centroidCounts = new Uint16Array(frameCount2);
+  const events = [];
+  const fft2 = new DeterministicFft512();
+  const detector2 = new AdaptiveMultibandDetector(
+    OFFLINE_SAMPLE_RATE,
+    OFFLINE_FFT_BINS,
+    OFFLINE_SAMPLE_RATE / OFFLINE_FFT_HOP
+  );
+  const spectrum = new Float32Array(OFFLINE_FFT_BINS);
+  for (let end = OFFLINE_FFT_SIZE; end <= buffer.totalSamplesPerChannel; end += OFFLINE_FFT_HOP) {
+    fft2.load(buffer, end - OFFLINE_FFT_SIZE);
+    fft2.transform();
+    let centroidNumerator = 0;
+    let centroidDenominator = 0;
+    let logSum = 0;
+    let linearSum = 0;
+    for (let bin = 0; bin < OFFLINE_FFT_BINS; bin++) {
+      const magnitude = fft2.magnitude(bin);
+      const db = 20 * Math.log10(magnitude + 1e-12);
+      const value = clamp0111((db - OFFLINE_MIN_DB) / OFFLINE_DB_RANGE);
+      spectrum[bin] = value;
+      centroidNumerator += value * bin;
+      centroidDenominator += value;
+      logSum += Math.log(value + 1e-6);
+      linearSum += value;
+    }
+    const spectralCentroid = centroidDenominator > 0 ? centroidNumerator / centroidDenominator / OFFLINE_FFT_BINS : 0;
+    const flatness = linearSum > 0 ? Math.exp(logSum / OFFLINE_FFT_BINS) / (linearSum / OFFLINE_FFT_BINS) : 0;
+    const time = end / OFFLINE_SAMPLE_RATE;
+    const features = detector2.analyse(
+      spectrum,
+      1,
+      time,
+      OFFLINE_FFT_HOP / OFFLINE_SAMPLE_RATE,
+      flatness
+    );
+    const frame2 = Math.min(frameCount2 - 1, timebase.frameAtSample(end - 1, "floor"));
+    if (frame2 < 0) continue;
+    flux[frame2] = Math.max(flux[frame2] ?? 0, features.flux);
+    onset[frame2] = Math.max(onset[frame2] ?? 0, features.onsetStrength);
+    centroid[frame2] = (centroid[frame2] ?? 0) + spectralCentroid;
+    centroidCounts[frame2] = (centroidCounts[frame2] ?? 0) + 1;
+    if (features.onsetClassCode !== 0) {
+      const liveClass = ONSET_CLASS_NAMES[features.onsetClassCode] ?? "tonal";
+      const kind = liveClass === "tonal" ? "onset" : liveClass;
+      const sample = strongestTransientSample(buffer, Math.max(1, end - OFFLINE_FFT_HOP), end);
+      const previous = events[events.length - 1];
+      if (!previous || sample - previous.sample >= OFFLINE_EVENT_REFRACTORY_SAMPLES) {
+        events.push(Object.freeze({ kind, sample, confidence: features.onsetStrength, strength: features.flux }));
+      }
+    }
+  }
+  for (let frame2 = 0; frame2 < frameCount2; frame2++) {
+    centroid[frame2] = centroidCounts[frame2] > 0 ? centroid[frame2] / centroidCounts[frame2] : frame2 > 0 ? centroid[frame2 - 1] : 0;
+  }
+  return { flux, onset, centroid, events: Object.freeze(events) };
+}
+function strongestTransientSample(buffer, start, end) {
+  let bestSample = start;
+  let bestDelta = -1;
+  let previous = (buffer.sample(0, start - 1) + buffer.sample(1, start - 1)) * 0.5;
+  for (let sample = start; sample < end; sample++) {
+    const current = (buffer.sample(0, sample) + buffer.sample(1, sample)) * 0.5;
+    const delta = Math.abs(current - previous);
+    if (delta > bestDelta) {
+      bestDelta = delta;
+      bestSample = sample;
+    }
+    previous = current;
+  }
+  return bestSample;
+}
+var DeterministicFft512 = class {
+  re = new Float32Array(OFFLINE_FFT_SIZE);
+  im = new Float32Array(OFFLINE_FFT_SIZE);
+  reverse = new Uint16Array(OFFLINE_FFT_SIZE);
+  cos = new Float32Array(OFFLINE_FFT_SIZE / 2);
+  sin = new Float32Array(OFFLINE_FFT_SIZE / 2);
+  window = new Float32Array(OFFLINE_FFT_SIZE);
+  magnitudeScale;
+  constructor() {
+    let windowGain = 0;
+    for (let i = 0; i < OFFLINE_FFT_SIZE; i++) {
+      let value = i;
+      let reversed = 0;
+      for (let bit = 0; bit < 9; bit++) {
+        reversed = reversed << 1 | value & 1;
+        value >>>= 1;
+      }
+      this.reverse[i] = reversed;
+      const w = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (OFFLINE_FFT_SIZE - 1));
+      this.window[i] = w;
+      windowGain += w;
+    }
+    for (let i = 0; i < OFFLINE_FFT_SIZE / 2; i++) {
+      const angle = -2 * Math.PI * i / OFFLINE_FFT_SIZE;
+      this.cos[i] = Math.cos(angle);
+      this.sin[i] = Math.sin(angle);
+    }
+    this.magnitudeScale = 2 / windowGain;
+  }
+  load(buffer, start) {
+    for (let i = 0; i < OFFLINE_FFT_SIZE; i++) {
+      const mono = (buffer.sample(0, start + i) + buffer.sample(1, start + i)) * 0.5;
+      this.re[i] = mono * this.window[i];
+      this.im[i] = 0;
+    }
+  }
+  transform() {
+    for (let i = 0; i < OFFLINE_FFT_SIZE; i++) {
+      const j = this.reverse[i];
+      if (j <= i) continue;
+      const real = this.re[i];
+      this.re[i] = this.re[j];
+      this.re[j] = real;
+      const imaginary = this.im[i];
+      this.im[i] = this.im[j];
+      this.im[j] = imaginary;
+    }
+    for (let size = 2; size <= OFFLINE_FFT_SIZE; size <<= 1) {
+      const half = size >>> 1;
+      const twiddleStep = OFFLINE_FFT_SIZE / size;
+      for (let base2 = 0; base2 < OFFLINE_FFT_SIZE; base2 += size) {
+        for (let offset = 0; offset < half; offset++) {
+          const twiddle = offset * twiddleStep;
+          const cosine = this.cos[twiddle];
+          const sine = this.sin[twiddle];
+          const upper = base2 + offset;
+          const lower = upper + half;
+          const lowerRe = this.re[lower] * cosine - this.im[lower] * sine;
+          const lowerIm = this.re[lower] * sine + this.im[lower] * cosine;
+          const upperRe = this.re[upper];
+          const upperIm = this.im[upper];
+          this.re[upper] = upperRe + lowerRe;
+          this.im[upper] = upperIm + lowerIm;
+          this.re[lower] = upperRe - lowerRe;
+          this.im[lower] = upperIm - lowerIm;
+        }
+      }
+    }
+  }
+  magnitude(bin) {
+    return Math.sqrt(this.re[bin] * this.re[bin] + this.im[bin] * this.im[bin]) * this.magnitudeScale;
+  }
+};
+function pushEvent(events, frameEvents, kind, sample, frame2, confidence, strength) {
+  const event = Object.freeze({ id: `event_${events.length.toString().padStart(6, "0")}`, kind, sample, frame: frame2, confidence, strength });
   events.push(event);
-  frameEvents.push(Object.freeze({ kind, confidence, sample: sample2 }));
+  frameEvents.push(Object.freeze({ kind, confidence, sample }));
 }
 function selectAnchors(frames2, events) {
   if (frames2.length === 0) return [];
@@ -18760,7 +21437,7 @@ function validateTempo(tempo2) {
   if (!Number.isInteger(tempo2.meterDenominator) || tempo2.meterDenominator <= 0) throw new RangeError("meter denominator must be positive");
   if (!Number.isSafeInteger(tempo2.downbeatSample)) throw new RangeError("downbeat sample must be an integer");
 }
-function clamp019(value) {
+function clamp0111(value) {
   return Math.max(0, Math.min(1, value));
 }
 function positiveFract(value) {
@@ -18818,6 +21495,8 @@ var OfflineRenderSession = class {
   #bandPan = new Float32Array(256);
   #spectrogram = new Float32Array(256);
   #peaks = new Float32Array(256);
+  #perceptualBands = new Float32Array(12);
+  #perceptualFlux = new Float32Array(12);
   constructor(buffer, plan2) {
     this.buffer = buffer;
     this.plan = plan2;
@@ -18869,6 +21548,8 @@ var OfflineRenderSession = class {
       crest: features.rms.master > 1e-9 ? features.peak.master / features.rms.master : 0,
       centroid: features.spectral_centroid,
       flatness: 0,
+      perceptualBands: this.#perceptualBands,
+      perceptualFlux: this.#perceptualFlux,
       waveform: this.#waveform,
       spectrum: this.#spectrum,
       bandPan: this.#bandPan,
@@ -18927,7 +21608,7 @@ function parseMeter(value) {
 }
 
 // src/offline/hash.ts
-async function sha256Hex(input) {
+async function sha256Hex3(input) {
   const bytes = await toBytes(input);
   const copy = bytes.slice().buffer;
   const digest = await crypto.subtle.digest("SHA-256", copy);
@@ -18999,9 +21680,9 @@ function encodeStereoPcmS16leWav(buffer, start = 0, end = buffer.totalSamplesPer
   ascii(bytes, 36, "data");
   view.setUint32(40, dataBytes, true);
   let offset = 44;
-  for (let sample2 = start; sample2 < end; sample2++) {
-    view.setInt16(offset, pcm16(buffer.sample(0, sample2)), true);
-    view.setInt16(offset + 2, pcm16(buffer.sample(1, sample2)), true);
+  for (let sample = start; sample < end; sample++) {
+    view.setInt16(offset, pcm16(buffer.sample(0, sample)), true);
+    view.setInt16(offset + 2, pcm16(buffer.sample(1, sample)), true);
     offset += 4;
   }
   return bytes;
@@ -19018,9 +21699,9 @@ function bindAnchorHashes(plan2, hashes) {
   });
 }
 async function createOfflineManifest(plan2, buffer, renderer2, hashes) {
-  const sourceSha256 = hashes[OFFLINE_PACKAGE_NAMES.audio] ?? await sha256Hex(encodeStereoPcmS16leWav(buffer));
-  const scheduleSha256 = await sha256Hex(stableJson(plan2.schedule));
-  const eventSha256 = await sha256Hex(serializeEvents(plan2.analysis));
+  const sourceSha256 = hashes[OFFLINE_PACKAGE_NAMES.audio] ?? await sha256Hex3(encodeStereoPcmS16leWav(buffer));
+  const scheduleSha256 = await sha256Hex3(stableJson(plan2.schedule));
+  const eventSha256 = await sha256Hex3(serializeEvents(plan2.analysis));
   const exactSamplesPerFrame = plan2.profile.fpsDenominator === 1 && 48e3 % plan2.profile.fpsNumerator === 0 ? 48e3 / plan2.profile.fpsNumerator : null;
   const firstPreset = plan2.schedule.entries[0];
   if (!firstPreset) throw new Error("cannot create manifest for an empty schedule");
@@ -19085,7 +21766,7 @@ var TransactionalPackageWriter = class {
     validatePackagePath(path);
     if (this.#hashes.has(path)) throw new Error(`package path already written: ${path}`);
     const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-    const hash = await sha256Hex(bytes);
+    const hash = await sha256Hex3(bytes);
     await this.#sink.write(path, bytes);
     this.#hashes.set(path, hash);
     return hash;
@@ -19127,8 +21808,8 @@ var TransactionalPackageWriter = class {
     if (this.#state !== "open") throw new Error(`package transaction is ${this.#state}`);
   }
 };
-function pcm16(sample2) {
-  const clamped = Math.max(-1, Math.min(1, Number.isFinite(sample2) ? sample2 : 0));
+function pcm16(sample) {
+  const clamped = Math.max(-1, Math.min(1, Number.isFinite(sample) ? sample : 0));
   return clamped <= -1 ? -32768 : Math.round(clamped * 32767);
 }
 function ascii(target, offset, text) {
@@ -19139,7 +21820,7 @@ function validatePackagePath(path) {
 }
 
 // src/offline-studio.ts
-var DEFAULT_STYLE_HREF2 = new URL("./offline-studio.css", import.meta.url).href;
+var DEFAULT_STYLE_HREF3 = new URL("./offline-studio.css", import.meta.url).href;
 var OFFLINE_OUTPUT_PROFILES = [
   { id: "minimax-anchor-736x416-24", label: "MiniMax anchor", width: 736, height: 416, fpsNum: 24, fpsDen: 1, purpose: "Authoritative PNG + WAV package", authority: true },
   { id: "minimax-review-736x416-24", label: "MiniMax review", width: 736, height: 416, fpsNum: 24, fpsDen: 1, purpose: "H.264 review proxy \xB7 CLI post-render", availability: "post-render" },
@@ -19191,7 +21872,7 @@ var DEFAULT_STATE = {
   error: null,
   canResume: false
 };
-function ensureStylesheet2(href) {
+function ensureStylesheet3(href) {
   if (document.querySelector(`link[data-aaavs-offline-studio="${CSS.escape(href)}"]`)) return;
   const link = document.createElement("link");
   link.rel = "stylesheet";
@@ -19199,7 +21880,7 @@ function ensureStylesheet2(href) {
   link.dataset.aaavsOfflineStudio = href;
   document.head.append(link);
 }
-function element(tag, className = "", text = "") {
+function element2(tag, className = "", text = "") {
   const node = document.createElement(tag);
   if (className) node.className = className;
   if (text) node.textContent = text;
@@ -19235,6 +21916,7 @@ var Studio = class {
   previewCanvas;
   options;
   profiles;
+  presets;
   draft;
   state;
   waveform = new Float32Array(0);
@@ -19277,6 +21959,7 @@ var Studio = class {
   constructor(options) {
     this.options = options;
     this.profiles = options.profiles?.length ? options.profiles : OFFLINE_OUTPUT_PROFILES;
+    this.presets = options.presets ?? [];
     this.draft = { ...DEFAULT_DRAFT, ...options.initialDraft };
     this.state = {
       ...DEFAULT_STATE,
@@ -19285,8 +21968,8 @@ var Studio = class {
       validation: options.initialState?.validation ? [...options.initialState.validation] : []
     };
     if (!this.profiles.some((profile2) => profile2.id === this.draft.profileId)) this.draft = { ...this.draft, profileId: this.profiles[0]?.id ?? "" };
-    ensureStylesheet2(options.styleHref ?? DEFAULT_STYLE_HREF2);
-    this.root = element("section", "offline-studio");
+    ensureStylesheet3(options.styleHref ?? DEFAULT_STYLE_HREF3);
+    this.root = element2("section", "offline-studio");
     this.root.id = "aaavs-offline-studio";
     this.root.hidden = true;
     this.root.tabIndex = -1;
@@ -19372,6 +22055,11 @@ var Studio = class {
     this.options.onDraftChange?.(this.getDraft());
     this.render();
   }
+  setPresets(presets) {
+    this.presets = presets;
+    this.populatePresets();
+    this.renderDraft();
+  }
   getState() {
     return cloneState(this.state);
   }
@@ -19395,10 +22083,10 @@ var Studio = class {
     this.drawTimeline();
   }
   appendLog(message, tone = "info") {
-    const row = element("li", `offline-log is-${tone}`);
-    const sequence = element("span", "offline-log-sequence", String(++this.logSequence).padStart(3, "0"));
-    const time = element("time", "offline-log-time", (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour12: false }));
-    row.append(sequence, time, element("span", "offline-log-message", message));
+    const row = element2("li", `offline-log is-${tone}`);
+    const sequence = element2("span", "offline-log-sequence", String(++this.logSequence).padStart(3, "0"));
+    const time = element2("time", "offline-log-time", (/* @__PURE__ */ new Date()).toLocaleTimeString([], { hour12: false }));
+    row.append(sequence, time, element2("span", "offline-log-message", message));
     this.logList.append(row);
     while (this.logList.childElementCount > 250) this.logList.firstElementChild?.remove();
     this.logList.scrollTop = this.logList.scrollHeight;
@@ -19540,7 +22228,7 @@ var Studio = class {
   populatePresets() {
     this.presetSelect.replaceChildren();
     const groups = /* @__PURE__ */ new Map();
-    for (const preset2 of this.options.presets ?? []) {
+    for (const preset2 of this.presets) {
       let group = groups.get(preset2.collection);
       if (!group) {
         group = document.createElement("optgroup");
@@ -19548,26 +22236,28 @@ var Studio = class {
         groups.set(preset2.collection, group);
         this.presetSelect.append(group);
       }
-      const option = element("option");
-      option.value = `${preset2.kind ?? "bundled"}:${preset2.id}`;
-      option.textContent = preset2.name;
-      group.append(option);
+      const option2 = element2("option");
+      option2.value = `${preset2.kind ?? "bundled"}:${preset2.id}`;
+      option2.disabled = preset2.available === false;
+      option2.textContent = `${preset2.name}${preset2.available === false ? " \xB7 unavailable" : ""}`;
+      if (preset2.unavailableReason) option2.title = preset2.unavailableReason;
+      group.append(option2);
     }
     if (!this.presetSelect.options.length) {
-      const option = element("option", "", "No preset catalog connected");
-      option.value = "";
-      this.presetSelect.append(option);
+      const option2 = element2("option", "", "No preset catalog connected");
+      option2.value = "";
+      this.presetSelect.append(option2);
     }
   }
   populateProfiles() {
     this.profileSelect.replaceChildren();
     for (const profile2 of this.profiles) {
       const postRender = profile2.availability === "post-render" || profile2.id === "minimax-review-736x416-24" || profile2.id === "archive-lossless-736x416-24" || profile2.id === "exact2x-review" || profile2.id === "hd-delivery";
-      const option = element("option");
-      option.value = profile2.id;
-      option.disabled = postRender;
-      option.textContent = `${profile2.label} \u2014 ${profile2.width}\xD7${profile2.height} / ${profile2.fpsNum} fps${profile2.authority ? " \xB7 AUTHORITY" : ""}${postRender ? " \xB7 CLI ONLY" : ""}`;
-      this.profileSelect.append(option);
+      const option2 = element2("option");
+      option2.value = profile2.id;
+      option2.disabled = postRender;
+      option2.textContent = `${profile2.label} \u2014 ${profile2.width}\xD7${profile2.height} / ${profile2.fpsNum} fps${profile2.authority ? " \xB7 AUTHORITY" : ""}${postRender ? " \xB7 CLI ONLY" : ""}`;
+      this.profileSelect.append(option2);
     }
   }
   bind() {
@@ -19599,7 +22289,8 @@ var Studio = class {
     for (const button of this.root.querySelectorAll("[data-mode]")) button.addEventListener("click", () => this.setDraft({ mode: button.dataset.mode }));
     this.presetSelect.addEventListener("change", () => {
       const [kind, ...id] = this.presetSelect.value.split(":");
-      this.setDraft({ presetKind: kind === "aaavs" ? "aaavs" : "bundled", presetId: id.join(":") || null, customPresetFile: null });
+      const presetKind = kind === "local" || kind === "personal" || kind === "aaavs" ? kind : "bundled";
+      this.setDraft({ presetKind, presetId: id.join(":") || null, customPresetFile: null });
     });
     this.profileSelect.addEventListener("change", () => this.setDraft({ profileId: this.profileSelect.value }));
     this.bindNumber("seed", (value) => this.setDraft({ seed: Math.max(0, Math.floor(value ?? 1)) }));
@@ -19758,9 +22449,9 @@ var Studio = class {
       button.classList.toggle("is-active", active);
       button.setAttribute("aria-pressed", String(active));
     }
-    this.presetSelect.disabled = this.draft.mode === "auto";
+    this.presetSelect.disabled = false;
     const selectedValue = this.draft.presetId ? `${this.draft.presetKind}:${this.draft.presetId}` : "";
-    if ([...this.presetSelect.options].some((option) => option.value === selectedValue)) this.presetSelect.value = selectedValue;
+    if ([...this.presetSelect.options].some((option2) => option2.value === selectedValue)) this.presetSelect.value = selectedValue;
     this.customPresetName.textContent = this.draft.customPresetFile?.name ?? "No custom preset";
     this.customPresetName.classList.toggle("is-loaded", !!this.draft.customPresetFile);
     this.need('input[data-field="seed"]').value = String(this.draft.seed);
@@ -19790,11 +22481,11 @@ var Studio = class {
     const checks = this.state.validation.length ? this.state.validation : this.defaultValidation();
     this.validationList.replaceChildren();
     for (const check of checks) {
-      const row = element("li", `is-${check.status}`);
-      const mark = element("span", "offline-validation-mark", check.status === "passed" ? "\u2713" : check.status === "failed" ? "\xD7" : check.status === "warning" ? "!" : check.status === "working" ? "\u21BB" : "\xB7");
-      const copy = element("div");
-      copy.append(element("strong", "", check.label));
-      if (check.detail) copy.append(element("small", "", check.detail));
+      const row = element2("li", `is-${check.status}`);
+      const mark = element2("span", "offline-validation-mark", check.status === "passed" ? "\u2713" : check.status === "failed" ? "\xD7" : check.status === "warning" ? "!" : check.status === "working" ? "\u21BB" : "\xB7");
+      const copy = element2("div");
+      copy.append(element2("strong", "", check.label));
+      if (check.detail) copy.append(element2("small", "", check.detail));
       row.append(mark, copy);
       this.validationList.append(row);
     }
@@ -19821,8 +22512,8 @@ var Studio = class {
     this.pauseButton.textContent = status === "paused" ? "Resume" : "Pause";
     this.cancelButton.disabled = !running;
     const frame2 = Math.min(progress.completedFrames, Math.max(0, progress.totalFrames - 1));
-    const sample2 = Math.floor(frame2 * this.samplesPerFrame(this.activeProfile()));
-    this.previewFrame.textContent = `F ${String(frame2).padStart(6, "0")} \xB7 S ${String(sample2).padStart(9, "0")}`;
+    const sample = Math.floor(frame2 * this.samplesPerFrame(this.activeProfile()));
+    this.previewFrame.textContent = `F ${String(frame2).padStart(6, "0")} \xB7 S ${String(sample).padStart(9, "0")}`;
   }
   renderResult() {
     const result = this.state.result;
@@ -19923,9 +22614,9 @@ var Studio = class {
       if (cellW > 34) {
         ctx.fillStyle = selected ? "#f4fbff" : "#8195a3";
         ctx.fillText(`F${String(frame2).padStart(4, "0")}`, x + 5, stripY + 13);
-        const sample2 = Math.floor(frame2 * this.samplesPerFrame(profile2));
+        const sample = Math.floor(frame2 * this.samplesPerFrame(profile2));
         ctx.fillStyle = selected ? "#42d8ee" : "#526875";
-        ctx.fillText(`S${sample2}`, x + 5, stripY + 29);
+        ctx.fillText(`S${sample}`, x + 5, stripY + 29);
       }
     }
     ctx.fillStyle = "#68808d";
@@ -19944,9 +22635,9 @@ var Studio = class {
     if (!profile2 || total <= 0) return;
     const rect = this.timelineCanvas.getBoundingClientRect();
     const frame2 = Math.min(total - 1, Math.max(0, Math.floor((event.clientX - rect.left) / rect.width * total)));
-    const sample2 = Math.floor(frame2 * this.samplesPerFrame(profile2));
-    this.previewFrame.textContent = `F ${String(frame2).padStart(6, "0")} \xB7 S ${String(sample2).padStart(9, "0")}`;
-    await this.options.onSeekPreview?.(frame2, sample2);
+    const sample = Math.floor(frame2 * this.samplesPerFrame(profile2));
+    this.previewFrame.textContent = `F ${String(frame2).padStart(6, "0")} \xB7 S ${String(sample).padStart(9, "0")}`;
+    await this.options.onSeekPreview?.(frame2, sample);
   }
   trapFocus(event) {
     const focusable = [...this.root.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex="0"]')].filter((node) => node.offsetParent !== null);
@@ -19973,13 +22664,9 @@ function createBrowserOfflineStudio() {
   let client = null;
   let previewAt = 0;
   let outputDirectory = null;
+  let disposed = false;
   const studio = createOfflineStudio({
-    presets: BUNDLED_AVS_PRESETS.map((preset2) => ({
-      id: preset2.id,
-      name: preset2.name,
-      collection: preset2.collection,
-      kind: "bundled"
-    })),
+    presets: [],
     profiles: OUTPUT_PROFILES.map((profile2) => ({
       id: profile2.id,
       label: profile2.label,
@@ -19993,7 +22680,7 @@ function createBrowserOfflineStudio() {
     })),
     async onAnalyzeTrack(file) {
       studio.setState({ status: "analyzing", error: null });
-      const sourceSha256 = await sha256Hex(file);
+      const sourceSha256 = await sha256Hex3(file);
       const context = new AudioContext({ sampleRate: 48e3 });
       try {
         const decoded = await context.decodeAudioData(await file.arrayBuffer());
@@ -20028,17 +22715,22 @@ function createBrowserOfflineStudio() {
       }
       outputDirectory = draft.outputDirectoryHandle;
       studio.appendLog("Freezing timeline, events, anchors and preset schedule");
+      const sourceId = selectedSourceId(draft);
+      const availableEntries = draft.customPresetFile ? Object.freeze([]) : draft.mode === "auto" ? await AVS_PRESET_SOURCES.autoBank(sourceId) : Object.freeze([await AVS_PRESET_SOURCES.require(sourceId, draft.presetId ?? "")]);
+      if (draft.mode === "auto" && availableEntries.length === 0) {
+        throw new Error(`${sourceId} has no compatible AVS presets available for automatic rendering.`);
+      }
       session = prepareOfflineRender(analysisBuffer, {
         profileId: draft.profileId,
         mode: draft.mode,
-        ...draft.mode === "preset" ? { presetId: selectedPresetId(draft) } : {},
-        ...draft.mode === "auto" ? { availablePresetIds: BUNDLED_AVS_PRESETS.map((preset2) => preset2.id) } : {},
+        ...draft.mode === "preset" ? { presetId: selectedPresetId(draft, availableEntries[0]) } : {},
+        ...draft.mode === "auto" ? { availablePresetIds: availableEntries.map((preset2) => preset2.ledgerId) } : {},
         seed: draft.seed,
         bpm: draft.bpm,
         meter: draft.meter,
         downbeatSample: draft.downbeatSample
       });
-      const prepared = await preparePresets(session, draft);
+      const prepared = await preparePresets(session, draft, availableEntries);
       const pcm = planarCopy(analysisBuffer);
       const profile2 = session.plan.profile;
       const workerInput = {
@@ -20098,13 +22790,13 @@ function createBrowserOfflineStudio() {
           bundleSha256,
           userAgent: navigator.userAgent
         }, writer.hashes);
-        const presetAuthoritySha256 = draft.mode === "preset" ? prepared.bank.find((entry) => entry.presetId === boundPlan.schedule.entries[0].presetId).presetSha256 : await sha256Hex(JSON.stringify(boundPlan.schedule));
+        const presetAuthoritySha256 = draft.mode === "preset" ? prepared.bank.find((entry) => entry.presetId === boundPlan.schedule.entries[0].presetId).presetSha256 : await sha256Hex3(JSON.stringify(boundPlan.schedule));
         await writer.finalize(Object.freeze({
           ...manifest,
           preset_authority: Object.freeze({ ...manifest.preset_authority, sha256: presetAuthoritySha256 })
         }));
         const manifestFile = await outputDirectory.getFileHandle(OFFLINE_PACKAGE_NAMES.manifest).then((handle) => handle.getFile());
-        const manifestSha256 = await sha256Hex(manifestFile);
+        const manifestSha256 = await sha256Hex3(manifestFile);
         const elapsedSeconds = (performance.now() - startedAt) / 1e3;
         studio.updateProgress({
           stage: "Validated package complete",
@@ -20161,9 +22853,32 @@ function createBrowserOfflineStudio() {
       if (outputDirectory) await showPreview(outputDirectory, frame2, studio.previewCanvas);
     }
   });
+  const refreshPresetCatalogs = async () => {
+    const snapshots = await AVS_PRESET_SOURCES.snapshots();
+    if (disposed) return;
+    for (const snapshot2 of snapshots) {
+      if (snapshot2.error) studio.appendLog(`${snapshot2.label} unavailable: ${snapshot2.error}`, "warning");
+    }
+    studio.setPresets(snapshots.flatMap((snapshot2) => snapshot2.entries.map((preset2) => ({
+      id: preset2.id,
+      name: preset2.name,
+      collection: snapshot2.label,
+      kind: preset2.sourceId,
+      available: preset2.autoEligible !== false,
+      unavailableReason: preset2.unavailableReason
+    }))));
+    const total = snapshots.reduce((sum, snapshot2) => sum + snapshot2.entries.length, 0);
+    studio.appendLog(`${total.toLocaleString()} AVS presets indexed from shared live/offline sources`, "success");
+  };
+  const unsubscribe = AVS_PRESET_SOURCES.subscribe((sourceId) => {
+    if (sourceId === void 0 || sourceId === "local" || sourceId === "personal") void refreshPresetCatalogs();
+  });
+  void refreshPresetCatalogs();
   return {
     studio,
     dispose() {
+      disposed = true;
+      unsubscribe();
       client?.dispose();
       studio.dispose();
     }
@@ -20172,7 +22887,7 @@ function createBrowserOfflineStudio() {
 function isDirectoryHandle(value) {
   return typeof value === "object" && value !== null && "kind" in value && value.kind === "directory" && "getDirectoryHandle" in value && typeof value.getDirectoryHandle === "function" && "getFileHandle" in value && typeof value.getFileHandle === "function";
 }
-async function preparePresets(session, draft) {
+async function preparePresets(session, draft, sourceEntries) {
   const customId = draft.customPresetFile ? `custom:${draft.customPresetFile.name}` : "";
   const ids = [...new Set(session.plan.schedule.entries.map((entry) => entry.presetId))];
   const bank = [];
@@ -20180,11 +22895,11 @@ async function preparePresets(session, draft) {
     let bytes;
     if (draft.customPresetFile && id === customId) bytes = new Uint8Array(await draft.customPresetFile.arrayBuffer());
     else {
-      const preset2 = BUNDLED_AVS_PRESETS.find((candidate) => candidate.id === id);
+      const preset2 = sourceEntries.find((candidate) => candidate.ledgerId === id);
       if (!preset2) throw new Error(`Offline schedule references unknown AVS preset ${id}`);
-      bytes = await fetchBundledAvsPreset(preset2);
+      bytes = await preset2.load();
     }
-    bank.push({ presetId: id, presetSha256: await sha256Hex(bytes), bytes });
+    bank.push({ presetId: id, presetSha256: await sha256Hex3(bytes), bytes });
   }
   const fps2 = session.plan.profile.fpsNumerator / session.plan.profile.fpsDenominator;
   const cues = session.plan.schedule.entries.map((entry, index) => ({
@@ -20195,10 +22910,13 @@ async function preparePresets(session, draft) {
   }));
   return { bank, cues };
 }
-function selectedPresetId(draft) {
+function selectedPresetId(draft, preset2) {
   if (draft.customPresetFile) return `custom:${draft.customPresetFile.name}`;
-  if (!draft.presetId) throw new Error("Choose an AVS preset for fixed mode.");
-  return draft.presetId;
+  if (!preset2) throw new Error("Choose an AVS preset for fixed mode.");
+  return preset2.ledgerId;
+}
+function selectedSourceId(draft) {
+  return draft.presetKind === "local" || draft.presetKind === "personal" ? draft.presetKind : "bundled";
 }
 function planarCopy(buffer) {
   const left = new Float32Array(buffer.totalSamplesPerChannel);
@@ -20213,8 +22931,8 @@ function overviewWaveform(buffer, points = 2048) {
     const start = Math.floor(i * span);
     const end = Math.max(start + 1, Math.floor((i + 1) * span));
     let peak = 0;
-    for (let sample2 = start; sample2 < end; sample2++) {
-      peak = Math.max(peak, Math.abs(buffer.sample(0, sample2)), Math.abs(buffer.sample(1, sample2)));
+    for (let sample = start; sample < end; sample++) {
+      peak = Math.max(peak, Math.abs(buffer.sample(0, sample)), Math.abs(buffer.sample(1, sample)));
     }
     output[i] = peak;
   }
@@ -20234,7 +22952,7 @@ async function showPreview(directory, frame2, canvas2) {
 async function currentOfflineWorkerSha256() {
   const response = await fetch(new URL("./offline-render.worker.js", import.meta.url));
   if (!response.ok) throw new Error(`Could not hash offline renderer bundle: HTTP ${response.status}`);
-  return sha256Hex(await response.blob());
+  return sha256Hex3(await response.blob());
 }
 function profilePurpose(kind) {
   switch (kind) {
@@ -20369,6 +23087,9 @@ function resetSeekDependentState(now) {
   lastPoll = now;
   stats.scheduledEvents = 0;
   stats.lateBy = 0;
+  if (activeAvsCatalogId && (avsEditorModel !== null || avsWorkerRenderer?.active || avsRuntime !== null)) {
+    avsLiveDirector.select(activeAvsCatalogId, avsBarPosition(now));
+  }
 }
 async function toggleTransport() {
   if (!audio.canTransport) return;
@@ -20622,6 +23343,15 @@ var transition = new Transition();
 var outgoingFrame = null;
 var captureOutgoing = false;
 function applyPreset(next, spec, now = 0, bpm = 120) {
+  avsLoadRevision++;
+  avsLiveLoadGuard.supersede();
+  avsEditor?.dispose();
+  avsEditor = null;
+  avsEditorHost = null;
+  avsEditorModel = null;
+  avsControls.clear();
+  ui?.setLayerEditor(null);
+  ui?.setPersonalAvsCanAdd(false);
   avsWorkerRenderer?.clear();
   avsRuntime = null;
   avsPresetName = "";
@@ -20683,12 +23413,107 @@ var avsImageWords = null;
 var avsLastRenderMs = 0;
 var avsWorkerFrameReady = false;
 var avsWorkerRenderer = createAvsWorkerRenderer();
+var avsEditor = null;
+var avsEditorHost = null;
+var avsEditorModel = null;
+var avsEditorFileName = "";
+var avsControls = /* @__PURE__ */ new Map();
+var avsCapabilityRegistry = createAvsCompatibilityRegistry();
+var avsLoadRevision = 0;
+var bundledAvsLiveBank = await AVS_PRESET_SOURCES.list("bundled");
+var localAvsLiveBank = [];
+var personalAvsPresets = [];
+var personalAvsLiveBank = [];
+var activeAvsLiveBank = bundledAvsLiveBank;
+var activeAvsCatalogId = "";
+var avsLiveLoadGuard = new AvsLiveLoadGuard();
+async function ensureLocalAvsCatalog() {
+  if (localAvsLiveBank.length) return localAvsLiveBank;
+  localAvsLiveBank = await AVS_PRESET_SOURCES.autoBank("local");
+  return localAvsLiveBank;
+}
+async function refreshPersonalAvsBank(updateUi) {
+  try {
+    personalAvsPresets = await AVS_PRESET_SOURCES.list("personal");
+  } catch (error) {
+    personalAvsPresets = [];
+    console.warn("[aaavs] personal AVS bank unavailable:", error);
+  }
+  personalAvsLiveBank = personalAvsPresets;
+  if (updateUi) ui.setPersonalAvsPresets(personalAvsPresets);
+}
+function avsBarPosition(at = audio.currentTime) {
+  const trackedBpm = timeline.bpm(at);
+  return resolveAvsLiveBarPosition(
+    timeline.slotAt(at) / SLOTS_PER_BEAT / 4,
+    trackedBpm,
+    at,
+    resolveTempoBpm(trackedBpm, tempo.bpm)
+  );
+}
+function avsLiveBankKind(bank) {
+  if (bank === bundledAvsLiveBank) return "bundled";
+  if (bank === localAvsLiveBank) return "local";
+  if (bank === personalAvsLiveBank) return "personal";
+  return "external";
+}
+async function loadAvsCatalogEntry(entry, bank, selectionPending = false) {
+  if (!selectionPending && activeAvsCatalogId) {
+    avsLiveDirector.select(activeAvsCatalogId, avsBarPosition());
+  }
+  const ticket = avsLiveLoadGuard.begin();
+  const revision = ++avsLoadRevision;
+  try {
+    const bytes = await entry.load();
+    if (!avsLiveLoadGuard.isCurrent(ticket) || revision !== avsLoadRevision) return;
+    const loaded = await loadAvsPreset(bytes, entry.fileName, false, revision);
+    if (!loaded || !avsLiveLoadGuard.isCurrent(ticket) || revision !== avsLoadRevision) return;
+    const bankChanged = activeAvsLiveBank !== bank;
+    activeAvsLiveBank = bank;
+    activeAvsCatalogId = entry.id;
+    if (bankChanged) avsLiveDirector.setBank(bank, entry.id, avsBarPosition());
+    else if (selectionPending) avsLiveDirector.commit(entry.id, avsBarPosition());
+    else avsLiveDirector.select(entry.id, avsBarPosition());
+    if (bank.length < 2) avsLiveDirector.enabled = false;
+    ui.setAuto(avsLiveDirector.enabled);
+    ui.setAvsPresetSelection(entry.id, avsLiveBankKind(bank));
+  } catch (error) {
+    if (selectionPending && avsLiveLoadGuard.isCurrent(ticket)) {
+      avsLiveDirector.cancel(entry.id, avsBarPosition());
+    }
+    throw error;
+  } finally {
+    avsLiveLoadGuard.finish(ticket);
+  }
+}
+async function addCurrentAvsToPersonalBank() {
+  if (!avsEditorModel) throw new Error("Load an AVS preset before adding it to My AVS bank");
+  const bytes = serializeAvsEditorModel(avsEditorModel);
+  const name = avsEditorFileName.replace(/\.avs$/i, "") || "Edited AVS preset";
+  await PERSONAL_AVS_BANK.put(name, bytes, `${name}.avs`);
+  AVS_PRESET_SOURCES.invalidate("personal");
+  await refreshPersonalAvsBank(true);
+}
+async function exportPersonalAvsBank() {
+  const blob = await PERSONAL_AVS_BANK.exportBlob();
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = "aaavs-personal-avs-bank.json";
+  link.click();
+  requestAnimationFrame(() => URL.revokeObjectURL(link.href));
+}
+async function importPersonalAvsBank(file) {
+  await PERSONAL_AVS_BANK.importFile(file);
+  AVS_PRESET_SOURCES.invalidate("personal");
+  await refreshPersonalAvsBank(true);
+}
 function createAvsWorkerRenderer() {
   if (!AvsWorkerRenderer.supported() || !avsContext) return null;
   try {
     return new AvsWorkerRenderer({
       canvas: avsCanvas,
       context: avsContext,
+      gpuLane: "120",
       onFrame() {
         avsWorkerFrameReady = true;
         if (!avsWorkerRenderer) return;
@@ -20714,32 +23539,52 @@ function syncAvsSurface() {
     avsImageWords = null;
   }
 }
-async function loadAvsPreset(bytes, fileName) {
+async function loadAvsPreset(bytes, fileName, preserveControls = false, requestedRevision) {
+  const loadRevision = requestedRevision ?? ++avsLoadRevision;
+  if (loadRevision !== avsLoadRevision) return false;
   avsGovernor.reset();
   const { width, height } = avsGovernor.dimensions(gpu.width, gpu.height);
+  const parsed = parseAvsPreset(bytes);
+  const nextEditorModel = createAvsEditorModel(parsed);
+  if (!preserveControls) avsControls.clear();
   avsRuntime = null;
   avsWorkerFrameReady = false;
-  if (avsWorkerRenderer) {
+  const worker = avsWorkerRenderer;
+  if (worker) {
     try {
-      await avsWorkerRenderer.load(bytes, width, height);
-      avsUnsupported = avsWorkerRenderer.unsupported;
+      await worker.load(bytes, width, height);
+      if (loadRevision !== avsLoadRevision || avsWorkerRenderer !== worker) return false;
+      avsUnsupported = worker.unsupported;
       avsPresetName = fileName.replace(/\.avs$/i, "");
       avsCanvas.width = width;
       avsCanvas.height = height;
       avsLastRenderMs = 0;
       avsCanvas.style.display = "block";
+      avsLiveDirector.enabled ||= director.enabled;
       director.enabled = false;
-      return;
+      ui.setAuto(avsLiveDirector.enabled);
+      worker.setControls([...avsControls.values()]);
+      avsEditorModel = nextEditorModel;
+      avsEditorFileName = fileName;
+      activateAvsEditor(parsed, fileName, preserveControls);
+      return true;
     } catch (error) {
+      if (loadRevision !== avsLoadRevision || avsWorkerRenderer !== worker) return false;
+      if (error instanceof Error && error.message === "AVS preset load superseded") return false;
       console.warn("[aaavs] worker renderer unavailable, using main-thread fallback:", error);
-      avsWorkerRenderer.dispose();
-      avsWorkerRenderer = null;
+      worker.dispose();
+      if (avsWorkerRenderer === worker) avsWorkerRenderer = null;
     }
   }
   const bitmapResolver = await loadBundledAvsBitmapResolver();
+  if (loadRevision !== avsLoadRevision) return false;
   const registry = createAvsCompatibilityRegistry({}, { bitmapResolver });
-  avsRuntime = new AvsCompatibilityRuntime(bytes, width, height, registry);
-  avsUnsupported = avsRuntime.render(void 0, true).stats.unsupported;
+  const nextRuntime = new AvsCompatibilityRuntime(parsed, width, height, registry);
+  nextRuntime.setControls([...avsControls.values()]);
+  const warmup = nextRuntime.render(void 0, true);
+  if (loadRevision !== avsLoadRevision) return false;
+  avsRuntime = nextRuntime;
+  avsUnsupported = warmup.stats.unsupported;
   avsPresetName = fileName.replace(/\.avs$/i, "");
   avsCanvas.width = width;
   avsCanvas.height = height;
@@ -20747,7 +23592,13 @@ async function loadAvsPreset(bytes, fileName) {
   avsImageWords = null;
   avsLastRenderMs = 0;
   avsCanvas.style.display = "block";
+  avsLiveDirector.enabled ||= director.enabled;
   director.enabled = false;
+  ui.setAuto(avsLiveDirector.enabled);
+  avsEditorModel = nextEditorModel;
+  avsEditorFileName = fileName;
+  activateAvsEditor(parsed, fileName, preserveControls);
+  return true;
 }
 function renderAvsPreset(audioFrame, nowMs) {
   if (!avsContext) return false;
@@ -20781,6 +23632,100 @@ function renderAvsPreset(audioFrame, nowMs) {
   avsGovernor.recordRender(avsLastRenderMs);
   return true;
 }
+function avsControl(path) {
+  const current = avsControls.get(path);
+  return {
+    path,
+    enabled: current?.enabled ?? true,
+    muted: current?.muted ?? false,
+    solo: current?.solo ?? false
+  };
+}
+function setAvsControl(path, patch) {
+  const next = { ...avsControl(path), ...patch, path };
+  if (next.enabled && !next.muted && !next.solo) avsControls.delete(path);
+  else avsControls.set(path, next);
+  const controls = [...avsControls.values()];
+  if (avsWorkerRenderer?.active) avsWorkerRenderer.setControls(controls);
+  else avsRuntime?.setControls(controls);
+  avsEditor?.refresh();
+}
+function avsNodeState(component, path) {
+  const control = avsControl(path);
+  return {
+    enabled: (component.list?.enabled ?? true) && control.enabled,
+    muted: control.muted,
+    soloed: control.solo,
+    supported: component.list !== null || avsCapabilityRegistry.handler(component) !== void 0
+  };
+}
+function activateAvsEditor(parsed, fileName, preserveView) {
+  ui.setPersonalAvsCanAdd(true);
+  if (preserveView && avsEditor) {
+    avsEditor.setPreset(parsed, fileName.replace(/\.avs$/i, ""));
+    return;
+  }
+  showAvsEditor(parsed, fileName);
+}
+function showAvsEditor(parsed, fileName) {
+  avsEditor?.dispose();
+  avsEditorHost = document.createElement("div");
+  avsEditorHost.className = "ui-avs-editor-host";
+  ui.setLayerEditor(avsEditorHost);
+  avsEditor = new AvsEditor({
+    host: avsEditorHost,
+    preset: parsed,
+    presetName: fileName.replace(/\.avs$/i, ""),
+    getNodeState: avsNodeState,
+    onSetEnabled: async (component, path, enabled) => {
+      if (component.list && avsEditorModel) {
+        avsEditorModel = setAvsEditorNodeEnabled(avsEditorModel, path, enabled);
+        await loadAvsPreset(serializeAvsEditorModel(avsEditorModel), avsEditorFileName, true);
+        return;
+      }
+      setAvsControl(path, { enabled });
+    },
+    onSetMuted: (_component, path, muted) => setAvsControl(path, { muted }),
+    onSetSoloed: (_component, path, solo) => setAvsControl(path, { solo }),
+    onMove: async (_component, path, parentPath, direction) => {
+      if (!avsEditorModel) return;
+      const siblings = parentPath === null ? avsEditorModel.nodes : findAvsEditorNode(avsEditorModel, parentPath)?.children ?? [];
+      const from = siblings.findIndex((node) => node.path === path);
+      const to = from + direction;
+      if (from < 0 || to < 0 || to >= siblings.length) return;
+      const order = siblings.map((node) => node.path);
+      [order[from], order[to]] = [order[to], order[from]];
+      avsEditorModel = reorderAvsEditorChildren(avsEditorModel, parentPath, order);
+      avsControls.clear();
+      await loadAvsPreset(serializeAvsEditorModel(avsEditorModel), avsEditorFileName, true);
+    },
+    onSave: saveAvsEditorPreset,
+    onAddToBank: addCurrentAvsToPersonalBank,
+    onPatchPayload: async (_component, path, payload) => {
+      if (!avsEditorModel) return;
+      avsEditorModel = patchAvsEditorNodePayload(avsEditorModel, path, payload);
+      await loadAvsPreset(serializeAvsEditorModel(avsEditorModel), avsEditorFileName, true);
+    },
+    onPatchFields: async (_component, path, patch) => {
+      if (!avsEditorModel) return;
+      avsEditorModel = patchAvsEditorNodeFields(avsEditorModel, path, patch);
+      await loadAvsPreset(serializeAvsEditorModel(avsEditorModel), avsEditorFileName, true);
+    },
+    onError: (error) => console.error("[aaavs] AVS editor action failed:", error)
+  });
+}
+function saveAvsEditorPreset() {
+  if (!avsEditorModel) return;
+  const bytes = serializeAvsEditorModel(avsEditorModel);
+  const sourceName = avsEditorFileName.replace(/\.avs$/i, "") || "preset";
+  const safeName = sourceName.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_");
+  const link = document.createElement("a");
+  const data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  link.href = URL.createObjectURL(new Blob([data], { type: "application/octet-stream" }));
+  link.download = `${safeName}.edited.avs`;
+  link.click();
+  requestAnimationFrame(() => URL.revokeObjectURL(link.href));
+}
 var presentPipeline = createFullscreenPipeline(gpu, "present", present_default, gpu.swapFormat);
 var postParams = device.createBuffer({
   label: "post-params",
@@ -20812,20 +23757,21 @@ if (!golden) {
     presentBinds.clear();
   });
 }
+if (!golden) await refreshPersonalAvsBank(false);
 var ui = new LayerUI({
   stack,
   preset,
   registry: renderer.types,
-  presets: PRESET_BANK.map((e) => ({ name: e.preset.name })),
-  avsPresets: BUNDLED_AVS_PRESETS.map(({ id, name, collection }) => ({ id, name, collection })),
-  onPickPreset(name) {
-    const i = PRESET_BANK.findIndex((e) => e.preset.name === name);
-    if (i < 0) return;
-    const c = director.step(i - director.currentIndex, audio.currentTime);
-    applyPreset(c.preset, c.transition, audio.currentTime, timeline.bpm(audio.currentTime) || 120);
-  },
+  avsPresets: bundledAvsLiveBank.map(({ id, name, collection }) => ({ id, name, collection })),
   onAutoChange(on) {
-    director.enabled = on;
+    const avsActive = avsEditorModel !== null || avsWorkerRenderer?.active || avsRuntime !== null;
+    avsLiveDirector.enabled = avsActive && on && activeAvsLiveBank.length > 1;
+    director.enabled = !avsActive && on;
+    if (avsLiveDirector.enabled && activeAvsCatalogId) {
+      const frame2 = snapshot(audio.currentTime);
+      avsLiveDirector.select(activeAvsCatalogId, avsBarPosition(), Math.max(frame2.level, frame2.beat));
+    }
+    ui.setAuto(avsActive ? avsLiveDirector.enabled : director.enabled);
   },
   async onTogglePlayback() {
     await toggleTransport();
@@ -20834,10 +23780,22 @@ var ui = new LayerUI({
     skipBar(direction);
   },
   onLoadPreset(next) {
+    avsLoadRevision++;
+    avsLiveLoadGuard.supersede();
+    avsEditor?.dispose();
+    avsEditor = null;
+    avsEditorHost = null;
+    avsEditorModel = null;
+    avsControls.clear();
+    ui.setLayerEditor(null);
+    ui.setPersonalAvsCanAdd(false);
     avsWorkerRenderer?.clear();
     avsRuntime = null;
     avsPresetName = "";
     avsCanvas.style.display = "none";
+    director.enabled = avsLiveDirector.enabled;
+    avsLiveDirector.enabled = false;
+    ui.setAuto(director.enabled);
     preset = next;
     stack.load(next);
     rebuildRequests();
@@ -20848,12 +23806,59 @@ var ui = new LayerUI({
     ui.setPreset(next);
   },
   async onPickAvsPreset(id) {
-    const bundled = BUNDLED_AVS_PRESETS.find((entry) => entry.id === id);
-    if (!bundled) throw new Error(`Unknown bundled AVS preset: ${id}`);
-    await loadAvsPreset(await fetchBundledAvsPreset(bundled), bundled.fileName);
+    const entry = bundledAvsLiveBank.find((candidate) => candidate.id === id);
+    if (!entry) throw new Error(`Unknown bundled AVS preset: ${id}`);
+    await loadAvsCatalogEntry(entry, bundledAvsLiveBank);
   },
+  ...loopbackTestHost ? {
+    async onRequestLocalAvsPresets() {
+      const catalog = await AVS_PRESET_SOURCES.list("local");
+      await ensureLocalAvsCatalog();
+      return catalog.map(({ id, name, autoEligible }) => ({
+        id,
+        name: `${name}${autoEligible === false ? " \xB7 unavailable" : ""}`
+      }));
+    },
+    async onPickLocalAvsPreset(id) {
+      await ensureLocalAvsCatalog();
+      const entry = await AVS_PRESET_SOURCES.require("local", id);
+      if (entry.autoEligible === false) throw new Error(`${entry.name} is unavailable: ${entry.unavailableReason ?? "parser rejected this preset"}`);
+      await loadAvsCatalogEntry(entry, localAvsLiveBank);
+    }
+  } : {},
+  personalAvsPresets,
+  onAddPersonalAvsPreset: addCurrentAvsToPersonalBank,
+  async onPickPersonalAvsPreset(id) {
+    const entry = personalAvsLiveBank.find((candidate) => candidate.id === id);
+    if (!entry) throw new Error(`Unknown personal AVS preset: ${id}`);
+    await loadAvsCatalogEntry(entry, personalAvsLiveBank);
+  },
+  async onRemovePersonalAvsPreset(id) {
+    const wasPersonalBank = activeAvsLiveBank === personalAvsLiveBank;
+    const removedActivePreset = wasPersonalBank && activeAvsCatalogId === id;
+    await PERSONAL_AVS_BANK.remove(id);
+    AVS_PRESET_SOURCES.invalidate("personal");
+    await refreshPersonalAvsBank(true);
+    if (removedActivePreset) {
+      const replacementBank = personalAvsLiveBank.length ? personalAvsLiveBank : bundledAvsLiveBank;
+      const replacement = replacementBank[0];
+      if (replacement) await loadAvsCatalogEntry(replacement, replacementBank);
+    } else if (wasPersonalBank) {
+      avsLiveDirector.setBank(personalAvsLiveBank, activeAvsCatalogId, avsBarPosition());
+      ui.setAvsPresetSelection(activeAvsCatalogId, "personal");
+    }
+  },
+  onImportPersonalAvsBank: importPersonalAvsBank,
+  onExportPersonalAvsBank: exportPersonalAvsBank,
   async onLoadAvsPreset(bytes, fileName) {
-    await loadAvsPreset(bytes, fileName);
+    const data = bytes.slice();
+    const entry = {
+      id: `import:${fileName}:${data.byteLength}`,
+      name: fileName.replace(/\.avs$/i, ""),
+      fileName,
+      load: async () => data.slice()
+    };
+    await loadAvsCatalogEntry(entry, [entry]);
   },
   // Fires on EVERY edit, including each step of a slider drag, so it must not do
   // per-edit work. `prune` clears the whole bind-group cache, which is a frame
@@ -20869,6 +23874,24 @@ var ui = new LayerUI({
   // UI test, which needs the production layout visibly open for page capture.
   open: !golden || uiTest
 });
+var avsLiveDirector = new AvsLiveDirector();
+avsLiveDirector.setBank(bundledAvsLiveBank, "", avsBarPosition());
+var useNativeProbeSurface = golden || transitionTest || Boolean(
+  ledStyleTest || presetTest || sourceTest || operatorTest || uiTest
+);
+if (!useNativeProbeSurface) {
+  const initialAvsPreset = bundledAvsLiveBank.find((entry) => entry.name === "UnConeD - Neon Coaster") ?? bundledAvsLiveBank[0];
+  const loading = document.createElement("div");
+  loading.className = "ui-avs-loading";
+  loading.textContent = initialAvsPreset ? `loading ${initialAvsPreset.name}\u2026` : "no AVS presets available";
+  ui.setLayerEditor(loading);
+  if (initialAvsPreset) {
+    void loadAvsCatalogEntry(initialAvsPreset, bundledAvsLiveBank).catch((error) => {
+      loading.classList.add("is-error");
+      loading.textContent = `AVS preset failed to load: ${String(error)}`;
+    });
+  }
+}
 var offline = golden ? null : createBrowserOfflineStudio();
 var offlineLauncher = offline ? document.createElement("button") : null;
 if (offlineLauncher && offline) {
@@ -20902,16 +23925,19 @@ var fps = 0;
 var frameCount = 0;
 var peakLevel = 0;
 function snapshot(t) {
+  const realtime = detector.attached ? detector.features : null;
   return {
     time: t,
-    level: audio.level,
+    level: realtime?.level ?? audio.level,
     beat: detector.attached ? detector.beat : audio.beat,
-    bands: audio.bands,
-    pan: audio.pan,
-    width: audio.width,
-    crest: audio.crest,
-    centroid: audio.centroid,
-    flatness: audio.flatness,
+    bands: realtime?.bands ?? audio.bands,
+    pan: realtime?.pan ?? audio.pan,
+    width: realtime?.width ?? audio.width,
+    crest: realtime?.crest ?? audio.crest,
+    centroid: realtime?.centroid ?? audio.centroid,
+    flatness: realtime?.flatness ?? audio.flatness,
+    perceptualBands: realtime?.perceptualBands ?? audio.perceptualBands,
+    perceptualFlux: realtime?.perceptualFlux ?? audio.perceptualFlux,
     waveform: audio.waveform,
     spectrum: audio.spectrum,
     bandPan: audio.bandPan,
@@ -20988,7 +24014,7 @@ function renderFrame(nowMs) {
   }
   tierB.update(t);
   const tlBpm = timeline.bpm(t);
-  const bpm = tlBpm > 0 ? tlBpm : 120;
+  const bpm = resolveTempoBpm(tlBpm, tempo.bpm);
   const transportDt = audio.isPaused && !harness ? 0 : dt;
   const dBeats = transportDt / (60 / bpm);
   director.outputLatency = scheduler.outputLatency;
@@ -20998,8 +24024,21 @@ function renderFrame(nowMs) {
     outgoingFrame = null;
   }
   {
-    const change = director.update(timeline, t, a.level, a.beat);
-    if (change) applyPreset(change.preset, change.transition, t, bpm);
+    const avsActive = avsEditorModel !== null || avsWorkerRenderer?.active || avsRuntime !== null;
+    if (avsActive) {
+      if (!avsLiveLoadGuard.busy) {
+        const selected = avsLiveDirector.update(avsBarPosition(t), a.level, a.beat);
+        const entry = selected && activeAvsLiveBank.find((candidate) => candidate.id === selected.id);
+        if (entry) {
+          void loadAvsCatalogEntry(entry, activeAvsLiveBank, true).catch((error) => {
+            console.error("[aaavs] responsive AVS auto switch failed:", error);
+          });
+        }
+      }
+    } else {
+      const change = director.update(timeline, t, a.level, a.beat);
+      if (change) applyPreset(change.preset, change.transition, t, bpm);
+    }
   }
   if (transitionTest && frameCount === 108) {
     applyPreset(PRESET_BANK[1].preset, { kind: "crossfade", beats: 8, curve: "equalPower" }, t, bpm);
@@ -21089,7 +24128,7 @@ function updateHud(t, bpm) {
   const avsActive = Boolean(avsWorkerRenderer?.active || avsRuntime);
   const avsWidth = avsWorkerRenderer?.active ? avsCanvas.width : avsRuntime?.framebuffer.width;
   const avsHeight = avsWorkerRenderer?.active ? avsCanvas.height : avsRuntime?.framebuffer.height;
-  const lock = tempo.locked ? `${tempo.bpm.toFixed(1)} BPM \xB7 ${timeline.confidence * 100 | 0}%` : `listening\u2026 (assuming ${bpm})`;
+  const lock = tempo.locked ? `${tempo.bpm.toFixed(1)} BPM \xB7 ${timeline.confidence * 100 | 0}%` : tempo.bpm > 0 ? `${tempo.bpm.toFixed(1)} BPM \xB7 reacquiring beat phase` : `listening\u2026 (assuming ${bpm})`;
   const det = detector.attached ? `worklet \xB7 ring ${ringAvailable()} \xB7 dropped ${detector.dropped}` : detectorError ? "rAF fallback (worklet failed)" : "rAF (worklet not attached)";
   const bold = (value) => {
     const node = document.createElement("b");
@@ -21102,9 +24141,9 @@ function updateHud(t, bpm) {
       ` \xB7 ${avsActive ? `${avsWidth}\xD7${avsHeight} AVS` : `${gpu.width}\xD7${gpu.height}`}`,
       ...harness ? [" \xB7 ", bold("GOLDEN")] : []
     ],
-    ["preset ", bold(avsActive ? `${avsPresetName} (AVS compatibility)` : preset.name), ` \xB7 ${avsActive ? "legacy ordered graph" : `${stack.length} layers`} \xB7 auto `, bold(director.enabled ? "on" : "off"), ` (${director.dynamic ? `${director.minBars}\u2013${director.maxBars}bar responsive` : `${director.every}bar`})`],
+    ["preset ", bold(avsActive ? `${avsPresetName} (AVS compatibility)` : preset.name), ` \xB7 ${avsActive ? "legacy ordered graph" : `${stack.length} layers`} \xB7 auto `, bold((avsActive ? avsLiveDirector.enabled : director.enabled) ? "on" : "off"), ` (${director.dynamic ? `${director.minBars}\u2013${director.maxBars}bar responsive` : `${director.every}bar`})`],
     ...avsActive ? [[
-      `AVS ${avsLastRenderMs.toFixed(1)}ms \xB7 ${avsWorkerRenderer?.active ? `${avsWorkerRenderer.presenter} \xB7 present ${avsWorkerRenderer.lastPresentMs.toFixed(2)}ms \xB7 full quality` : `fallback quality ${avsGovernor.qualityIndex + 1}/${AVS_QUALITY_TIERS.length}`} \xB7 unsupported records `,
+      `AVS ${avsLastRenderMs.toFixed(1)}ms \xB7 ${avsWorkerRenderer?.active ? `${avsWorkerRenderer.presenter} \xB7 GPU effects ${avsWorkerRenderer.gpuEffectPasses} \xB7 present ${avsWorkerRenderer.lastPresentMs.toFixed(2)}ms \xB7 full quality` : `CPU fallback \xB7 quality ${avsGovernor.qualityIndex + 1}/${AVS_QUALITY_TIERS.length}`} \xB7 unsupported records `,
       bold(avsUnsupported)
     ]] : [],
     ["tempo ", bold(lock), ` \xB7 horizon ${timeline.horizonSec.toFixed(2)}s`],
@@ -21148,7 +24187,11 @@ var avsCompatibilityDiagnostics = {
       effectMs: avsWorkerRenderer.lastEffectMs,
       uploadMs: avsWorkerRenderer.lastUploadMs,
       encodeSubmitMs: avsWorkerRenderer.lastEncodeSubmitMs,
-      mainThreadPresentMs: avsWorkerRenderer.lastPresentMs
+      mainThreadPresentMs: avsWorkerRenderer.lastPresentMs,
+      gpuEffectPasses: avsWorkerRenderer.gpuEffectPasses,
+      gpuEffectComponents: avsWorkerRenderer.gpuEffectComponents,
+      gpuFusedPointwiseOperations: avsWorkerRenderer.gpuFusedPointwiseOperations,
+      gpuEffectPlan: avsWorkerRenderer.gpuEffectPlan
     } : {
       active: false,
       presenter: "main-thread-cpu",
@@ -21156,7 +24199,11 @@ var avsCompatibilityDiagnostics = {
       effectMs: avsLastRenderMs,
       uploadMs: 0,
       encodeSubmitMs: 0,
-      mainThreadPresentMs: 0
+      mainThreadPresentMs: 0,
+      gpuEffectPasses: 0,
+      gpuEffectComponents: 0,
+      gpuFusedPointwiseOperations: 0,
+      gpuEffectPlan: "main-thread exact CPU fallback"
     };
   }
 };
@@ -21175,7 +24222,14 @@ globalThis.__aaavs = {
   offline,
   post,
   gpu,
-  avsCompatibility: avsCompatibilityDiagnostics
+  avsCompatibility: avsCompatibilityDiagnostics,
+  avsLive: () => ({
+    ...avsLiveDirector.diagnostics(),
+    barPosition: avsBarPosition(),
+    activeCatalogId: activeAvsCatalogId,
+    activeBankSize: activeAvsLiveBank.length,
+    loadBusy: avsLiveLoadGuard.busy
+  })
 };
 function patchParams(type, patch) {
   let touched = false;
@@ -21204,7 +24258,6 @@ document.addEventListener("drop", async (e) => {
   const file = e.dataTransfer?.files?.[0];
   if (!file) return;
   $("hint").hidden = true;
-  resetTransport(0);
   try {
     await audio.loadFile(file);
   } catch (loadErr) {
@@ -21215,6 +24268,7 @@ document.addEventListener("drop", async (e) => {
     console.error("[aaavs] file load failed", loadErr);
     return;
   }
+  resetTransport(0);
   await ensureDetector();
   detector.timeOrigin = (audio.ctx?.currentTime ?? 0) - audio.currentTime;
   detector.reset();
@@ -21252,14 +24306,17 @@ window.addEventListener("keydown", (e) => {
     return;
   }
   if (offline?.studio.isOpen()) return;
-  if (e.key >= "2" && e.key <= "9") patchParams("kaleidoscope", { segments: Number(e.key) });
-  if (e.key === "1") patchParams("kaleidoscope", { segments: 0 });
-  if (e.key === "k") {
-    const mix = readParam("kaleidoscope", "mix", 0.55);
-    patchParams("kaleidoscope", { mix: mix > 0.05 ? 0 : 0.55 });
+  const avsKeyboardActive = avsEditorModel !== null || avsWorkerRenderer?.active || avsRuntime !== null;
+  if (!avsKeyboardActive) {
+    if (e.key >= "2" && e.key <= "9") patchParams("kaleidoscope", { segments: Number(e.key) });
+    if (e.key === "1") patchParams("kaleidoscope", { segments: 0 });
+    if (e.key === "k") {
+      const mix = readParam("kaleidoscope", "mix", 0.55);
+      patchParams("kaleidoscope", { mix: mix > 0.05 ? 0 : 0.55 });
+    }
+    if (e.key === "[") patchParams("feedback", { tauBeats: Math.max(0.1, readParam("feedback", "tauBeats", 1.2) - 0.15) });
+    if (e.key === "]") patchParams("feedback", { tauBeats: Math.min(8, readParam("feedback", "tauBeats", 1.2) + 0.15) });
   }
-  if (e.key === "[") patchParams("feedback", { tauBeats: Math.max(0.1, readParam("feedback", "tauBeats", 1.2) - 0.15) });
-  if (e.key === "]") patchParams("feedback", { tauBeats: Math.min(8, readParam("feedback", "tauBeats", 1.2) + 0.15) });
   if (e.key === "h") hud.hidden = !hud.hidden;
   if (e.key === "?") {
     openGuide();
@@ -21274,12 +24331,29 @@ window.addEventListener("keydown", (e) => {
     skipBar(e.key === "ArrowRight" ? 1 : -1);
   }
   if (e.key === "p") {
-    director.enabled = !director.enabled;
-    ui.setAuto(director.enabled);
+    const avsActive = avsEditorModel !== null || avsWorkerRenderer?.active || avsRuntime !== null;
+    if (avsActive) {
+      avsLiveDirector.enabled = activeAvsLiveBank.length > 1 && !avsLiveDirector.enabled;
+      if (avsLiveDirector.enabled && activeAvsCatalogId) {
+        const frame2 = snapshot(audio.currentTime);
+        avsLiveDirector.select(activeAvsCatalogId, avsBarPosition(), Math.max(frame2.level, frame2.beat));
+      }
+    } else director.enabled = !director.enabled;
+    ui.setAuto(avsActive ? avsLiveDirector.enabled : director.enabled);
   }
   if (e.key === "," || e.key === ".") {
-    const c = director.step(e.key === "." ? 1 : -1, audio.currentTime);
-    applyPreset(c.preset, c.transition, audio.currentTime, timeline.bpm(audio.currentTime) || 120);
+    const avsActive = avsEditorModel !== null || avsWorkerRenderer?.active || avsRuntime !== null;
+    if (avsActive && activeAvsLiveBank.length > 1 && !avsLiveLoadGuard.busy) {
+      const current = Math.max(0, activeAvsLiveBank.findIndex((entry2) => entry2.id === activeAvsCatalogId));
+      const offset = e.key === "." ? 1 : -1;
+      const entry = activeAvsLiveBank[(current + offset + activeAvsLiveBank.length) % activeAvsLiveBank.length];
+      void loadAvsCatalogEntry(entry, activeAvsLiveBank).catch((error) => {
+        console.error("[aaavs] manual AVS step failed:", error);
+      });
+    } else if (!avsActive) {
+      const c = director.step(e.key === "." ? 1 : -1, audio.currentTime);
+      applyPreset(c.preset, c.transition, audio.currentTime, timeline.bpm(audio.currentTime) || 120);
+    }
   }
   if (e.key === "d") overlay.toggle();
   if (e.key === "o") offline?.studio.open();

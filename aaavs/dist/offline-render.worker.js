@@ -666,44 +666,6 @@ var HELPERS = {
   },
   modulo(a, b) {
     return Math.abs(b) < Number.EPSILON ? 0 : Number.isFinite(a % b) ? a % b : 0;
-  },
-  assignment(operator, left, right) {
-    let result;
-    switch (operator) {
-      case "=":
-        result = right;
-        break;
-      case "+=":
-        result = left + right;
-        break;
-      case "-=":
-        result = left - right;
-        break;
-      case "*=":
-        result = left * right;
-        break;
-      case "/=":
-        result = this.divide(left, right);
-        break;
-      case "%=":
-        result = this.modulo(left, right);
-        break;
-      case "|=":
-        result = this.integer(left) | this.integer(right);
-        break;
-      case "&=":
-        result = this.integer(left) & this.integer(right);
-        break;
-      case "^=":
-        result = this.integer(left) ^ this.integer(right);
-        break;
-      case "**=":
-        result = Math.pow(left, right);
-        break;
-      default:
-        result = 0;
-    }
-    return this.finite(result);
   }
 };
 function compileAvsEelJit(node) {
@@ -872,7 +834,7 @@ var Builder = class {
       const rightTemp = this.store(right);
       const left = this.store(targetAccess);
       const result = this.temp();
-      this.lines.push(`const ${result}=H.assignment(${JSON.stringify(operator)},${left},${rightTemp});`);
+      this.lines.push(`const ${result}=${this.assignment(operator, left, rightTemp)};`);
       this.lines.push(`${targetAccess}=${result};`);
       return result;
     }
@@ -882,7 +844,7 @@ var Builder = class {
       const global = target.name === "gmegabuf";
       const left = this.store(`vm.readMemory(${global},${address})`);
       const result = this.temp();
-      this.lines.push(`const ${result}=H.assignment(${JSON.stringify(operator)},${left},${right});`);
+      this.lines.push(`const ${result}=${this.assignment(operator, left, right)};`);
       this.lines.push(`vm.writeMemory(${global},${address},${result});`);
       return result;
     }
@@ -996,6 +958,33 @@ var Builder = class {
     this.lines.push(`const ${temporary}=${expression};`);
     return temporary;
   }
+  /** Inline the compile-time-known assignment operator in hot point scripts. */
+  assignment(operator, left, right) {
+    switch (operator) {
+      case "=":
+        return `H.finite(${right})`;
+      case "+=":
+        return `H.finite((${left})+(${right}))`;
+      case "-=":
+        return `H.finite((${left})-(${right}))`;
+      case "*=":
+        return `H.finite((${left})*(${right}))`;
+      case "/=":
+        return `H.divide(${left},${right})`;
+      case "%=":
+        return `H.modulo(${left},${right})`;
+      case "|=":
+        return `(H.integer(${left})|H.integer(${right}))`;
+      case "&=":
+        return `(H.integer(${left})&H.integer(${right}))`;
+      case "^=":
+        return `(H.integer(${left})^H.integer(${right}))`;
+      case "**=":
+        return `H.finite(Math.pow(${left},${right}))`;
+      default:
+        throw new UnsupportedJitNode();
+    }
+  }
   temp() {
     return `t${this.temporary++}`;
   }
@@ -1020,16 +1009,17 @@ function compileAvsEel(source) {
 function compileAvsEelAst(ast) {
   const fallback = compileNode(ast.body);
   const bindJit = ast.source.length <= 1400 ? compileAvsEelJit(ast.body) : null;
+  const bind = (vm) => bindJit ? bindJit(vm) : () => fallback(vm);
   let boundVm;
   let boundExecute;
   const execute7 = (vm) => {
     if (vm !== boundVm) {
       boundVm = vm;
-      boundExecute = bindJit ? bindJit(vm) : () => fallback(vm);
+      boundExecute = bind(vm);
     }
     return boundExecute();
   };
-  return { source: ast.source, ast, execute: execute7 };
+  return { source: ast.source, ast, bind, execute: execute7 };
 }
 function compileNode(node) {
   switch (node.kind) {
@@ -1851,6 +1841,7 @@ var AvsExecutor = class {
     this.preset = preset;
     this.registry = registry;
     this.eelGlobal = registry.eelGlobal;
+    this.indexComponents(preset.components, null);
   }
   buffers = new AvsBufferBank();
   stats = { rendered: 0, unsupported: 0, lists: 0 };
@@ -1860,6 +1851,56 @@ var AvsExecutor = class {
   alternates = /* @__PURE__ */ new Map();
   beatFrames = /* @__PURE__ */ new Map();
   listEel = /* @__PURE__ */ new Map();
+  components = /* @__PURE__ */ new Map();
+  parents = /* @__PURE__ */ new Map();
+  controlsByPath = /* @__PURE__ */ new Map();
+  soloSelection = null;
+  /** Current non-default controls, in preset traversal order. */
+  get controls() {
+    const result = [];
+    for (const path of this.components.keys()) {
+      const control = this.controlsByPath.get(path);
+      if (control) result.push(control);
+    }
+    return result;
+  }
+  /**
+   * Atomically replaces graph controls. Unknown or duplicate paths are rejected
+   * so stale editor state cannot silently control a different preset.
+   */
+  setControls(controls) {
+    const next = /* @__PURE__ */ new Map();
+    for (const control of controls) {
+      if (!this.components.has(control.path)) throw new RangeError(`Unknown AVS component path ${control.path}`);
+      if (next.has(control.path)) throw new RangeError(`Duplicate AVS component control path ${control.path}`);
+      const resolved = {
+        path: control.path,
+        enabled: control.enabled ?? true,
+        muted: control.muted ?? false,
+        solo: control.solo ?? false
+      };
+      if (!isDefaultControl(resolved)) next.set(control.path, resolved);
+    }
+    if (sameControls(this.controlsByPath, next)) return;
+    this.controlsByPath = next;
+    this.rebuildSoloSelection();
+    this.resetControlSensitiveState();
+  }
+  /** Merge one path's editor state without disturbing controls on other paths. */
+  setComponentControl(path, patch) {
+    if (!this.components.has(path)) throw new RangeError(`Unknown AVS component path ${path}`);
+    const current = this.controlsByPath.get(path) ?? { path, enabled: true, muted: false, solo: false };
+    const next = {
+      path,
+      enabled: patch.enabled ?? current.enabled,
+      muted: patch.muted ?? current.muted,
+      solo: patch.solo ?? current.solo
+    };
+    this.setControls([
+      ...this.controls.filter((control) => control.path !== path),
+      next
+    ]);
+  }
   render(framebuffer, audio, preinit = false) {
     this.stats.rendered = 0;
     this.stats.unsupported = 0;
@@ -1883,6 +1924,7 @@ var AvsExecutor = class {
     let spare = alternate;
     let beat = initialBeat;
     for (const component of children) {
+      if (!this.shouldRun(component)) continue;
       if (component.list) {
         this.runList(component, current, audio, line, preinit, beat);
         continue;
@@ -2024,7 +2066,60 @@ var AvsExecutor = class {
     store.set(key, created);
     return created;
   }
+  indexComponents(children, parent) {
+    for (const component of children) {
+      if (this.components.has(component.path)) throw new Error(`Duplicate AVS component path ${component.path}`);
+      this.components.set(component.path, component);
+      this.parents.set(component.path, parent);
+      this.indexComponents(component.children, component.path);
+    }
+  }
+  shouldRun(component) {
+    const control = this.controlsByPath.get(component.path);
+    if (control && (!control.enabled || control.muted)) return false;
+    return this.soloSelection === null || this.soloSelection.has(component.path);
+  }
+  rebuildSoloSelection() {
+    const solos = [...this.controlsByPath.values()].filter((control) => control.solo);
+    if (solos.length === 0) {
+      this.soloSelection = null;
+      return;
+    }
+    const selected = /* @__PURE__ */ new Set();
+    for (const solo of solos) {
+      let path = solo.path;
+      while (path !== null) {
+        selected.add(path);
+        path = this.parents.get(path) ?? null;
+      }
+      const component = this.components.get(solo.path);
+      if (component.list) this.selectSubtree(component, selected);
+    }
+    this.soloSelection = selected;
+  }
+  selectSubtree(component, selected) {
+    selected.add(component.path);
+    for (const child of component.children) this.selectSubtree(child, selected);
+  }
+  resetControlSensitiveState() {
+    this.retained.clear();
+    this.alternates.clear();
+    this.beatFrames.clear();
+    this.listEel.clear();
+    this.buffers.release();
+  }
 };
+function isDefaultControl(control) {
+  return control.enabled && !control.muted && !control.solo;
+}
+function sameControls(left, right) {
+  if (left.size !== right.size) return false;
+  for (const [path, a] of left) {
+    const b = right.get(path);
+    if (!b || a.enabled !== b.enabled || a.muted !== b.muted || a.solo !== b.solo) return false;
+  }
+  return true;
+}
 function compileOrNull(source) {
   if (!source.trim()) return null;
   try {
@@ -2296,22 +2391,22 @@ function registerAvsClassicEffects(registry = new AvsEffectRegistry(), options =
       ctx.output.copyFrom(ctx.input);
       return { swap: true };
     }
-    let table6 = scatterTables.get(width);
-    if (!table6) {
-      table6 = new Int32Array(512);
-      for (let i = 0; i < table6.length; i++) {
+    let table5 = scatterTables.get(width);
+    if (!table5) {
+      table5 = new Int32Array(512);
+      for (let i = 0; i < table5.length; i++) {
         let dx = i % 8 - 4;
         let dy = Math.floor(i / 8) % 8 - 4;
         if (dx < 0) dx++;
         if (dy < 0) dy++;
-        table6[i] = width * dy + dx;
+        table5[i] = width * dy + dx;
       }
-      scatterTables.set(width, table6);
+      scatterTables.set(width, table5);
     }
     const edge = width * 4;
     ctx.output.pixels.set(ctx.input.pixels.subarray(0, edge), 0);
     for (let i = edge; i < width * (height - 4); i++) {
-      const offset = table6[normalizeRandom(randomInt(512), 512)];
+      const offset = table5[normalizeRandom(randomInt(512), 512)];
       ctx.output.pixels[i] = ctx.input.pixels[i + offset];
     }
     ctx.output.pixels.set(ctx.input.pixels.subarray(width * (height - 4)), width * (height - 4));
@@ -2682,11 +2777,11 @@ function decodeAvsColorMap(payload) {
   };
 }
 function buildAvsColorMapTable(points) {
-  const table6 = new Uint32Array(256);
+  const table5 = new Uint32Array(256);
   const sorted = points.length > 0 ? [...points].sort((a, b) => a.position - b.position || a.color - b.color) : defaultPoints();
   const first = sorted[0];
   const firstPosition = clamp3(first.position, 0, 255);
-  table6.fill(first.color & 16777215, 0, firstPosition);
+  table5.fill(first.color & 16777215, 0, firstPosition);
   for (let i = 0; i + 1 < sorted.length; i++) {
     const left = sorted[i];
     const right = sorted[i + 1];
@@ -2698,13 +2793,13 @@ function buildAvsColorMapTable(points) {
     let fraction = 0;
     for (let position = leftPosition; position <= rightPosition; position++) {
       const weight = Math.min(256, fraction >>> 8);
-      table6[position] = mix256(left.color, right.color, weight);
+      table5[position] = mix256(left.color, right.color, weight);
       fraction += increment;
     }
   }
   const last = sorted[sorted.length - 1];
-  table6.fill(last.color & 16777215, clamp3(last.position, 0, 255), 256);
-  return table6;
+  table5.fill(last.color & 16777215, clamp3(last.position, 0, 255), 256);
+  return table5;
 }
 function registerAvsColorMap(registry = new AvsEffectRegistry()) {
   const states = /* @__PURE__ */ new Map();
@@ -2725,8 +2820,8 @@ function registerAvsColorMap(registry = new AvsEffectRegistry()) {
       };
       states.set(context.component.path, state);
     }
-    const table6 = selectTable(config, state, context.beat);
-    transform(context, config, table6);
+    const table5 = selectTable(config, state, context.beat);
+    transform(context, config, table5);
   });
   return registry;
 }
@@ -2761,18 +2856,18 @@ function selectTable(config, state, beat) {
     state.previous = state.target;
     return state.tables[state.target];
   }
-  const table6 = new Uint32Array(256);
+  const table5 = new Uint32Array(256);
   const previous = state.tables[state.previous];
   const target = state.tables[state.target];
-  for (let i = 0; i < 256; i++) table6[i] = mix256(previous[i], target[i], state.progress);
-  return table6;
+  for (let i = 0; i < 256; i++) table5[i] = mix256(previous[i], target[i], state.progress);
+  return table5;
 }
-function transform(context, config, table6) {
+function transform(context, config, table5) {
   for (let i = 0; i < context.input.pixels.length; i++) {
     const destination = context.input.pixels[i] & 16777215;
     const key = colorKey(destination, config.key);
     if (key === null) continue;
-    const source = table6[key];
+    const source = table5[key];
     context.input.pixels[i] = blend(source, destination, config.blendMode, config.adjustBlend);
   }
 }
@@ -2946,6 +3041,7 @@ function prepareConvolution(config) {
   const divisor = Math.abs(config.scale) || 1;
   const positiveTaps = taps.filter((tap) => tap.coefficient > 0);
   const negativeTaps = taps.filter((tap) => tap.coefficient < 0);
+  const boxCoefficient = taps.length === KERNEL_CELLS && taps.every((tap) => tap.coefficient === taps[0].coefficient) && taps[0].coefficient > 0 ? taps[0].coefficient : 0;
   return {
     config,
     taps,
@@ -2965,7 +3061,9 @@ function prepareConvolution(config) {
     positiveCoefficients: Uint16Array.from(positiveTaps, (tap) => tap.coefficient),
     negativeDx: Int8Array.from(negativeTaps, (tap) => tap.dx),
     negativeDy: Int8Array.from(negativeTaps, (tap) => tap.dy),
-    negativeCoefficients: Uint16Array.from(negativeTaps, (tap) => -tap.coefficient)
+    negativeCoefficients: Uint16Array.from(negativeTaps, (tap) => -tap.coefficient),
+    boxCoefficient,
+    boxScratch: null
   };
 }
 function renderConvolution(context, state) {
@@ -2975,7 +3073,11 @@ function renderConvolution(context, state) {
   const target = swap ? context.output.pixels : source;
   const width = context.input.width;
   const height = context.input.height;
-  if (swap && !config.twoPass && state.bias === 0 && !state.saturatePositive && !state.saturateNegative && !config.absolute && !config.wrap && state.scaleShift >= 0) {
+  if (swap && !config.twoPass && state.bias === 0 && !state.saturatePositive && !state.saturateNegative && (!state.hasNegative || !config.absolute && !config.wrap)) {
+    if (state.boxCoefficient !== 0) {
+      renderBoxConvolution(source, target, width, height, state);
+      return { swap: true };
+    }
     renderFastConvolution(source, target, width, height, state);
     return { swap: true };
   }
@@ -3025,6 +3127,7 @@ function renderFastConvolution(source, target, width, height, state) {
   const interiorStart = Math.min(width, state.leftEdge);
   const interiorEnd = Math.max(interiorStart, width - state.rightEdge);
   const shift = state.scaleShift;
+  const reciprocal = shift < 0 ? Math.floor(65536 / state.divisor) & 65535 : 0;
   for (let y = 0; y < height; y++) {
     for (let tap = 0; tap < tapCount; tap++) {
       rowBases[tap] = clamp4(y + dy[tap], 0, height - 1) * width;
@@ -3067,15 +3170,105 @@ function renderFastConvolution(source, target, width, height, state) {
         red = red > negativeRed ? red - negativeRed : 0;
         alpha = alpha > negativeAlpha ? alpha - negativeAlpha : 0;
       }
-      blue >>>= shift;
-      green >>>= shift;
-      red >>>= shift;
-      alpha >>>= shift;
-      if (blue > 255) blue = 255;
-      if (green > 255) green = 255;
-      if (red > 255) red = 255;
-      if (alpha > 255) alpha = 255;
+      if (shift >= 0) {
+        blue >>>= shift;
+        green >>>= shift;
+        red >>>= shift;
+        alpha >>>= shift;
+      } else {
+        blue = Math.floor(blue * reciprocal / 65536) & 65535;
+        green = Math.floor(green * reciprocal / 65536) & 65535;
+        red = Math.floor(red * reciprocal / 65536) & 65535;
+        alpha = Math.floor(alpha * reciprocal / 65536) & 65535;
+      }
+      blue = packByte(blue);
+      green = packByte(green);
+      red = packByte(red);
+      alpha = packByte(alpha);
       target[targetRow + x] = (blue | green << 8 | red << 16 | alpha << 24) >>> 0;
+    }
+  }
+}
+function renderBoxConvolution(source, target, width, height, state) {
+  let scratch = state.boxScratch;
+  if (!scratch || scratch.width !== width || scratch.height !== height) {
+    scratch = {
+      width,
+      height,
+      redBlue: new Uint32Array(width * height),
+      greenAlpha: new Uint32Array(width * height)
+    };
+    state.boxScratch = scratch;
+  }
+  const horizontalRedBlue = scratch.redBlue;
+  const horizontalGreenAlpha = scratch.greenAlpha;
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    const first = source[row];
+    let redBlue = (first & 255) * 4 + (first >>> 16 & 255) * 4 * 65536;
+    let greenAlpha = (first >>> 8 & 255) * 4 + (first >>> 24) * 4 * 65536;
+    for (let x = 1; x <= Math.min(3, width - 1); x++) {
+      const pixel = source[row + x];
+      redBlue += (pixel & 255) + (pixel >>> 16 & 255) * 65536;
+      greenAlpha += (pixel >>> 8 & 255) + (pixel >>> 24) * 65536;
+    }
+    if (width < 4) {
+      const last = source[row + width - 1];
+      const missing = 4 - width;
+      redBlue += (last & 255) * missing + (last >>> 16 & 255) * missing * 65536;
+      greenAlpha += (last >>> 8 & 255) * missing + (last >>> 24) * missing * 65536;
+    }
+    for (let x = 0; x < width; x++) {
+      horizontalRedBlue[row + x] = redBlue;
+      horizontalGreenAlpha[row + x] = greenAlpha;
+      const removeX = x < 3 ? 0 : x - 3;
+      const addX = x + 4 >= width ? width - 1 : x + 4;
+      const remove = source[row + removeX];
+      const add3 = source[row + addX];
+      redBlue += (add3 & 255) - (remove & 255) + ((add3 >>> 16 & 255) - (remove >>> 16 & 255)) * 65536;
+      greenAlpha += (add3 >>> 8 & 255) - (remove >>> 8 & 255) + ((add3 >>> 24) - (remove >>> 24)) * 65536;
+    }
+  }
+  const coefficient = state.boxCoefficient;
+  const reciprocal = state.scaleShift < 0 ? Math.floor(65536 / state.divisor) & 65535 : 0;
+  for (let x = 0; x < width; x++) {
+    let redBlue = horizontalRedBlue[x] * 4;
+    let greenAlpha = horizontalGreenAlpha[x] * 4;
+    for (let y = 1; y <= Math.min(3, height - 1); y++) {
+      redBlue += horizontalRedBlue[y * width + x];
+      greenAlpha += horizontalGreenAlpha[y * width + x];
+    }
+    if (height < 4) {
+      const last = (height - 1) * width + x;
+      const missing = 4 - height;
+      redBlue += horizontalRedBlue[last] * missing;
+      greenAlpha += horizontalGreenAlpha[last] * missing;
+    }
+    for (let y = 0; y < height; y++) {
+      let blue = (redBlue & 65535) * coefficient;
+      let red = Math.floor(redBlue / 65536) * coefficient;
+      let green = (greenAlpha & 65535) * coefficient;
+      let alpha = Math.floor(greenAlpha / 65536) * coefficient;
+      if (state.scaleShift >= 0) {
+        blue >>>= state.scaleShift;
+        green >>>= state.scaleShift;
+        red >>>= state.scaleShift;
+        alpha >>>= state.scaleShift;
+      } else {
+        blue = Math.floor(blue * reciprocal / 65536) & 65535;
+        green = Math.floor(green * reciprocal / 65536) & 65535;
+        red = Math.floor(red * reciprocal / 65536) & 65535;
+        alpha = Math.floor(alpha * reciprocal / 65536) & 65535;
+      }
+      blue = packByte(blue);
+      green = packByte(green);
+      red = packByte(red);
+      alpha = packByte(alpha);
+      target[y * width + x] = (blue | green << 8 | red << 16 | alpha << 24) >>> 0;
+      const removeY = y < 3 ? 0 : y - 3;
+      const addY = y + 4 >= height ? height - 1 : y + 4;
+      redBlue += horizontalRedBlue[addY * width + x] - horizontalRedBlue[removeY * width + x];
+      greenAlpha += horizontalGreenAlpha[addY * width + x] - horizontalGreenAlpha[removeY * width + x];
     }
   }
 }
@@ -3160,6 +3353,446 @@ function clamp4(value, minimum, maximum) {
   return value < minimum ? minimum : value > maximum ? maximum : value;
 }
 
+// src/avs/effects/movement.ts
+var TEXT2 = new TextDecoder("windows-1252");
+var CUSTOM_EFFECT = 32767;
+var LAST_BUILTIN_EFFECT = 23;
+var OFFSET_MASK = (1 << 22) - 1;
+var BILINEAR_WEIGHTS = (() => {
+  const weights = [
+    new Uint8Array(32 * 32),
+    new Uint8Array(32 * 32),
+    new Uint8Array(32 * 32),
+    new Uint8Array(32 * 32)
+  ];
+  for (let x = 0; x < 32; x++) {
+    const xp = x << 3;
+    const inverseX = 255 - xp;
+    for (let y = 0; y < 32; y++) {
+      const yp = y << 3;
+      const inverseY = 255 - yp;
+      const key = x << 5 | y;
+      weights[0][key] = AVS_BLEND_TABLE[inverseX << 8 | inverseY];
+      weights[1][key] = AVS_BLEND_TABLE[xp << 8 | inverseY];
+      weights[2][key] = AVS_BLEND_TABLE[inverseX << 8 | yp];
+      weights[3][key] = AVS_BLEND_TABLE[xp << 8 | yp];
+    }
+  }
+  return weights;
+})();
+var EVALUATED_BUILTINS = {
+  18: {
+    source: "d=d*(1-(sin((r-$pi*.5)*7)*.03));r=r+(cos(d*12)*.03)",
+    rectangular: false
+  },
+  19: {
+    source: "d=d*(1-(sin((r-$pi*.5)*12)*.05));r=r+(cos(d*18)*.05);d=d*(1-((d-.4)*.03));r=r+((d-.4)*.13)",
+    rectangular: false
+  },
+  20: { source: "x=x+(cos(y*18)*.02);y=y+(sin(x*14)*.03)", rectangular: true },
+  21: {
+    source: "x=x+(cos(abs(y-.5)*8)*.02);y=y+(sin(abs(x-.5)*8)*.05);x=x*.95;y=y*.95",
+    rectangular: true
+  },
+  22: {
+    source: "y=y*(1+(sin(r+$pi/2)*.3));x=x*(1+(cos(r+$pi/2)*.3));x=x*.995;y=y*.995",
+    rectangular: true
+  },
+  23: { source: "y=(r*6)/$pi;x=d", rectangular: true }
+};
+function decodeAvsMovement(payload) {
+  let offset = 0;
+  let effect = readI322(payload, offset, 1);
+  offset += 4;
+  let expression = "";
+  let rectangular = false;
+  if (effect === CUSTOM_EFFECT) {
+    if (asciiEquals(payload, offset, "!rect ")) {
+      offset += 6;
+      rectangular = true;
+    }
+    if (payload[offset] === 1) {
+      offset++;
+      const length = readI322(payload, offset, 0);
+      offset += 4;
+      if (length > 0 && offset + length <= payload.length) {
+        expression = nulText3(payload.subarray(offset, offset + length));
+        offset += length;
+      }
+    } else {
+      const length = 256 - (rectangular ? 6 : 0);
+      if (offset + length <= payload.length) {
+        expression = nulText3(payload.subarray(offset, offset + length));
+        offset += length;
+      }
+    }
+  }
+  const blend2 = readI322(payload, offset, 0) !== 0;
+  offset += 4;
+  const sourceMapped = readI322(payload, offset, 0);
+  offset += 4;
+  rectangular = readI322(payload, offset, rectangular ? 1 : 0) !== 0;
+  offset += 4;
+  const subpixel = readI322(payload, offset, 0) !== 0;
+  offset += 4;
+  const wrap = readI322(payload, offset, 0) !== 0;
+  offset += 4;
+  if (effect === 0 && offset + 4 <= payload.length) effect = readI322(payload, offset, 0);
+  if (effect !== CUSTOM_EFFECT && effect > LAST_BUILTIN_EFFECT || effect < 0) effect = 0;
+  return { effect, expression, blend: blend2, sourceMapped, rectangular, subpixel, wrap };
+}
+function registerAvsMovement(registry, global = new AvsEelGlobalState()) {
+  const states = /* @__PURE__ */ new Map();
+  registry.registerBuiltin(15, (context) => {
+    let state = states.get(context.component.path);
+    if (!state) {
+      const config = decodeAvsMovement(context.component.payload);
+      state = {
+        config,
+        program: movementProgram(config),
+        sourceMapped: config.sourceMapped,
+        width: 0,
+        height: 0,
+        table: null,
+        randomState: hashPath3(context.component.path)
+      };
+      states.set(context.component.path, state);
+    }
+    if (state.config.effect === 0) return;
+    if (!state.table || state.width !== context.input.width || state.height !== context.input.height) {
+      state.table = buildMovementTable(context, state, global);
+      state.width = context.input.width;
+      state.height = context.input.height;
+    }
+    if (context.preinit) return;
+    if ((state.sourceMapped & 2) !== 0 && context.beat) state.sourceMapped ^= 1;
+    if ((state.sourceMapped & 1) !== 0) renderForward(context, state.table, state.config.blend);
+    else renderInverse(context, state.table, state.config.blend);
+    return { swap: true };
+  });
+  return registry;
+}
+function movementProgram(config) {
+  const source = config.effect === CUSTOM_EFFECT ? config.expression : EVALUATED_BUILTINS[config.effect]?.source;
+  if (!source?.trim()) return null;
+  try {
+    return compileAvsEel(source);
+  } catch {
+    return null;
+  }
+}
+function buildMovementTable(context, state, global) {
+  const { width, height } = context.input;
+  const count = width * height;
+  const config = state.config;
+  const bilinear3 = config.subpixel && width > 1 && height > 1 && count < 1 << 22 && (config.effect === CUSTOM_EFFECT || config.effect >= 3 && config.effect <= 23 && config.effect !== 7);
+  const table5 = {
+    offsets: new Uint32Array(count),
+    weightKeys: new Uint16Array(count),
+    bilinear: bilinear3
+  };
+  if (config.effect === 1) {
+    for (let i = 0; i < count; i++) {
+      const dx = nextRandom(state) % 3 - 1;
+      const dy = nextRandom(state) % 3 - 1;
+      table5.offsets[i] = clamp5(i + dx + dy * width, 0, count - 1);
+    }
+    return table5;
+  }
+  if (config.effect === 2) {
+    buildStaticMovementTable(config, table5, width, height);
+    return table5;
+  }
+  if (config.effect === 7) {
+    buildStaticMovementTable(config, table5, width, height);
+    return table5;
+  }
+  if (state.program) buildEvaluatedTable(context, state, table5, global);
+  else if (config.effect >= 3 && config.effect <= 17) buildStaticMovementTable(config, table5, width, height);
+  else fillIdentity(table5, width, height);
+  return table5;
+}
+function buildStaticMovementTable(config, table5, width, height) {
+  if (config.effect === 2) {
+    const shift = Math.trunc(width / 64);
+    for (let y = 0; y < height; y++) {
+      let sourceX = shift;
+      for (let x = 0; x < width; x++) {
+        table5.offsets[x + y * width] = sourceX + y * width;
+        sourceX++;
+        if (sourceX >= width) sourceX -= width;
+      }
+    }
+    return;
+  }
+  if (config.effect === 7) {
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+      let sourceX = x;
+      let sourceY = y;
+      if ((x & 2) === 0 && (y & 2) === 0) {
+        sourceX = Math.trunc(width / 2 + ((x & ~1) - width / 2) * 7 / 8);
+        sourceY = Math.trunc(height / 2 + ((y & ~1) - height / 2) * 7 / 8);
+      }
+      table5.offsets[x + y * width] = clamp5(sourceX, 0, width - 1) + clamp5(sourceY, 0, height - 1) * width;
+    }
+    return;
+  }
+  const halfWidth = Math.trunc(width / 2);
+  const halfHeight = Math.trunc(height / 2);
+  const maxDistance = Math.sqrt(width * width + height * height) / 2;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const xd = x - halfWidth;
+      const yd = y - halfHeight;
+      let distance = Math.hypot(xd, yd);
+      let angle = Math.atan2(yd, xd);
+      let xOffset = 0;
+      switch (config.effect) {
+        case 3:
+          angle += 0.1 - 0.2 * distance / maxDistance;
+          distance *= 0.96;
+          break;
+        case 4:
+          distance *= 0.99 * (1 - Math.sin(angle) / 32);
+          angle += 0.03 * Math.sin(distance / maxDistance * Math.PI * 4);
+          break;
+        case 5:
+          distance *= 0.94 + Math.cos(angle * 32) * 0.06;
+          break;
+        case 6:
+          distance *= 1.01 + Math.cos(angle * 4) * 0.04;
+          angle += 0.03 * Math.sin(distance / maxDistance * Math.PI * 4);
+          break;
+        case 8:
+          angle += 0.1 * Math.sin(distance / maxDistance * Math.PI * 5);
+          break;
+        case 9: {
+          const t = Math.sin(distance / maxDistance * Math.PI);
+          distance -= 8 * t ** 5;
+          break;
+        }
+        case 10: {
+          const t = Math.sin(distance / maxDistance * Math.PI);
+          distance -= 8 * t ** 5;
+          const swirl = Math.cos(distance / maxDistance * Math.PI / 2);
+          angle += 0.1 * swirl ** 3;
+          break;
+        }
+        case 11:
+          distance *= 0.95 + Math.cos(angle * 5 - Math.PI / 2.5) * 0.03;
+          break;
+        case 12:
+          angle += 0.04;
+          distance *= 0.96 + Math.cos(distance / maxDistance * Math.PI) * 0.05;
+          break;
+        case 13: {
+          const t = Math.cos(distance / maxDistance * Math.PI);
+          angle += 0.07 * t;
+          distance *= 0.98 + t * 0.1;
+          break;
+        }
+        case 14:
+          angle += 0.1 - 0.2 * distance / maxDistance;
+          distance *= 0.96;
+          xOffset = 8;
+          break;
+        case 15:
+          distance = maxDistance * 0.15;
+          break;
+        case 16:
+          angle = Math.cos(angle * 3);
+          break;
+        case 17:
+          distance *= 1 - (distance / maxDistance - 0.35) * 0.5;
+          angle += 0.1;
+          break;
+      }
+      const sampleX = halfWidth + Math.cos(angle) * distance + 0.5 + xOffset * width / 256;
+      const sampleY = halfHeight + Math.sin(angle) * distance + 0.5;
+      storeCoordinate(table5, x + y * width, sampleX, sampleY, width, height, config.wrap);
+    }
+  }
+}
+function buildEvaluatedTable(context, state, table5, global) {
+  const { width, height } = context.input;
+  const halfWidth = Math.trunc(width / 2);
+  const halfHeight = Math.trunc(height / 2);
+  const maxDistance = Math.sqrt(width * width + height * height) / 2;
+  const vm = new AvsEelVm({ global, seed: state.randomState });
+  vm.setHost({
+    getosc: (band, span, channel) => avsAudioSample(context.audio, "osc", band, span, channel),
+    getspec: (band, span, channel) => avsAudioSample(context.audio, "spec", band, span, channel)
+  });
+  vm.set("sw", width);
+  vm.set("sh", height);
+  const rectangular = state.config.effect === CUSTOM_EFFECT ? state.config.rectangular : EVALUATED_BUILTINS[state.config.effect]?.rectangular === true;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const xd = x - halfWidth;
+      const yd = y - halfHeight;
+      vm.set("x", halfWidth === 0 ? 0 : xd / halfWidth);
+      vm.set("y", halfHeight === 0 ? 0 : yd / halfHeight);
+      vm.set("d", maxDistance === 0 ? 0 : Math.hypot(xd, yd) / maxDistance);
+      vm.set("r", Math.atan2(yd, xd) + Math.PI / 2);
+      vm.execute(state.program);
+      let sampleX;
+      let sampleY;
+      if (rectangular) {
+        sampleX = (vm.get("x") + 1) * halfWidth;
+        sampleY = (vm.get("y") + 1) * halfHeight;
+      } else {
+        const distance = vm.get("d") * maxDistance;
+        const angle = vm.get("r") - Math.PI / 2;
+        sampleX = halfWidth + Math.cos(angle) * distance;
+        sampleY = halfHeight + Math.sin(angle) * distance;
+      }
+      if (!table5.bilinear) {
+        sampleX += 0.5;
+        sampleY += 0.5;
+      }
+      storeCoordinate(table5, x + y * width, sampleX, sampleY, width, height, state.config.wrap);
+    }
+  }
+}
+function storeCoordinate(table5, destination, rawX, rawY, width, height, wrap) {
+  if (!table5.bilinear) {
+    let x2 = Math.trunc(rawX);
+    let y2 = Math.trunc(rawY);
+    if (wrap) {
+      x2 = modulo3(x2, width);
+      y2 = modulo3(y2, height);
+    } else {
+      x2 = clamp5(x2, 0, width - 1);
+      y2 = clamp5(y2, 0, height - 1);
+    }
+    table5.offsets[destination] = x2 + y2 * width;
+    return;
+  }
+  let x = Math.trunc(rawX);
+  let y = Math.trunc(rawY);
+  let xPartial = Math.trunc(32 * (rawX - x));
+  let yPartial = Math.trunc(32 * (rawY - y));
+  if (wrap) {
+    x = modulo3(x, width - 1);
+    y = modulo3(y, height - 1);
+  } else {
+    if (x < 0) {
+      x = 0;
+      xPartial = 0;
+    } else if (x >= width - 1) {
+      x = width - 2;
+      xPartial = 31;
+    }
+    if (y < 0) {
+      y = 0;
+      yPartial = 0;
+    } else if (y >= height - 1) {
+      y = height - 2;
+      yPartial = 31;
+    }
+  }
+  const packed = (x + y * width | yPartial << 22 | xPartial << 27) >>> 0;
+  table5.offsets[destination] = packed & OFFSET_MASK;
+  const xWeight = packed >>> 24 & 31 << 3;
+  const yWeight = packed >>> 19 & 31 << 3;
+  table5.weightKeys[destination] = xWeight << 2 | yWeight >>> 3;
+}
+function renderInverse(context, table5, blend2) {
+  const source = context.input.pixels;
+  const output = context.output.pixels;
+  const width = context.input.width;
+  if (table5.bilinear) {
+    if (blend2) {
+      for (let i = 0; i < output.length; i++) {
+        output[i] = averagePixel3(source[i], sampleBilinear(
+          source,
+          table5.offsets[i],
+          width,
+          table5.weightKeys[i]
+        ));
+      }
+    } else {
+      for (let i = 0; i < output.length; i++) {
+        output[i] = sampleBilinear(source, table5.offsets[i], width, table5.weightKeys[i]);
+      }
+    }
+  } else if (blend2) {
+    for (let i = 0; i < output.length; i++) output[i] = averagePixel3(source[i], source[table5.offsets[i]]);
+  } else {
+    for (let i = 0; i < output.length; i++) output[i] = source[table5.offsets[i]];
+  }
+}
+function renderForward(context, table5, blend2) {
+  const source = context.input.pixels;
+  const output = context.output.pixels;
+  if (blend2) output.set(source);
+  else output.fill(0);
+  for (let i = 0; i < source.length; i++) {
+    const destination = table5.offsets[i];
+    output[destination] = maximumPixel2(source[i], output[destination]);
+  }
+  if (blend2) {
+    for (let i = 0; i < output.length; i++) output[i] = averagePixel3(output[i], source[i]);
+  }
+}
+function sampleBilinear(source, offset, width, weightKey) {
+  const blendTable = AVS_BLEND_TABLE;
+  const w0 = BILINEAR_WEIGHTS[0][weightKey];
+  const w1 = BILINEAR_WEIGHTS[1][weightKey];
+  const w2 = BILINEAR_WEIGHTS[2][weightKey];
+  const w3 = BILINEAR_WEIGHTS[3][weightKey];
+  const p0 = source[offset];
+  const p1 = source[offset + 1];
+  const p2 = source[offset + width];
+  const p3 = source[offset + width + 1];
+  const low = blendTable[(p0 & 255) << 8 | w0] + blendTable[(p1 & 255) << 8 | w1] + blendTable[(p2 & 255) << 8 | w2] + blendTable[(p3 & 255) << 8 | w3];
+  const middle = blendTable[(p0 >>> 8 & 255) << 8 | w0] + blendTable[(p1 >>> 8 & 255) << 8 | w1] + blendTable[(p2 >>> 8 & 255) << 8 | w2] + blendTable[(p3 >>> 8 & 255) << 8 | w3];
+  const high = blendTable[(p0 >>> 16 & 255) << 8 | w0] + blendTable[(p1 >>> 16 & 255) << 8 | w1] + blendTable[(p2 >>> 16 & 255) << 8 | w2] + blendTable[(p3 >>> 16 & 255) << 8 | w3];
+  return low & 255 | (middle & 255) << 8 | (high & 255) << 16;
+}
+function fillIdentity(table5, width, height) {
+  for (let i = 0; i < width * height; i++) table5.offsets[i] = i;
+}
+function averagePixel3(a, b) {
+  return (a >>> 1 & 8355711) + (b >>> 1 & 8355711) & 16777215;
+}
+function maximumPixel2(a, b) {
+  return Math.max(a & 255, b & 255) | Math.max(a >>> 8 & 255, b >>> 8 & 255) << 8 | Math.max(a >>> 16 & 255, b >>> 16 & 255) << 16;
+}
+function nextRandom(state) {
+  let x = state.randomState || 1831565813;
+  x ^= x << 13;
+  x ^= x >>> 17;
+  x ^= x << 5;
+  state.randomState = x >>> 0;
+  return state.randomState;
+}
+function modulo3(value, modulus) {
+  if (modulus <= 0) return 0;
+  const result = value % modulus;
+  return result < 0 ? result + modulus : result;
+}
+function readI322(payload, offset, fallback) {
+  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
+}
+function asciiEquals(payload, offset, value) {
+  if (offset + value.length > payload.length) return false;
+  for (let i = 0; i < value.length; i++) if (payload[offset + i] !== value.charCodeAt(i)) return false;
+  return true;
+}
+function nulText3(bytes) {
+  const end = bytes.indexOf(0);
+  return TEXT2.decode(end < 0 ? bytes : bytes.subarray(0, end));
+}
+function clamp5(value, minimum, maximum) {
+  return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+function hashPath3(path) {
+  let hash = 2166136261;
+  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
+  return hash >>> 0;
+}
+
 // src/avs/effects/basic-transforms.ts
 function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
   const clears = /* @__PURE__ */ new Map();
@@ -3196,7 +3829,7 @@ function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
     const beat = [int3(context, 16, normal[0]), int3(context, 20, normal[1]), int3(context, 24, normal[2])];
     let state = colorFades.get(context.component.path);
     if (!state) {
-      state = { position: [...normal], random: hashPath3(context.component.path) };
+      state = { position: [...normal], random: hashPath4(context.component.path) };
       colorFades.set(context.component.path, state);
     }
     state.position[0] += Math.sign(normal[0] - state.position[0]);
@@ -3204,21 +3837,21 @@ function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
     state.position[2] += Math.sign(normal[1] - state.position[2]);
     if ((enabled & 4) === 0) state.position = [...normal];
     else if (context.beat && (enabled & 2) !== 0) {
-      state.position[0] = nextRandom(state, 32) - 6;
-      state.position[1] = nextRandom(state, 64) - 32;
+      state.position[0] = nextRandom2(state, 32) - 6;
+      state.position[1] = nextRandom2(state, 64) - 32;
       if (state.position[1] < 0 && state.position[1] > -16) state.position[1] = -32;
       if (state.position[1] >= 0 && state.position[1] < 16) state.position[1] = 32;
-      state.position[2] = nextRandom(state, 32) - 6;
+      state.position[2] = nextRandom2(state, 32) - 6;
     } else if (context.beat) state.position = [...beat];
     const [first, second, third] = state.position;
-    const table6 = [[third, second, first], [second, first, third], [first, third, second], [third, third, third]];
+    const table5 = [[third, second, first], [second, first, third], [first, third, second], [third, third, third]];
     for (let i = 0; i < context.input.pixels.length; i++) {
       const pixel = context.input.pixels[i];
       const low = pixel & 255, middle = pixel >>> 8 & 255, high = pixel >>> 16 & 255;
       const x = middle - high;
       const y = high - low;
       const category = x > 0 && x > -y ? 0 : y < 0 && x < -y ? 1 : x < 0 && y > 0 ? 2 : 3;
-      const offsets = table6[category];
+      const offsets = table5[category];
       context.input.pixels[i] = clampByte3(low + offsets[0]) | clampByte3(middle + offsets[1]) << 8 | clampByte3(high + offsets[2]) << 16;
     }
   });
@@ -3240,29 +3873,54 @@ function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
   registry.registerBuiltin(20, (context) => {
     if (context.preinit || int3(context, 0, 1) === 0) return;
     const { width, height } = context.input;
+    const source = context.input.pixels;
+    const destination = context.output.pixels;
     let previous = waterFrames.get(context.component.path);
-    if (!previous || previous.length !== context.input.pixels.length) {
-      previous = new Uint32Array(context.input.pixels.length);
+    if (!previous || previous.length !== source.length) {
+      previous = new Uint32Array(source.length);
       waterFrames.set(context.component.path, previous);
     }
-    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
-      const neighbors = [];
-      if (x > 0) neighbors.push(context.input.pixels[x - 1 + y * width]);
-      if (x + 1 < width) neighbors.push(context.input.pixels[x + 1 + y * width]);
-      if (y > 0) neighbors.push(context.input.pixels[x + (y - 1) * width]);
-      if (y + 1 < height) neighbors.push(context.input.pixels[x + (y + 1) * width]);
-      const index = x + y * width;
-      let result = 0;
-      for (let shift = 0; shift <= 16; shift += 8) {
-        let total = 0;
-        for (const pixel of neighbors) total += pixel >>> shift & 255;
-        if (neighbors.length > 2) total = Math.trunc(total / 2);
-        const value = clampByte3(total - (previous[index] >>> shift & 255));
-        result |= value << shift;
-      }
-      context.output.pixels[index] = result;
+    destination[0] = water2(source[1], source[width], previous[0]);
+    for (let x = 1; x < width - 1; x++) {
+      destination[x] = water3(source[x - 1], source[x + 1], source[width + x], previous[x]);
     }
-    previous.set(context.input.pixels);
+    const topRight = width - 1;
+    destination[topRight] = water2(source[topRight - 1], source[topRight + width], previous[topRight]);
+    for (let y = 1; y < height - 1; y++) {
+      const row = y * width;
+      destination[row] = water3(source[row + 1], source[row - width], source[row + width], previous[row]);
+      for (let x = 1; x < width - 1; x++) {
+        const index = row + x;
+        destination[index] = water4(
+          source[index - 1],
+          source[index + 1],
+          source[index - width],
+          source[index + width],
+          previous[index]
+        );
+      }
+      const right = row + width - 1;
+      destination[right] = water3(
+        source[right - 1],
+        source[right - width],
+        source[right + width],
+        previous[right]
+      );
+    }
+    const bottom = (height - 1) * width;
+    destination[bottom] = water2(source[bottom + 1], source[bottom - width], previous[bottom]);
+    for (let x = 1; x < width - 1; x++) {
+      const index = bottom + x;
+      destination[index] = water3(
+        source[index - 1],
+        source[index + 1],
+        source[index - width],
+        previous[index]
+      );
+    }
+    const final = source.length - 1;
+    destination[final] = water2(source[final - 1], source[final - width], previous[final]);
+    previous.set(source);
     return { swap: true };
   });
   registry.registerBuiltin(23, (context) => {
@@ -3343,6 +4001,33 @@ function registerAvsBasicTransforms(registry = new AvsEffectRegistry()) {
   });
   return registry;
 }
+function water2(a, b, previous) {
+  return waterChannels(
+    (a & 255) + (b & 255),
+    (a >>> 8 & 255) + (b >>> 8 & 255),
+    (a >>> 16 & 255) + (b >>> 16 & 255),
+    previous
+  );
+}
+function water3(a, b, c, previous) {
+  return waterChannels(
+    (a & 255) + (b & 255) + (c & 255) >> 1,
+    (a >>> 8 & 255) + (b >>> 8 & 255) + (c >>> 8 & 255) >> 1,
+    (a >>> 16 & 255) + (b >>> 16 & 255) + (c >>> 16 & 255) >> 1,
+    previous
+  );
+}
+function water4(a, b, c, d, previous) {
+  return waterChannels(
+    (a & 255) + (b & 255) + (c & 255) + (d & 255) >> 1,
+    (a >>> 8 & 255) + (b >>> 8 & 255) + (c >>> 8 & 255) + (d >>> 8 & 255) >> 1,
+    (a >>> 16 & 255) + (b >>> 16 & 255) + (c >>> 16 & 255) + (d >>> 16 & 255) >> 1,
+    previous
+  );
+}
+function waterChannels(low, middle, high, previous) {
+  return clampByte3(low - (previous & 255)) | clampByte3(middle - (previous >>> 8 & 255)) << 8 | clampByte3(high - (previous >>> 16 & 255)) << 16;
+}
 function mosaic(context, quality, additive, average) {
   const { width, height } = context.input;
   const incrementX = Math.trunc(width * 65536 / quality);
@@ -3381,7 +4066,7 @@ function int3(context, offset, fallback) {
 function clampByte3(value) {
   return value < 0 ? 0 : value > 255 ? 255 : Math.trunc(value);
 }
-function nextRandom(state, bound) {
+function nextRandom2(state, bound) {
   let value = state.random || 1831565813;
   value ^= value << 13;
   value ^= value >>> 17;
@@ -3389,7 +4074,7 @@ function nextRandom(state, bound) {
   state.random = value >>> 0;
   return state.random % bound;
 }
-function hashPath3(path) {
+function hashPath4(path) {
   let hash = 2166136261;
   for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
   return hash >>> 0;
@@ -3607,7 +4292,7 @@ function registerStarfield(registry, options) {
         currentSpeed: Math.fround(config.speed),
         beatIncrement: 0,
         beatFrames: 0,
-        randomState: hashPath4(context.component.path)
+        randomState: hashPath5(context.component.path)
       };
       states.set(context.component.path, state);
     }
@@ -3686,7 +4371,7 @@ function registerMovingParticle(registry, options) {
         velocity: [-0.01551, 0],
         position: [-0.6, 0.3],
         size: config.size,
-        randomState: hashPath4(context.component.path)
+        randomState: hashPath5(context.component.path)
       };
       states.set(context.component.path, state);
     }
@@ -3769,7 +4454,7 @@ function registerCustomBpm(registry, options) {
   });
 }
 function randomModulo33(state, hook) {
-  const value = hook ? Math.trunc(hook()) >>> 0 : nextRandom2(state);
+  const value = hook ? Math.trunc(hook()) >>> 0 : nextRandom3(state);
   return value % 33;
 }
 function randomBound(state, hook, bound) {
@@ -3777,7 +4462,7 @@ function randomBound(state, hook, bound) {
   const value = hook ? Math.trunc(hook()) >>> 0 : nextStarRandom(state);
   return value % bound;
 }
-function nextRandom2(state) {
+function nextRandom3(state) {
   let value = state.randomState || 1831565813;
   value ^= value << 13;
   value ^= value >>> 17;
@@ -3802,14 +4487,14 @@ function i324(payload, offset, fallback) {
 function f32(payload, offset, fallback) {
   return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getFloat32(offset, true) : fallback;
 }
-function hashPath4(path) {
+function hashPath5(path) {
   let hash = 2166136261;
   for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
   return hash >>> 0;
 }
 
 // src/avs/effects/bump.ts
-var TEXT2 = new TextDecoder("windows-1252");
+var TEXT3 = new TextDecoder("windows-1252");
 function decodeAvsBump(payload) {
   let offset = 0;
   const read = (fallback) => {
@@ -3858,7 +4543,7 @@ function registerAvsBump(registry) {
     if (!config.enabled) return;
     let state = states.get(context.component.path);
     if (!state) {
-      const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath5(context.component.path) });
+      const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath6(context.component.path) });
       vm.set("bi", 1);
       state = {
         vm,
@@ -3888,12 +4573,12 @@ function registerAvsBump(registry) {
       state.beatFrames = config.beatDurationFrames;
     } else if (!state.beatFrames) state.currentDepth = config.depth;
     context.output.clear();
-    const lightX = clamp5(Math.trunc(state.vm.get("x") * context.input.width / (config.oldStyle ? 100 : 1)), 0, context.input.width);
-    const lightY = clamp5(Math.trunc(state.vm.get("y") * context.input.height / (config.oldStyle ? 100 : 1)), 0, context.input.height);
+    const lightX = clamp6(Math.trunc(state.vm.get("x") * context.input.width / (config.oldStyle ? 100 : 1)), 0, context.input.width);
+    const lightY = clamp6(Math.trunc(state.vm.get("y") * context.input.height / (config.oldStyle ? 100 : 1)), 0, context.input.height);
     if (config.showLight && lightX < context.input.width && lightY < context.input.height) {
       context.output.pixels[lightX + lightY * context.input.width] = 16777215;
     }
-    const intensity = clamp5(state.vm.get("bi"), 0, 1);
+    const intensity = clamp6(state.vm.get("bi"), 0, 1);
     state.vm.set("bi", intensity);
     state.currentDepth = Math.trunc(state.currentDepth * intensity);
     shadeBump(context, depthSurface.pixels, config, state.currentDepth, lightX, lightY);
@@ -3954,7 +4639,7 @@ function readString(payload, offset) {
   const length = i325(payload, offset, 0);
   const start = offset + 4;
   if (length <= 0 || start + length > payload.length) return { value: "", next: start };
-  return { value: nulText3(payload.subarray(start, start + length)), next: start + length };
+  return { value: nulText4(payload.subarray(start, start + length)), next: start + length };
 }
 function compileOrNull2(source) {
   if (!source.trim()) return null;
@@ -3970,21 +4655,21 @@ function execute2(program, vm) {
 function i325(payload, offset, fallback) {
   return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
 }
-function nulText3(bytes) {
+function nulText4(bytes) {
   const end = bytes.indexOf(0);
-  return TEXT2.decode(end < 0 ? bytes : bytes.subarray(0, end));
+  return TEXT3.decode(end < 0 ? bytes : bytes.subarray(0, end));
 }
-function clamp5(value, minimum, maximum) {
+function clamp6(value, minimum, maximum) {
   return value < minimum ? minimum : value > maximum ? maximum : value;
 }
-function hashPath5(path) {
+function hashPath6(path) {
   let hash = 2166136261;
   for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
   return hash >>> 0;
 }
 
 // src/avs/effects/dynamic-movement.ts
-var TEXT3 = new TextDecoder("windows-1252");
+var TEXT4 = new TextDecoder("windows-1252");
 function decodeAvsDynamicMovement(payload) {
   let offset = 0;
   let scripts = ["", "", "", ""];
@@ -3996,7 +4681,7 @@ function decodeAvsDynamicMovement(payload) {
       offset = value.next;
     }
   } else if (payload.length >= 1024) {
-    scripts = [0, 256, 512, 768].map((start) => nulText4(payload.subarray(start, start + 256)));
+    scripts = [0, 256, 512, 768].map((start) => nulText5(payload.subarray(start, start + 256)));
     offset = 1024;
   }
   const read = (fallback) => {
@@ -4025,7 +4710,7 @@ function registerAvsDynamicMovement(registry) {
     let state = states.get(context.component.path);
     if (!state) {
       const config = decodeAvsDynamicMovement(context.component.payload);
-      const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath6(context.component.path) });
+      const vm = new AvsEelVm({ global: registry.eelGlobal, seed: hashPath7(context.component.path) });
       state = {
         config,
         vm,
@@ -4069,8 +4754,8 @@ function renderDynamicMovement(context, config, state) {
   }
   execute3(state.programs[1], vm);
   if (context.beat) execute3(state.programs[2], vm);
-  const columns = clamp6(Math.trunc(config.gridWidth) + 1, 2, 256);
-  const rows = clamp6(Math.trunc(config.gridHeight) + 1, 2, 256);
+  const columns = clamp7(Math.trunc(config.gridWidth) + 1, 2, 256);
+  const rows = clamp7(Math.trunc(config.gridHeight) + 1, 2, 256);
   const gridSize = columns * rows;
   if (state.gridX.length !== gridSize) {
     state.gridX = new Float64Array(gridSize);
@@ -4109,7 +4794,7 @@ function renderDynamicMovement(context, config, state) {
       const index = gx + gy * columns;
       gridX[index] = x;
       gridY[index] = y;
-      gridAlpha[index] = clamp6(vm.get("alpha"), 0, 1);
+      gridAlpha[index] = clamp7(vm.get("alpha"), 0, 1);
     }
   }
   const cellXs = state.cellX;
@@ -4132,37 +4817,199 @@ function renderDynamicMovement(context, config, state) {
     );
     return { swap: true };
   }
+  if (!config.noMove) {
+    if (config.blend) {
+      renderBilinearBlendGrid(
+        context,
+        source.pixels,
+        gridX,
+        gridY,
+        gridAlpha,
+        cellXs,
+        fractionXs,
+        cellYs,
+        fractionYs,
+        columns,
+        config.wrap
+      );
+    } else {
+      renderBilinearReplaceGrid(
+        context,
+        source.pixels,
+        gridX,
+        gridY,
+        cellXs,
+        fractionXs,
+        cellYs,
+        fractionYs,
+        columns,
+        config.wrap
+      );
+    }
+    return { swap: true };
+  }
+  renderNoMoveGrid(
+    context,
+    config.buffer === 0 ? null : source.pixels,
+    gridAlpha,
+    cellXs,
+    fractionXs,
+    cellYs,
+    fractionYs,
+    columns
+  );
+  return;
+}
+function renderNoMoveGrid(context, maskSource, gridAlpha, cellXs, fractionXs, cellYs, fractionYs, columns) {
+  const width = context.input.width;
+  const height = context.input.height;
+  const input = context.input.pixels;
+  const blendTable = AVS_BLEND_TABLE;
+  let index = 0;
   for (let y = 0; y < height; y++) {
     const cellY = cellYs[y];
     const fy = fractionYs[y];
-    for (let x = 0; x < width; x++) {
-      const cellX = cellXs[x];
+    const inverseY = 1 - fy;
+    const row = cellY * columns;
+    for (let x = 0; x < width; x++, index++) {
       const fx = fractionXs[x];
-      const topLeft = cellX + cellY * columns;
+      const topLeft = cellXs[x] + row;
       const topRight = topLeft + 1;
       const bottomLeft = topLeft + columns;
       const bottomRight = bottomLeft + 1;
-      const mappedX = bilerp(gridX[topLeft], gridX[topRight], gridX[bottomLeft], gridX[bottomRight], fx, fy);
-      const mappedY = bilerp(gridY[topLeft], gridY[topRight], gridY[bottomLeft], gridY[bottomRight], fx, fy);
-      const alpha = config.noMove || config.blend ? Math.trunc(clamp6(bilerp(
-        gridAlpha[topLeft],
-        gridAlpha[topRight],
-        gridAlpha[bottomLeft],
-        gridAlpha[bottomRight],
-        fx,
-        fy
-      ), 0, 1) * 255) : 0;
-      const index = x + y * width;
-      if (config.noMove) {
-        const maskSource = config.buffer === 0 ? 0 : source.pixels[index];
-        context.input.pixels[index] = blendPixel(maskSource, context.input.pixels[index], "adjustable", alpha);
-        continue;
-      }
-      const sampled = sample(source.pixels, width, height, mappedX, mappedY, config.wrap, config.bilinear);
-      context.output.pixels[index] = config.blend ? blendPixel(sampled, context.input.pixels[index], "adjustable", alpha) : sampled;
+      const rawAlpha = (gridAlpha[topLeft] + (gridAlpha[topRight] - gridAlpha[topLeft]) * fx) * inverseY + (gridAlpha[bottomLeft] + (gridAlpha[bottomRight] - gridAlpha[bottomLeft]) * fx) * fy;
+      const alpha = Math.trunc(clamp7(rawAlpha, 0, 1) * 255);
+      const inverseAlpha = 255 - alpha;
+      const source = maskSource?.[index] ?? 0;
+      const current = input[index];
+      const low = blendTable[(source & 255) << 8 | alpha] + blendTable[(current & 255) << 8 | inverseAlpha];
+      const middle = blendTable[(source >>> 8 & 255) << 8 | alpha] + blendTable[(current >>> 8 & 255) << 8 | inverseAlpha];
+      const high = blendTable[(source >>> 16 & 255) << 8 | alpha] + blendTable[(current >>> 16 & 255) << 8 | inverseAlpha];
+      input[index] = low | middle << 8 | high << 16;
     }
   }
-  return config.noMove ? void 0 : { swap: true };
+}
+function renderBilinearReplaceGrid(context, source, gridX, gridY, cellXs, fractionXs, cellYs, fractionYs, columns, wrap) {
+  const width = context.input.width;
+  const height = context.input.height;
+  const destination = context.output.pixels;
+  const maxX = Math.max(0, width - 2);
+  const maxY = Math.max(0, height - 2);
+  const spanX = Math.max(1, maxX);
+  const spanY = Math.max(1, maxY);
+  const blendTable = AVS_BLEND_TABLE;
+  let index = 0;
+  for (let y = 0; y < height; y++) {
+    const cellY = cellYs[y];
+    const fy = fractionYs[y];
+    const inverseY = 1 - fy;
+    const row = cellY * columns;
+    for (let x = 0; x < width; x++, index++) {
+      const fx = fractionXs[x];
+      const topLeft = cellXs[x] + row;
+      const topRight = topLeft + 1;
+      const bottomLeft = topLeft + columns;
+      const bottomRight = bottomLeft + 1;
+      let mappedX = (gridX[topLeft] + (gridX[topRight] - gridX[topLeft]) * fx) * inverseY + (gridX[bottomLeft] + (gridX[bottomRight] - gridX[bottomLeft]) * fx) * fy;
+      let mappedY = (gridY[topLeft] + (gridY[topRight] - gridY[topLeft]) * fx) * inverseY + (gridY[bottomLeft] + (gridY[bottomRight] - gridY[bottomLeft]) * fx) * fy;
+      if (wrap) {
+        mappedX = (mappedX % spanX + spanX) % spanX;
+        mappedY = (mappedY % spanY + spanY) % spanY;
+      } else {
+        mappedX = clamp7(mappedX, 0, maxX);
+        mappedY = clamp7(mappedY, 0, maxY);
+      }
+      const ix = Math.trunc(mappedX);
+      const iy = Math.trunc(mappedY);
+      if (width < 2 || height < 2) {
+        destination[index] = source[ix + iy * width];
+        continue;
+      }
+      const sampleX = Math.trunc((mappedX - ix) * 256) & 255;
+      const sampleY = Math.trunc((mappedY - iy) * 256) & 255;
+      const inverseX = 255 - sampleX;
+      const inverseSampleY = 255 - sampleY;
+      const weight0 = blendTable[inverseX << 8 | inverseSampleY];
+      const weight1 = blendTable[sampleX << 8 | inverseSampleY];
+      const weight2 = blendTable[inverseX << 8 | sampleY];
+      const weight3 = blendTable[sampleX << 8 | sampleY];
+      const offset = ix + iy * width;
+      const pixel0 = source[offset];
+      const pixel1 = source[offset + 1];
+      const pixel2 = source[offset + width];
+      const pixel3 = source[offset + width + 1];
+      const low = blendTable[(pixel0 & 255) << 8 | weight0] + blendTable[(pixel1 & 255) << 8 | weight1] + blendTable[(pixel2 & 255) << 8 | weight2] + blendTable[(pixel3 & 255) << 8 | weight3];
+      const middle = blendTable[(pixel0 >>> 8 & 255) << 8 | weight0] + blendTable[(pixel1 >>> 8 & 255) << 8 | weight1] + blendTable[(pixel2 >>> 8 & 255) << 8 | weight2] + blendTable[(pixel3 >>> 8 & 255) << 8 | weight3];
+      const high = blendTable[(pixel0 >>> 16 & 255) << 8 | weight0] + blendTable[(pixel1 >>> 16 & 255) << 8 | weight1] + blendTable[(pixel2 >>> 16 & 255) << 8 | weight2] + blendTable[(pixel3 >>> 16 & 255) << 8 | weight3];
+      destination[index] = low & 255 | (middle & 255) << 8 | (high & 255) << 16;
+    }
+  }
+}
+function renderBilinearBlendGrid(context, source, gridX, gridY, gridAlpha, cellXs, fractionXs, cellYs, fractionYs, columns, wrap) {
+  const width = context.input.width;
+  const height = context.input.height;
+  const input = context.input.pixels;
+  const destination = context.output.pixels;
+  const maxX = Math.max(0, width - 2);
+  const maxY = Math.max(0, height - 2);
+  const spanX = Math.max(1, maxX);
+  const spanY = Math.max(1, maxY);
+  const blendTable = AVS_BLEND_TABLE;
+  let index = 0;
+  for (let y = 0; y < height; y++) {
+    const cellY = cellYs[y];
+    const fy = fractionYs[y];
+    const inverseY = 1 - fy;
+    const row = cellY * columns;
+    for (let x = 0; x < width; x++, index++) {
+      const fx = fractionXs[x];
+      const topLeft = cellXs[x] + row;
+      const topRight = topLeft + 1;
+      const bottomLeft = topLeft + columns;
+      const bottomRight = bottomLeft + 1;
+      let mappedX = (gridX[topLeft] + (gridX[topRight] - gridX[topLeft]) * fx) * inverseY + (gridX[bottomLeft] + (gridX[bottomRight] - gridX[bottomLeft]) * fx) * fy;
+      let mappedY = (gridY[topLeft] + (gridY[topRight] - gridY[topLeft]) * fx) * inverseY + (gridY[bottomLeft] + (gridY[bottomRight] - gridY[bottomLeft]) * fx) * fy;
+      if (wrap) {
+        mappedX = (mappedX % spanX + spanX) % spanX;
+        mappedY = (mappedY % spanY + spanY) % spanY;
+      } else {
+        mappedX = clamp7(mappedX, 0, maxX);
+        mappedY = clamp7(mappedY, 0, maxY);
+      }
+      const ix = Math.trunc(mappedX);
+      const iy = Math.trunc(mappedY);
+      let sampled;
+      if (width < 2 || height < 2) {
+        sampled = source[ix + iy * width];
+      } else {
+        const sampleX = Math.trunc((mappedX - ix) * 256) & 255;
+        const sampleY = Math.trunc((mappedY - iy) * 256) & 255;
+        const inverseX = 255 - sampleX;
+        const inverseSampleY = 255 - sampleY;
+        const weight0 = blendTable[inverseX << 8 | inverseSampleY];
+        const weight1 = blendTable[sampleX << 8 | inverseSampleY];
+        const weight2 = blendTable[inverseX << 8 | sampleY];
+        const weight3 = blendTable[sampleX << 8 | sampleY];
+        const offset = ix + iy * width;
+        const pixel0 = source[offset];
+        const pixel1 = source[offset + 1];
+        const pixel2 = source[offset + width];
+        const pixel3 = source[offset + width + 1];
+        const low2 = blendTable[(pixel0 & 255) << 8 | weight0] + blendTable[(pixel1 & 255) << 8 | weight1] + blendTable[(pixel2 & 255) << 8 | weight2] + blendTable[(pixel3 & 255) << 8 | weight3];
+        const middle2 = blendTable[(pixel0 >>> 8 & 255) << 8 | weight0] + blendTable[(pixel1 >>> 8 & 255) << 8 | weight1] + blendTable[(pixel2 >>> 8 & 255) << 8 | weight2] + blendTable[(pixel3 >>> 8 & 255) << 8 | weight3];
+        const high2 = blendTable[(pixel0 >>> 16 & 255) << 8 | weight0] + blendTable[(pixel1 >>> 16 & 255) << 8 | weight1] + blendTable[(pixel2 >>> 16 & 255) << 8 | weight2] + blendTable[(pixel3 >>> 16 & 255) << 8 | weight3];
+        sampled = low2 & 255 | (middle2 & 255) << 8 | (high2 & 255) << 16;
+      }
+      const rawAlpha = (gridAlpha[topLeft] + (gridAlpha[topRight] - gridAlpha[topLeft]) * fx) * inverseY + (gridAlpha[bottomLeft] + (gridAlpha[bottomRight] - gridAlpha[bottomLeft]) * fx) * fy;
+      const alpha = Math.trunc(clamp7(rawAlpha, 0, 1) * 255);
+      const inverseAlpha = 255 - alpha;
+      const current = input[index];
+      const low = blendTable[(sampled & 255) << 8 | alpha] + blendTable[(current & 255) << 8 | inverseAlpha];
+      const middle = blendTable[(sampled >>> 8 & 255) << 8 | alpha] + blendTable[(current >>> 8 & 255) << 8 | inverseAlpha];
+      const high = blendTable[(sampled >>> 16 & 255) << 8 | alpha] + blendTable[(current >>> 16 & 255) << 8 | inverseAlpha];
+      destination[index] = low | middle << 8 | high << 16;
+    }
+  }
 }
 function renderNearestGrid(context, config, source, gridX, gridY, gridAlpha, cellXs, fractionXs, cellYs, fractionYs, columns) {
   const width = context.input.width;
@@ -4189,11 +5036,15 @@ function renderNearestGrid(context, config, source, gridX, gridY, gridAlpha, cel
       let mappedX = (gridX[topLeft] + (gridX[topRight] - gridX[topLeft]) * fx) * inverseY + (gridX[bottomLeft] + (gridX[bottomRight] - gridX[bottomLeft]) * fx) * fy;
       let mappedY = (gridY[topLeft] + (gridY[topRight] - gridY[topLeft]) * fx) * inverseY + (gridY[bottomLeft] + (gridY[bottomRight] - gridY[bottomLeft]) * fx) * fy;
       if (config.wrap) {
-        mappedX = (mappedX % spanX + spanX) % spanX;
-        mappedY = (mappedY % spanY + spanY) % spanY;
+        if (!(mappedX >= 0 && mappedX < spanX && Number.isInteger(mappedX))) {
+          mappedX = (mappedX % spanX + spanX) % spanX;
+        }
+        if (!(mappedY >= 0 && mappedY < spanY && Number.isInteger(mappedY))) {
+          mappedY = (mappedY % spanY + spanY) % spanY;
+        }
       } else {
-        mappedX = clamp6(mappedX, 0, maxX);
-        mappedY = clamp6(mappedY, 0, maxY);
+        mappedX = clamp7(mappedX, 0, maxX);
+        mappedY = clamp7(mappedY, 0, maxY);
       }
       const sampled = source[Math.trunc(mappedX) + Math.trunc(mappedY) * width];
       if (!config.blend) {
@@ -4201,7 +5052,7 @@ function renderNearestGrid(context, config, source, gridX, gridY, gridAlpha, cel
         continue;
       }
       const rawAlpha = (gridAlpha[topLeft] + (gridAlpha[topRight] - gridAlpha[topLeft]) * fx) * inverseY + (gridAlpha[bottomLeft] + (gridAlpha[bottomRight] - gridAlpha[bottomLeft]) * fx) * fy;
-      const alpha = Math.trunc(clamp6(rawAlpha, 0, 1) * 255);
+      const alpha = Math.trunc(clamp7(rawAlpha, 0, 1) * 255);
       const inverse = 255 - alpha;
       const current = input[index];
       const low = blendTable[(sampled & 255) << 8 | alpha] + blendTable[(current & 255) << 8 | inverse];
@@ -4241,47 +5092,12 @@ function prepareInterpolationAxis(state, width, height, columns, rows) {
     }
   }
 }
-function sample(pixels, width, height, rawX, rawY, wrap, bilinear3) {
-  const maxX = bilinear3 ? Math.max(0, width - 2) : width - 1;
-  const maxY = bilinear3 ? Math.max(0, height - 2) : height - 1;
-  let x = rawX;
-  let y = rawY;
-  if (wrap) {
-    const spanX = Math.max(1, maxX);
-    const spanY = Math.max(1, maxY);
-    x = (x % spanX + spanX) % spanX;
-    y = (y % spanY + spanY) % spanY;
-  } else {
-    x = clamp6(x, 0, maxX);
-    y = clamp6(y, 0, maxY);
-  }
-  const ix = Math.trunc(x);
-  const iy = Math.trunc(y);
-  if (!bilinear3 || width < 2 || height < 2) return pixels[ix + iy * width];
-  const fx = Math.trunc((x - ix) * 256) & 255;
-  const fy = Math.trunc((y - iy) * 256) & 255;
-  const inverseX = 255 - fx;
-  const inverseY = 255 - fy;
-  const w0 = table3(inverseX, inverseY);
-  const w1 = table3(fx, inverseY);
-  const w2 = table3(inverseX, fy);
-  const w3 = table3(fx, fy);
-  const offset = ix + iy * width;
-  const p0 = pixels[offset];
-  const p1 = pixels[offset + 1];
-  const p2 = pixels[offset + width];
-  const p3 = pixels[offset + width + 1];
-  const low = table3(p0 & 255, w0) + table3(p1 & 255, w1) + table3(p2 & 255, w2) + table3(p3 & 255, w3);
-  const middle = table3(p0 >>> 8 & 255, w0) + table3(p1 >>> 8 & 255, w1) + table3(p2 >>> 8 & 255, w2) + table3(p3 >>> 8 & 255, w3);
-  const high = table3(p0 >>> 16 & 255, w0) + table3(p1 >>> 16 & 255, w1) + table3(p2 >>> 16 & 255, w2) + table3(p3 >>> 16 & 255, w3);
-  return low & 255 | (middle & 255) << 8 | (high & 255) << 16;
-}
 function readString2(payload, offset) {
   if (offset + 4 > payload.length) return { value: "", next: payload.length };
   const length = u323(payload, offset, 0);
   const start = offset + 4;
   const end = Math.min(payload.length, start + length);
-  return { value: nulText4(payload.subarray(start, end)), next: end };
+  return { value: nulText5(payload.subarray(start, end)), next: end };
 }
 function compileOrNull3(source) {
   if (!source.trim()) return null;
@@ -4300,20 +5116,14 @@ function i326(payload, offset, fallback) {
 function u323(payload, offset, fallback) {
   return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint32(offset, true) : fallback;
 }
-function nulText4(bytes) {
+function nulText5(bytes) {
   const end = bytes.indexOf(0);
-  return TEXT3.decode(end < 0 ? bytes : bytes.subarray(0, end));
+  return TEXT4.decode(end < 0 ? bytes : bytes.subarray(0, end));
 }
-function bilerp(a, b, c, d, x, y) {
-  return (a + (b - a) * x) * (1 - y) + (c + (d - c) * x) * y;
-}
-function table3(x, y) {
-  return AVS_BLEND_TABLE[x << 8 | y];
-}
-function clamp6(value, minimum, maximum) {
+function clamp7(value, minimum, maximum) {
   return value < minimum ? minimum : value > maximum ? maximum : value;
 }
-function hashPath6(path) {
+function hashPath7(path) {
   let hash = 2166136261;
   for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
   return hash >>> 0;
@@ -4406,13 +5216,13 @@ function rotoBlit(context, zoom, degrees, blend2, subpixel) {
   let tStart = -Math.trunc((width - 1) / 2) * dtDx - Math.trunc((height - 1) / 2) * dtDy + (height - 1) * (32768 + (1 << 20));
   let output = 0;
   for (let row = height; row > 0; row--) {
-    let s = modulo3(sStart, ds), t = modulo3(tStart, dt);
+    let s = modulo4(sStart, ds), t = modulo4(tStart, dt);
     for (let x = width; x > 0; x--) {
-      const sample2 = subpixel ? bilinear2(context, s, t) : context.input.pixels[(s >> 16) + (t >> 16) * width];
-      context.output.pixels[output] = blend2 ? blendPixel(sample2, context.input.pixels[output], "average") : sample2;
+      const sample = subpixel ? bilinear2(context, s, t) : context.input.pixels[(s >> 16) + (t >> 16) * width];
+      context.output.pixels[output] = blend2 ? blendPixel(sample, context.input.pixels[output], "average") : sample;
       output++;
-      s = modulo3(s + dsDx, ds);
-      t = modulo3(t + dtDx, dt);
+      s = modulo4(s + dsDx, ds);
+      t = modulo4(t + dtDx, dt);
     }
     sStart += dsDy;
     tStart += dtDy;
@@ -4421,7 +5231,7 @@ function rotoBlit(context, zoom, degrees, blend2, subpixel) {
 function bilinear2(context, s, t) {
   const x = s >> 16, y = t >> 16, fx = s >> 8 & 255, fy = t >> 8 & 255, width = context.input.width;
   const pixels = context.input.pixels, base = x + y * width;
-  const weights = [table4(255 - fx, 255 - fy), table4(fx, 255 - fy), table4(255 - fx, fy), table4(fx, fy)];
+  const weights = [table3(255 - fx, 255 - fy), table3(fx, 255 - fy), table3(255 - fx, fy), table3(fx, fy)];
   const samples = [pixels[base], pixels[base + 1], pixels[base + width], pixels[base + width + 1]];
   return channels(samples, weights);
 }
@@ -4433,16 +5243,16 @@ function interference(context, points, alpha, rgb2) {
       for (let index = 0; index < points.length; index++) {
         const pixel = displaced(context, x, y, points[index]);
         const channel = index % 3;
-        values[channel] = Math.min(255, values[channel] + table4(pixel >>> channel * 8 & 255, alpha));
+        values[channel] = Math.min(255, values[channel] + table3(pixel >>> channel * 8 & 255, alpha));
       }
       context.output.pixels[x + y * width] = values[0] | values[1] << 8 | values[2] << 16;
     } else {
       let red = 0, green = 0, blue = 0;
       for (const point of points) {
         const pixel = displaced(context, x, y, point);
-        blue += table4(pixel & 255, alpha);
-        green += table4(pixel >>> 8 & 255, alpha);
-        red += table4(pixel >>> 16 & 255, alpha);
+        blue += table3(pixel & 255, alpha);
+        green += table3(pixel >>> 8 & 255, alpha);
+        red += table3(pixel >>> 16 & 255, alpha);
       }
       context.output.pixels[x + y * width] = Math.min(255, blue) | Math.min(255, green) << 8 | Math.min(255, red) << 16;
     }
@@ -4534,7 +5344,7 @@ function channels(samples, weights) {
   let out = 0;
   for (let channel = 0; channel < 3; channel++) {
     let value = 0;
-    for (let i = 0; i < 4; i++) value += table4(samples[i] >>> channel * 8 & 255, weights[i]);
+    for (let i = 0; i < 4; i++) value += table3(samples[i] >>> channel * 8 & 255, weights[i]);
     out |= (value & 255) << channel * 8;
   }
   return out;
@@ -4544,10 +5354,10 @@ function mixColor(a, b, numerator, denominator) {
   for (let channel = 0; channel < 3; channel++) out |= Math.trunc(((a >>> channel * 8 & 255) * (denominator - numerator) + (b >>> channel * 8 & 255) * numerator) / denominator) << channel * 8;
   return out;
 }
-function table4(x, y) {
+function table3(x, y) {
   return Math.trunc(x / 255 * y);
 }
-function modulo3(value, divisor) {
+function modulo4(value, divisor) {
   const result = value % divisor;
   return result < 0 ? result + divisor : result;
 }
@@ -4556,421 +5366,6 @@ function int4(context, offset, fallback) {
 }
 function float(context, offset, fallback) {
   return offset + 4 <= context.component.payload.length ? new DataView(context.component.payload.buffer, context.component.payload.byteOffset, context.component.payload.byteLength).getFloat32(offset, true) : fallback;
-}
-
-// src/avs/effects/movement.ts
-var TEXT4 = new TextDecoder("windows-1252");
-var CUSTOM_EFFECT = 32767;
-var LAST_BUILTIN_EFFECT = 23;
-var OFFSET_MASK = (1 << 22) - 1;
-var EVALUATED_BUILTINS = {
-  18: {
-    source: "d=d*(1-(sin((r-$pi*.5)*7)*.03));r=r+(cos(d*12)*.03)",
-    rectangular: false
-  },
-  19: {
-    source: "d=d*(1-(sin((r-$pi*.5)*12)*.05));r=r+(cos(d*18)*.05);d=d*(1-((d-.4)*.03));r=r+((d-.4)*.13)",
-    rectangular: false
-  },
-  20: { source: "x=x+(cos(y*18)*.02);y=y+(sin(x*14)*.03)", rectangular: true },
-  21: {
-    source: "x=x+(cos(abs(y-.5)*8)*.02);y=y+(sin(abs(x-.5)*8)*.05);x=x*.95;y=y*.95",
-    rectangular: true
-  },
-  22: {
-    source: "y=y*(1+(sin(r+$pi/2)*.3));x=x*(1+(cos(r+$pi/2)*.3));x=x*.995;y=y*.995",
-    rectangular: true
-  },
-  23: { source: "y=(r*6)/$pi;x=d", rectangular: true }
-};
-function decodeAvsMovement(payload) {
-  let offset = 0;
-  let effect = readI322(payload, offset, 1);
-  offset += 4;
-  let expression = "";
-  let rectangular = false;
-  if (effect === CUSTOM_EFFECT) {
-    if (asciiEquals(payload, offset, "!rect ")) {
-      offset += 6;
-      rectangular = true;
-    }
-    if (payload[offset] === 1) {
-      offset++;
-      const length = readI322(payload, offset, 0);
-      offset += 4;
-      if (length > 0 && offset + length <= payload.length) {
-        expression = nulText5(payload.subarray(offset, offset + length));
-        offset += length;
-      }
-    } else {
-      const length = 256 - (rectangular ? 6 : 0);
-      if (offset + length <= payload.length) {
-        expression = nulText5(payload.subarray(offset, offset + length));
-        offset += length;
-      }
-    }
-  }
-  const blend2 = readI322(payload, offset, 0) !== 0;
-  offset += 4;
-  const sourceMapped = readI322(payload, offset, 0);
-  offset += 4;
-  rectangular = readI322(payload, offset, rectangular ? 1 : 0) !== 0;
-  offset += 4;
-  const subpixel = readI322(payload, offset, 0) !== 0;
-  offset += 4;
-  const wrap = readI322(payload, offset, 0) !== 0;
-  offset += 4;
-  if (effect === 0 && offset + 4 <= payload.length) effect = readI322(payload, offset, 0);
-  if (effect !== CUSTOM_EFFECT && effect > LAST_BUILTIN_EFFECT || effect < 0) effect = 0;
-  return { effect, expression, blend: blend2, sourceMapped, rectangular, subpixel, wrap };
-}
-function registerAvsMovement(registry, global = new AvsEelGlobalState()) {
-  const states = /* @__PURE__ */ new Map();
-  registry.registerBuiltin(15, (context) => {
-    let state = states.get(context.component.path);
-    if (!state) {
-      const config = decodeAvsMovement(context.component.payload);
-      state = {
-        config,
-        program: movementProgram(config),
-        sourceMapped: config.sourceMapped,
-        width: 0,
-        height: 0,
-        table: null,
-        randomState: hashPath7(context.component.path)
-      };
-      states.set(context.component.path, state);
-    }
-    if (state.config.effect === 0) return;
-    if (!state.table || state.width !== context.input.width || state.height !== context.input.height) {
-      state.table = buildMovementTable(context, state, global);
-      state.width = context.input.width;
-      state.height = context.input.height;
-    }
-    if (context.preinit) return;
-    if ((state.sourceMapped & 2) !== 0 && context.beat) state.sourceMapped ^= 1;
-    if ((state.sourceMapped & 1) !== 0) renderForward(context, state.table, state.config.blend);
-    else renderInverse(context, state.table, state.config.blend);
-    return { swap: true };
-  });
-  return registry;
-}
-function movementProgram(config) {
-  const source = config.effect === CUSTOM_EFFECT ? config.expression : EVALUATED_BUILTINS[config.effect]?.source;
-  if (!source?.trim()) return null;
-  try {
-    return compileAvsEel(source);
-  } catch {
-    return null;
-  }
-}
-function buildMovementTable(context, state, global) {
-  const { width, height } = context.input;
-  const count = width * height;
-  const config = state.config;
-  const bilinear3 = config.subpixel && width > 1 && height > 1 && count < 1 << 22 && (config.effect === CUSTOM_EFFECT || config.effect >= 3 && config.effect <= 23 && config.effect !== 7);
-  const table6 = {
-    offsets: new Uint32Array(count),
-    xWeights: new Uint8Array(count),
-    yWeights: new Uint8Array(count),
-    bilinear: bilinear3
-  };
-  if (config.effect === 1) {
-    for (let i = 0; i < count; i++) {
-      const dx = nextRandom3(state) % 3 - 1;
-      const dy = nextRandom3(state) % 3 - 1;
-      table6.offsets[i] = clamp7(i + dx + dy * width, 0, count - 1);
-    }
-    return table6;
-  }
-  if (config.effect === 2) {
-    const shift = Math.trunc(width / 64);
-    for (let y = 0; y < height; y++) {
-      let sourceX = shift;
-      for (let x = 0; x < width; x++) {
-        table6.offsets[x + y * width] = sourceX + y * width;
-        sourceX++;
-        if (sourceX >= width) sourceX -= width;
-      }
-    }
-    return table6;
-  }
-  if (config.effect === 7) {
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        let sourceX = x;
-        let sourceY = y;
-        if ((x & 2) === 0 && (y & 2) === 0) {
-          sourceX = Math.trunc(width / 2 + ((x & ~1) - width / 2) * 7 / 8);
-          sourceY = Math.trunc(height / 2 + ((y & ~1) - height / 2) * 7 / 8);
-        }
-        table6.offsets[x + y * width] = clamp7(sourceX, 0, width - 1) + clamp7(sourceY, 0, height - 1) * width;
-      }
-    }
-    return table6;
-  }
-  if (state.program) buildEvaluatedTable(context, state, table6, global);
-  else if (config.effect >= 3 && config.effect <= 17) buildNativeTable(state, table6, width, height);
-  else fillIdentity(table6, width, height);
-  return table6;
-}
-function buildNativeTable(state, table6, width, height) {
-  const halfWidth = Math.trunc(width / 2);
-  const halfHeight = Math.trunc(height / 2);
-  const maxDistance = Math.sqrt(width * width + height * height) / 2;
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const xd = x - halfWidth;
-      const yd = y - halfHeight;
-      let distance = Math.hypot(xd, yd);
-      let angle = Math.atan2(yd, xd);
-      let xOffset = 0;
-      switch (state.config.effect) {
-        case 3:
-          angle += 0.1 - 0.2 * distance / maxDistance;
-          distance *= 0.96;
-          break;
-        case 4:
-          distance *= 0.99 * (1 - Math.sin(angle) / 32);
-          angle += 0.03 * Math.sin(distance / maxDistance * Math.PI * 4);
-          break;
-        case 5:
-          distance *= 0.94 + Math.cos(angle * 32) * 0.06;
-          break;
-        case 6:
-          distance *= 1.01 + Math.cos(angle * 4) * 0.04;
-          angle += 0.03 * Math.sin(distance / maxDistance * Math.PI * 4);
-          break;
-        case 8:
-          angle += 0.1 * Math.sin(distance / maxDistance * Math.PI * 5);
-          break;
-        case 9: {
-          const t = Math.sin(distance / maxDistance * Math.PI);
-          distance -= 8 * t ** 5;
-          break;
-        }
-        case 10: {
-          const t = Math.sin(distance / maxDistance * Math.PI);
-          distance -= 8 * t ** 5;
-          const swirl = Math.cos(distance / maxDistance * Math.PI / 2);
-          angle += 0.1 * swirl ** 3;
-          break;
-        }
-        case 11:
-          distance *= 0.95 + Math.cos(angle * 5 - Math.PI / 2.5) * 0.03;
-          break;
-        case 12:
-          angle += 0.04;
-          distance *= 0.96 + Math.cos(distance / maxDistance * Math.PI) * 0.05;
-          break;
-        case 13: {
-          const t = Math.cos(distance / maxDistance * Math.PI);
-          angle += 0.07 * t;
-          distance *= 0.98 + t * 0.1;
-          break;
-        }
-        case 14:
-          angle += 0.1 - 0.2 * distance / maxDistance;
-          distance *= 0.96;
-          xOffset = 8;
-          break;
-        case 15:
-          distance = maxDistance * 0.15;
-          break;
-        case 16:
-          angle = Math.cos(angle * 3);
-          break;
-        case 17:
-          distance *= 1 - (distance / maxDistance - 0.35) * 0.5;
-          angle += 0.1;
-          break;
-      }
-      const sampleX = halfWidth + Math.cos(angle) * distance + 0.5 + xOffset * width / 256;
-      const sampleY = halfHeight + Math.sin(angle) * distance + 0.5;
-      storeCoordinate(table6, x + y * width, sampleX, sampleY, width, height, state.config.wrap);
-    }
-  }
-}
-function buildEvaluatedTable(context, state, table6, global) {
-  const { width, height } = context.input;
-  const halfWidth = Math.trunc(width / 2);
-  const halfHeight = Math.trunc(height / 2);
-  const maxDistance = Math.sqrt(width * width + height * height) / 2;
-  const vm = new AvsEelVm({ global, seed: state.randomState });
-  vm.setHost({
-    getosc: (band, span, channel) => avsAudioSample(context.audio, "osc", band, span, channel),
-    getspec: (band, span, channel) => avsAudioSample(context.audio, "spec", band, span, channel)
-  });
-  vm.set("sw", width);
-  vm.set("sh", height);
-  const rectangular = state.config.effect === CUSTOM_EFFECT ? state.config.rectangular : EVALUATED_BUILTINS[state.config.effect]?.rectangular === true;
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const xd = x - halfWidth;
-      const yd = y - halfHeight;
-      vm.set("x", halfWidth === 0 ? 0 : xd / halfWidth);
-      vm.set("y", halfHeight === 0 ? 0 : yd / halfHeight);
-      vm.set("d", maxDistance === 0 ? 0 : Math.hypot(xd, yd) / maxDistance);
-      vm.set("r", Math.atan2(yd, xd) + Math.PI / 2);
-      vm.execute(state.program);
-      let sampleX;
-      let sampleY;
-      if (rectangular) {
-        sampleX = (vm.get("x") + 1) * halfWidth;
-        sampleY = (vm.get("y") + 1) * halfHeight;
-      } else {
-        const distance = vm.get("d") * maxDistance;
-        const angle = vm.get("r") - Math.PI / 2;
-        sampleX = halfWidth + Math.cos(angle) * distance;
-        sampleY = halfHeight + Math.sin(angle) * distance;
-      }
-      if (!table6.bilinear) {
-        sampleX += 0.5;
-        sampleY += 0.5;
-      }
-      storeCoordinate(table6, x + y * width, sampleX, sampleY, width, height, state.config.wrap);
-    }
-  }
-}
-function storeCoordinate(table6, destination, rawX, rawY, width, height, wrap) {
-  if (!table6.bilinear) {
-    let x2 = Math.trunc(rawX);
-    let y2 = Math.trunc(rawY);
-    if (wrap) {
-      x2 = modulo4(x2, width);
-      y2 = modulo4(y2, height);
-    } else {
-      x2 = clamp7(x2, 0, width - 1);
-      y2 = clamp7(y2, 0, height - 1);
-    }
-    table6.offsets[destination] = x2 + y2 * width;
-    return;
-  }
-  let x = Math.trunc(rawX);
-  let y = Math.trunc(rawY);
-  let xPartial = Math.trunc(32 * (rawX - x));
-  let yPartial = Math.trunc(32 * (rawY - y));
-  if (wrap) {
-    x = modulo4(x, width - 1);
-    y = modulo4(y, height - 1);
-  } else {
-    if (x < 0) {
-      x = 0;
-      xPartial = 0;
-    } else if (x >= width - 1) {
-      x = width - 2;
-      xPartial = 31;
-    }
-    if (y < 0) {
-      y = 0;
-      yPartial = 0;
-    } else if (y >= height - 1) {
-      y = height - 2;
-      yPartial = 31;
-    }
-  }
-  const packed = (x + y * width | yPartial << 22 | xPartial << 27) >>> 0;
-  table6.offsets[destination] = packed & OFFSET_MASK;
-  table6.xWeights[destination] = packed >>> 24 & 31 << 3;
-  table6.yWeights[destination] = packed >>> 19 & 31 << 3;
-}
-function renderInverse(context, table6, blend2) {
-  const source = context.input.pixels;
-  const output = context.output.pixels;
-  const width = context.input.width;
-  if (table6.bilinear) {
-    if (blend2) {
-      for (let i = 0; i < output.length; i++) {
-        output[i] = averagePixel3(source[i], sampleBilinear(
-          source,
-          table6.offsets[i],
-          width,
-          table6.xWeights[i],
-          table6.yWeights[i]
-        ));
-      }
-    } else {
-      for (let i = 0; i < output.length; i++) {
-        output[i] = sampleBilinear(source, table6.offsets[i], width, table6.xWeights[i], table6.yWeights[i]);
-      }
-    }
-  } else if (blend2) {
-    for (let i = 0; i < output.length; i++) output[i] = averagePixel3(source[i], source[table6.offsets[i]]);
-  } else {
-    for (let i = 0; i < output.length; i++) output[i] = source[table6.offsets[i]];
-  }
-}
-function renderForward(context, table6, blend2) {
-  const source = context.input.pixels;
-  const output = context.output.pixels;
-  if (blend2) output.set(source);
-  else output.fill(0);
-  for (let i = 0; i < source.length; i++) {
-    const destination = table6.offsets[i];
-    output[destination] = maximumPixel2(source[i], output[destination]);
-  }
-  if (blend2) {
-    for (let i = 0; i < output.length; i++) output[i] = averagePixel3(output[i], source[i]);
-  }
-}
-function sampleBilinear(source, offset, width, xp, yp) {
-  const blendTable = AVS_BLEND_TABLE;
-  const inverseX = 255 - xp;
-  const inverseY = 255 - yp;
-  const w0 = blendTable[inverseX << 8 | inverseY];
-  const w1 = blendTable[xp << 8 | inverseY];
-  const w2 = blendTable[inverseX << 8 | yp];
-  const w3 = blendTable[xp << 8 | yp];
-  const p0 = source[offset];
-  const p1 = source[offset + 1];
-  const p2 = source[offset + width];
-  const p3 = source[offset + width + 1];
-  const low = blendTable[(p0 & 255) << 8 | w0] + blendTable[(p1 & 255) << 8 | w1] + blendTable[(p2 & 255) << 8 | w2] + blendTable[(p3 & 255) << 8 | w3];
-  const middle = blendTable[(p0 >>> 8 & 255) << 8 | w0] + blendTable[(p1 >>> 8 & 255) << 8 | w1] + blendTable[(p2 >>> 8 & 255) << 8 | w2] + blendTable[(p3 >>> 8 & 255) << 8 | w3];
-  const high = blendTable[(p0 >>> 16 & 255) << 8 | w0] + blendTable[(p1 >>> 16 & 255) << 8 | w1] + blendTable[(p2 >>> 16 & 255) << 8 | w2] + blendTable[(p3 >>> 16 & 255) << 8 | w3];
-  return low & 255 | (middle & 255) << 8 | (high & 255) << 16;
-}
-function fillIdentity(table6, width, height) {
-  for (let i = 0; i < width * height; i++) table6.offsets[i] = i;
-}
-function averagePixel3(a, b) {
-  return (a >>> 1 & 8355711) + (b >>> 1 & 8355711) & 16777215;
-}
-function maximumPixel2(a, b) {
-  return Math.max(a & 255, b & 255) | Math.max(a >>> 8 & 255, b >>> 8 & 255) << 8 | Math.max(a >>> 16 & 255, b >>> 16 & 255) << 16;
-}
-function nextRandom3(state) {
-  let x = state.randomState || 1831565813;
-  x ^= x << 13;
-  x ^= x >>> 17;
-  x ^= x << 5;
-  state.randomState = x >>> 0;
-  return state.randomState;
-}
-function modulo4(value, modulus) {
-  if (modulus <= 0) return 0;
-  const result = value % modulus;
-  return result < 0 ? result + modulus : result;
-}
-function readI322(payload, offset, fallback) {
-  return offset + 4 <= payload.length ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getInt32(offset, true) : fallback;
-}
-function asciiEquals(payload, offset, value) {
-  if (offset + value.length > payload.length) return false;
-  for (let i = 0; i < value.length; i++) if (payload[offset + i] !== value.charCodeAt(i)) return false;
-  return true;
-}
-function nulText5(bytes) {
-  const end = bytes.indexOf(0);
-  return TEXT4.decode(end < 0 ? bytes : bytes.subarray(0, end));
-}
-function clamp7(value, minimum, maximum) {
-  return value < minimum ? minimum : value > maximum ? maximum : value;
-}
-function hashPath7(path) {
-  let hash = 2166136261;
-  for (let i = 0; i < path.length; i++) hash = Math.imul(hash ^ path.charCodeAt(i), 16777619);
-  return hash >>> 0;
 }
 
 // src/avs/effects/low-count-builtins.ts
@@ -5296,7 +5691,17 @@ function infiniteRootBorder(context) {
 var AVS_CHANNEL_SHIFT_APE_ID = "Channel Shift";
 var AVS_COLOR_REDUCTION_APE_ID = "Color Reduction";
 var AVS_MULTIPLIER_APE_ID = "Multiplier";
-var CHANNEL_MODES = [1183, 1020, 1018, 1022, 1019, 1021];
+var AVS_CHANNEL_SHIFT_MODES = [1183, 1020, 1018, 1022, 1019, 1021];
+function createAvsChannelShiftState(config, path) {
+  return { mode: config.mode, randomState: hashPath9(path) };
+}
+function resolveAvsChannelShiftMode(state, config, beat) {
+  if (beat && config.randomizeOnBeat) {
+    state.randomState = xorshift323(state.randomState);
+    state.mode = AVS_CHANNEL_SHIFT_MODES[state.randomState % AVS_CHANNEL_SHIFT_MODES.length];
+  }
+  return state.mode;
+}
 function decodeAvsChannelShift(payload) {
   const native = new Uint8Array(8);
   const view = new DataView(native.buffer);
@@ -5325,14 +5730,10 @@ function registerAvsNamedApeEffects(registry = new AvsEffectRegistry()) {
     const config = decodeAvsChannelShift(context.component.payload);
     let state = shifts.get(context.component.path);
     if (!state) {
-      state = { mode: config.mode, randomState: hashPath9(context.component.path) };
+      state = createAvsChannelShiftState(config, context.component.path);
       shifts.set(context.component.path, state);
     }
-    if (context.beat && config.randomizeOnBeat) {
-      state.randomState = xorshift323(state.randomState);
-      state.mode = CHANNEL_MODES[state.randomState % CHANNEL_MODES.length];
-    }
-    shiftChannels(context, state.mode);
+    shiftChannels(context, resolveAvsChannelShiftMode(state, config, context.beat));
   });
   registry.registerApe(AVS_COLOR_REDUCTION_APE_ID, (context) => {
     if (context.preinit) return;
@@ -5345,7 +5746,7 @@ function registerAvsNamedApeEffects(registry = new AvsEffectRegistry()) {
   return registry;
 }
 function shiftChannels(context, mode) {
-  if (mode === 1183 || !CHANNEL_MODES.includes(mode)) return;
+  if (mode === 1183 || !AVS_CHANNEL_SHIFT_MODES.includes(mode)) return;
   for (let i = 0; i < context.input.pixels.length; i++) {
     const pixel = context.input.pixels[i];
     const red = pixel >>> 16 & 255;
@@ -5717,7 +6118,7 @@ function registerUniqueTone(registry) {
       const original = pixels[i];
       let depth = Math.max(original & 255, original >>> 8 & 255, original >>> 16 & 255);
       if (config.invert) depth = 255 - depth;
-      const tone = table5(depth, blue) | table5(depth, green) << 8 | table5(depth, red) << 16;
+      const tone = table4(depth, blue) | table4(depth, green) << 8 | table4(depth, red) << 16;
       pixels[i] = config.additive ? blendPixel(tone, original, "additive") : config.average ? averagePixel4(original, tone) : tone;
     }
   });
@@ -5784,12 +6185,12 @@ function avsIntegerSquareRoot(value) {
   return Math.trunc(Math.sqrt(n));
 }
 function sampleBilinear2(source, offset, width, xp, yp) {
-  const weights = [table5(255 - xp, 255 - yp), table5(xp, 255 - yp), table5(255 - xp, yp), table5(xp, yp)];
+  const weights = [table4(255 - xp, 255 - yp), table4(xp, 255 - yp), table4(255 - xp, yp), table4(xp, yp)];
   const pixels = [source[offset], source[offset + 1], source[offset + width], source[offset + width + 1]];
   let result = 0;
   for (let shift = 0; shift <= 16; shift += 8) {
     let value = 0;
-    for (let i = 0; i < 4; i++) value += table5(pixels[i] >>> shift & 255, weights[i]);
+    for (let i = 0; i < 4; i++) value += table4(pixels[i] >>> shift & 255, weights[i]);
     result |= (value & 255) << shift;
   }
   return result;
@@ -5800,7 +6201,7 @@ function eelChannel(value) {
 function averagePixel4(a, b) {
   return (a >>> 1 & 8355711) + (b >>> 1 & 8355711) & 16777215;
 }
-function table5(x, y) {
+function table4(x, y) {
   return Math.trunc(x / 255 * y);
 }
 function i327(payload, offset, fallback) {
@@ -5864,16 +6265,28 @@ function registerAvsSuperScope(registry, global = registry.eelGlobal) {
     if (!state) {
       const config = decodeAvsSuperScope(context.component.payload);
       const vm = new AvsEelVm({ global, seed: hashPath11(context.component.path) });
+      const host = { audio: context.audio };
+      vm.setHost({
+        getosc: (band, width, channel) => avsAudioSample(host.audio, "osc", band, width, channel),
+        getspec: (band, width, channel) => avsAudioSample(host.audio, "spec", band, width, channel)
+      });
       vm.set("n", 100);
+      const programs = [
+        compileOrNull4(config.point),
+        compileOrNull4(config.frame),
+        compileOrNull4(config.beat),
+        compileOrNull4(config.init)
+      ];
       state = {
         config,
         vm,
-        programs: [
-          compileOrNull4(config.point),
-          compileOrNull4(config.frame),
-          compileOrNull4(config.beat),
-          compileOrNull4(config.init)
+        executors: [
+          programs[0]?.bind(vm) ?? null,
+          programs[1]?.bind(vm) ?? null,
+          programs[2]?.bind(vm) ?? null,
+          programs[3]?.bind(vm) ?? null
         ],
+        host,
         initialized: false,
         colorPosition: 0,
         centeredAudio: new Uint8Array(576),
@@ -5890,10 +6303,7 @@ function renderSuperScope(context, config, state) {
   if (config.colors.length === 0) return;
   const { vm } = state;
   const variables = state.variables;
-  vm.setHost({
-    getosc: (band, width, channel) => avsAudioSample(context.audio, "osc", band, width, channel),
-    getspec: (band, width, channel) => avsAudioSample(context.audio, "spec", band, width, channel)
-  });
+  state.host.audio = context.audio;
   state.colorPosition++;
   if (state.colorPosition >= config.colors.length * 64) state.colorPosition = 0;
   const color = interpolatedColor(config.colors, state.colorPosition);
@@ -5907,16 +6317,42 @@ function renderSuperScope(context, config, state) {
   setBinding(variables.linesize, context.line.lineWidth >>> 0 & 255);
   setBinding(variables.drawmode, config.lines ? 1 : 0);
   if (!state.initialized) {
-    execute5(state.programs[3], vm);
+    execute5(state.executors[3]);
     state.initialized = true;
   }
-  execute5(state.programs[1], vm);
-  if (context.beat) execute5(state.programs[2], vm);
-  if (!state.programs[0]) return;
+  execute5(state.executors[1]);
+  if (context.beat) execute5(state.executors[2]);
+  const executePoint = state.executors[0];
+  if (!executePoint) return;
   const count = Math.min(MAX_POINTS, Math.trunc(getBinding(variables.n)));
   if (count <= 0) return;
   const data = scopeChannel(context, config.channel, state.centeredAudio);
   const xor = (config.channel & 4) !== 0 ? 0 : 128;
+  runSuperScopePoints(context, variables, executePoint, data, xor, count);
+}
+function runSuperScopePoints(context, variables, executePoint, data, xor, count) {
+  const vValues = variables.v.values;
+  const vIndex = variables.v.index;
+  const iValues = variables.i.values;
+  const iIndex = variables.i.index;
+  const skipValues = variables.skip.values;
+  const skipIndex = variables.skip.index;
+  const xValues = variables.x.values;
+  const xIndex = variables.x.index;
+  const yValues = variables.y.values;
+  const yIndex = variables.y.index;
+  const blueValues = variables.blue.values;
+  const blueIndex = variables.blue.index;
+  const greenValues = variables.green.values;
+  const greenIndex = variables.green.index;
+  const redValues = variables.red.values;
+  const redIndex = variables.red.index;
+  const drawmodeValues = variables.drawmode.values;
+  const drawmodeIndex = variables.drawmode.index;
+  const linesizeValues = variables.linesize.values;
+  const linesizeIndex = variables.linesize.index;
+  const inputWidth = context.input.width;
+  const inputHeight = context.input.height;
   let canDraw = false;
   let lastX = 0;
   let lastY = 0;
@@ -5926,18 +6362,18 @@ function renderSuperScope(context, config, state) {
     const fraction = audioPosition - sourceIndex;
     const a = data[Math.min(575, sourceIndex)] ^ xor;
     const b = data[Math.min(575, sourceIndex + 1)] ^ xor;
-    setBinding(variables.v, (a * (1 - fraction) + b * fraction) / 128 - 1);
-    setBinding(variables.i, count === 1 ? 0 : index / (count - 1));
-    setBinding(variables.skip, 0);
-    state.programs[0].execute(vm);
-    const x = Math.trunc((getBinding(variables.x) + 1) * context.input.width * 0.5);
-    const y = Math.trunc((getBinding(variables.y) + 1) * context.input.height * 0.5);
-    if (getBinding(variables.skip) < 1e-5) {
-      const drawColor = makeByte(getBinding(variables.blue)) | makeByte(getBinding(variables.green)) << 8 | makeByte(getBinding(variables.red)) << 16;
-      if (getBinding(variables.drawmode) < 1e-5) {
+    vValues[vIndex] = (a * (1 - fraction) + b * fraction) / 128 - 1;
+    iValues[iIndex] = count === 1 ? 0 : index / (count - 1);
+    skipValues[skipIndex] = 0;
+    executePoint();
+    const x = Math.trunc(((xValues[xIndex] ?? 0) + 1) * inputWidth * 0.5);
+    const y = Math.trunc(((yValues[yIndex] ?? 0) + 1) * inputHeight * 0.5);
+    if ((skipValues[skipIndex] ?? 0) < 1e-5) {
+      const drawColor = makeByte(blueValues[blueIndex] ?? 0) | makeByte(greenValues[greenIndex] ?? 0) << 8 | makeByte(redValues[redIndex] ?? 0) << 16;
+      if ((drawmodeValues[drawmodeIndex] ?? 0) < 1e-5) {
         drawPoint(context, x, y, drawColor);
       } else if (canDraw && (drawColor !== 0 || context.line.blendMode !== 1)) {
-        drawLine2(context, lastX, lastY, x, y, drawColor, Math.trunc(getBinding(variables.linesize) + 0.5));
+        drawLine2(context, lastX, lastY, x, y, drawColor, Math.trunc((linesizeValues[linesizeIndex] ?? 0) + 0.5));
       }
     }
     canDraw = true;
@@ -6023,8 +6459,8 @@ function drawLine2(context, x1, y1, x2, y2, color, requestedWidth) {
     }
   }
 }
-function execute5(program, vm) {
-  return program ? vm.execute(program) : 0;
+function execute5(executor) {
+  return executor ? executor() : 0;
 }
 function bindVariables(vm) {
   return {
@@ -6569,9 +7005,9 @@ function renderTexer2(context, config, bitmap, state) {
     vm.set("i", progress);
     progress += step;
     vm.set("skip", 0);
-    const sample2 = Math.trunc(index * 575 / count);
-    const left = signedByte2(context.audio.waveform[0][sample2]);
-    const right = signedByte2(context.audio.waveform[1][sample2]);
+    const sample = Math.trunc(index * 575 / count);
+    const left = signedByte2(context.audio.waveform[0][sample]);
+    const right = signedByte2(context.audio.waveform[1][sample]);
     vm.set("v", (left + right) / 256);
     execute6(state.programs[3], vm);
     if (vm.get("skip") !== 0) continue;
@@ -6615,6 +7051,10 @@ function drawTexer2Particle(context, config, bitmap, x, y, sizeX, sizeY, color, 
   else drawUnscaledParticle(context, bitmap, x, y, color, config.colorize, flipX, flipY);
 }
 function drawUnscaledParticle(context, bitmap, x, y, color, colorize, flipX, flipY) {
+  const pixels = context.input.pixels;
+  const width = context.input.width;
+  const blendMode = context.line.blendMode;
+  const adjustableAlpha = context.line.adjustableAlpha;
   const screenMaxX = context.input.width - 1;
   const screenMaxY = context.input.height - 1;
   const imageMaxX = bitmap.width - 1;
@@ -6633,20 +7073,20 @@ function drawUnscaledParticle(context, bitmap, x, y, color, colorize, flipX, fli
   if (right <= left || bottom <= top) return;
   for (let drawY = top; drawY <= bottom; drawY++, textureY++) {
     let tx = textureX;
+    let destination = drawY * width + left;
     for (let drawX = left; drawX <= right; drawX++, tx++) {
       let source = sampleBitmap(bitmap, tx, textureY, flipX, flipY);
       if (colorize) source = filterPixel(source, color);
-      const destination = drawY * context.input.width + drawX;
-      context.input.pixels[destination] = blendTexerPixel(
-        source,
-        context.input.pixels[destination],
-        context.line.blendMode,
-        context.line.adjustableAlpha
-      );
+      pixels[destination] = blendMode === 0 ? source & 16777215 : blendTexerPixel(source, pixels[destination], blendMode, adjustableAlpha);
+      destination++;
     }
   }
 }
 function drawScaledParticle(context, bitmap, x, y, sizeX, sizeY, color, flipX, flipY) {
+  const pixels = context.input.pixels;
+  const width = context.input.width;
+  const blendMode = context.line.blendMode;
+  const adjustableAlpha = context.line.adjustableAlpha;
   const screenMaxX = context.input.width - 1;
   const screenMaxY = context.input.height - 1;
   const imageMaxX = bitmap.width - 1;
@@ -6687,15 +7127,11 @@ function drawScaledParticle(context, bitmap, x, y, sizeX, sizeY, color, flipX, f
   }
   if (right <= left || bottom <= top) return;
   for (let drawY = top, fy = cy; drawY <= bottom; drawY++, fy += stepY) {
+    let destination = drawY * width + left;
     for (let drawX = left, fx = cx; drawX <= right; drawX++, fx += stepX) {
       const source = filterPixel(sampleBilinearFixed(bitmap, fx, fy, flipX, flipY), color);
-      const destination = drawY * context.input.width + drawX;
-      context.input.pixels[destination] = blendTexerPixel(
-        source,
-        context.input.pixels[destination],
-        context.line.blendMode,
-        context.line.adjustableAlpha
-      );
+      pixels[destination] = blendMode === 0 ? source & 16777215 : blendTexerPixel(source, pixels[destination], blendMode, adjustableAlpha);
+      destination++;
     }
   }
 }
@@ -6704,10 +7140,16 @@ function sampleBilinearFixed(bitmap, fx, fy, flipX, flipY) {
   const y = clamp12(fy >> 16, 0, Math.max(0, bitmap.height - 2));
   const dx = fx >>> 8 & 255;
   const dy = fy >>> 8 & 255;
-  const a = sampleBitmap(bitmap, x, y, flipX, flipY);
-  const b = sampleBitmap(bitmap, x + 1, y, flipX, flipY);
-  const c = sampleBitmap(bitmap, x, y + 1, flipX, flipY);
-  const d = sampleBitmap(bitmap, x + 1, y + 1, flipX, flipY);
+  const x1 = Math.min(x + 1, bitmap.width - 1);
+  const y1 = Math.min(y + 1, bitmap.height - 1);
+  const sx0 = flipX ? bitmap.width - x - 1 : x;
+  const sx1 = flipX ? bitmap.width - x1 - 1 : x1;
+  const row0 = (flipY ? bitmap.height - y - 1 : y) * bitmap.width;
+  const row1 = (flipY ? bitmap.height - y1 - 1 : y1) * bitmap.width;
+  const a = bitmap.pixels[row0 + sx0];
+  const b = bitmap.pixels[row0 + sx1];
+  const c = bitmap.pixels[row1 + sx0];
+  const d = bitmap.pixels[row1 + sx1];
   const inverseX = 255 - dx;
   const inverseY = 255 - dy;
   return interpolateByte(a, b, c, d, dx, dy, inverseX, inverseY) | interpolateByte(a >>> 8, b >>> 8, c >>> 8, d >>> 8, dx, dy, inverseX, inverseY) << 8 | interpolateByte(a >>> 16, b >>> 16, c >>> 16, d >>> 16, dx, dy, inverseX, inverseY) << 16;
@@ -6862,6 +7304,10 @@ function createAvsCompatibilityRegistry(classicOptions = {}, texerOptions = {}) 
   return registry;
 }
 
+// src/avs/gpu-ordered-draw.ts
+var DEFAULT_BUDGET = 64 * 1024 * 1024;
+var DEFAULT_MAX_RECORDS = 4 * 128 * 1024;
+
 // src/avs/runtime.ts
 var AvsCompatibilityRuntime = class {
   preset;
@@ -6878,6 +7324,15 @@ var AvsCompatibilityRuntime = class {
   }
   get framebuffer() {
     return this.surface;
+  }
+  get controls() {
+    return this.executor.controls;
+  }
+  setControls(controls) {
+    this.executor.setControls(controls);
+  }
+  setComponentControl(path, control) {
+    this.executor.setComponentControl(path, control);
   }
   resize(width, height) {
     if (this.surface.width === width && this.surface.height === height) return;
@@ -7103,13 +7558,13 @@ function crc32(bytes) {
   return (crc ^ 4294967295) >>> 0;
 }
 function buildCrcTable() {
-  const table6 = new Uint32Array(256);
+  const table5 = new Uint32Array(256);
   for (let n = 0; n < 256; n++) {
     let c = n;
     for (let k = 0; k < 8; k++) c = c & 1 ? 3988292384 ^ c >>> 1 : c >>> 1;
-    table6[n] = c >>> 0;
+    table5[n] = c >>> 0;
   }
-  return table6;
+  return table5;
 }
 function writeU32(output, offset, value) {
   output[offset] = value >>> 24;

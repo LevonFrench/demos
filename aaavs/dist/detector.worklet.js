@@ -1,53 +1,292 @@
+// src/audio-features.ts
+var PERCEPTUAL_BAND_EDGES_HZ = [
+  0,
+  125,
+  250,
+  500,
+  750,
+  1e3,
+  1500,
+  2500,
+  4e3,
+  6e3,
+  8500,
+  12e3,
+  2e4
+];
+var PERCEPTUAL_BAND_COUNT = PERCEPTUAL_BAND_EDGES_HZ.length - 1;
+var ONSET_CLASS_NAMES = [
+  null,
+  "kick",
+  "snare",
+  "hat",
+  "tonal"
+];
+var ONSET_CLASS_KICK = 1;
+var ONSET_CLASS_SNARE = 2;
+var ONSET_CLASS_HAT = 3;
+var ONSET_CLASS_TONAL = 4;
+var AUDIO_FEATURE_OFFSETS = Object.freeze({
+  time: 0,
+  flux: 1,
+  threshold: 2,
+  level: 3,
+  crest: 4,
+  pan: 5,
+  width: 6,
+  centroid: 7,
+  flatness: 8,
+  publicBands: 9,
+  onsetStrength: 14,
+  onsetClass: 15,
+  perceptualBands: 16,
+  perceptualFlux: 16 + PERCEPTUAL_BAND_COUNT
+});
+var AUDIO_FEATURE_FLOATS = 16 + PERCEPTUAL_BAND_COUNT * 2;
+var PUBLIC_EDGES = [0, 80, 250, 2e3, 8e3, 2e4];
+var PUBLIC_GAINS = [1.6, 1.5, 2.2, 3, 3];
+var PUBLIC_BAND_COUNT = 5;
+var HISTORY_SECONDS = 1.1;
+var WARMUP_SECONDS = 0.25;
+var THRESHOLD_SIGMA = 1.55;
+var FLUX_FLOOR = 0.012;
+var MIN_GAP_SECONDS = 0.09;
+var WHITEN_FLOOR = 0.02;
+var WHITEN_DECAY_PER_SECOND = 0.36;
+var ENERGY_ATTACK_SECONDS = 0.012;
+var ENERGY_RELEASE_SECONDS = 0.18;
+var FLUX_ATTACK_SECONDS = 4e-3;
+var FLUX_RELEASE_SECONDS = 0.085;
+var EMPTY_TIME = -1e9;
+var SPECTRUM_MIN_DB = -100;
+var SPECTRUM_DB_RANGE = 70;
+var AdaptiveMultibandDetector = class {
+  result = {
+    flux: 0,
+    threshold: 0,
+    onsetStrength: 0,
+    onsetClassCode: 0,
+    bands: new Float32Array(PERCEPTUAL_BAND_COUNT),
+    bandFlux: new Float32Array(PERCEPTUAL_BAND_COUNT),
+    publicBands: new Float32Array(PUBLIC_BAND_COUNT)
+  };
+  bandStart = new Int16Array(PERCEPTUAL_BAND_COUNT);
+  bandEnd = new Int16Array(PERCEPTUAL_BAND_COUNT);
+  publicWeights = new Float32Array(PUBLIC_BAND_COUNT * PERCEPTUAL_BAND_COUNT);
+  publicWeightSums = new Float32Array(PUBLIC_BAND_COUNT);
+  energy = new Float32Array(PERCEPTUAL_BAND_COUNT);
+  classificationEnergy = new Float32Array(PERCEPTUAL_BAND_COUNT);
+  positiveFlux = new Float32Array(PERCEPTUAL_BAND_COUNT);
+  peak = new Float32Array(PERCEPTUAL_BAND_COUNT);
+  previous = new Float32Array(PERCEPTUAL_BAND_COUNT);
+  linearMagnitude = new Float32Array(256);
+  historyTime;
+  historyFlux;
+  historyCapacity;
+  historyHead = 0;
+  historyCount = 0;
+  historySum = 0;
+  historySquareSum = 0;
+  historyFirstTime = EMPTY_TIME;
+  lastOnset = EMPTY_TIME;
+  activeBands = 0;
+  constructor(sampleRate2, spectrumBins, maximumFramesPerSecond = 1e3) {
+    const nyquist = Math.max(1, sampleRate2 * 0.5);
+    for (let value = 0; value < 256; value++) {
+      const db = SPECTRUM_MIN_DB + value / 255 * SPECTRUM_DB_RANGE;
+      this.linearMagnitude[value] = Math.pow(10, db / 20);
+    }
+    for (let band = 0; band < PERCEPTUAL_BAND_COUNT; band++) {
+      const lo = PERCEPTUAL_BAND_EDGES_HZ[band];
+      const hi = Math.min(nyquist, PERCEPTUAL_BAND_EDGES_HZ[band + 1]);
+      const start = Math.min(spectrumBins, Math.max(0, Math.floor(lo / nyquist * spectrumBins)));
+      const end = hi > lo ? Math.min(spectrumBins, Math.max(start + 1, Math.ceil(hi / nyquist * spectrumBins))) : start;
+      this.bandStart[band] = start;
+      this.bandEnd[band] = end;
+      if (end > start) this.activeBands++;
+      const perceptualHi = PERCEPTUAL_BAND_EDGES_HZ[band + 1];
+      for (let pub = 0; pub < PUBLIC_BAND_COUNT; pub++) {
+        const overlap = Math.max(
+          0,
+          Math.min(perceptualHi, PUBLIC_EDGES[pub + 1]) - Math.max(lo, PUBLIC_EDGES[pub])
+        );
+        const weight = overlap / Math.max(1, perceptualHi - lo);
+        this.publicWeights[pub * PERCEPTUAL_BAND_COUNT + band] = weight;
+        this.publicWeightSums[pub] = this.publicWeightSums[pub] + weight;
+      }
+    }
+    this.historyCapacity = Math.max(32, Math.ceil(HISTORY_SECONDS * maximumFramesPerSecond) + 4);
+    this.historyTime = new Float32Array(this.historyCapacity);
+    this.historyFlux = new Float32Array(this.historyCapacity);
+    this.reset();
+  }
+  reset() {
+    this.result.flux = 0;
+    this.result.threshold = 0;
+    this.result.onsetStrength = 0;
+    this.result.onsetClassCode = 0;
+    this.result.bands.fill(0);
+    this.result.bandFlux.fill(0);
+    this.result.publicBands.fill(0);
+    this.energy.fill(0);
+    this.classificationEnergy.fill(0);
+    this.positiveFlux.fill(0);
+    this.peak.fill(WHITEN_FLOOR);
+    this.previous.fill(0);
+    this.historyTime.fill(EMPTY_TIME);
+    this.historyFlux.fill(0);
+    this.historyHead = 0;
+    this.historyCount = 0;
+    this.historySum = 0;
+    this.historySquareSum = 0;
+    this.historyFirstTime = EMPTY_TIME;
+    this.lastOnset = EMPTY_TIME;
+  }
+  analyse(spectrum, scale, time, dt, flatness) {
+    const safeDt = Math.max(1e-5, Math.min(0.25, dt));
+    const peakDecay = Math.pow(WHITEN_DECAY_PER_SECOND, safeDt);
+    let flux = 0;
+    let active = 0;
+    for (let band = 0; band < PERCEPTUAL_BAND_COUNT; band++) {
+      const start = this.bandStart[band];
+      const end = Math.min(this.bandEnd[band], spectrum.length);
+      let square = 0;
+      let linearSquare = 0;
+      for (let bin = start; bin < end; bin++) {
+        const raw = (spectrum[bin] ?? 0) * scale;
+        const quantized = Math.floor(Math.max(0, Math.min(1, raw)) * 255 + 1e-6);
+        const value = quantized / 255;
+        square += value * value;
+        const linear = this.linearMagnitude[quantized];
+        linearSquare += linear * linear;
+      }
+      const energy = end > start ? Math.sqrt(square / (end - start)) : 0;
+      this.energy[band] = energy;
+      this.classificationEnergy[band] = end > start ? Math.sqrt(linearSquare / (end - start)) : 0;
+      const oldEnvelope = this.result.bands[band];
+      const energyTau = energy > oldEnvelope ? ENERGY_ATTACK_SECONDS : ENERGY_RELEASE_SECONDS;
+      const energyCoeff = Math.exp(-safeDt / energyTau);
+      this.result.bands[band] = energy + (oldEnvelope - energy) * energyCoeff;
+      const peak = Math.max(energy, this.peak[band] * peakDecay, WHITEN_FLOOR);
+      this.peak[band] = peak;
+      const normalised = energy / peak;
+      const positive = Math.max(0, normalised - this.previous[band]);
+      this.positiveFlux[band] = positive;
+      this.previous[band] = normalised;
+      const oldFlux = this.result.bandFlux[band];
+      const fluxTau = positive > oldFlux ? FLUX_ATTACK_SECONDS : FLUX_RELEASE_SECONDS;
+      const fluxCoeff = Math.exp(-safeDt / fluxTau);
+      this.result.bandFlux[band] = positive + (oldFlux - positive) * fluxCoeff;
+      if (end > start) {
+        flux += positive;
+        active++;
+      }
+    }
+    flux /= Math.max(1, active);
+    this.expireHistory(time);
+    const mean = this.historyCount > 0 ? this.historySum / this.historyCount : 0;
+    const variance = this.historyCount > 0 ? Math.max(0, this.historySquareSum / this.historyCount - mean * mean) : 0;
+    const threshold = mean + THRESHOLD_SIGMA * Math.sqrt(variance);
+    const warmed = this.historyFirstTime > EMPTY_TIME * 0.5 && time - this.historyFirstTime >= WARMUP_SECONDS;
+    let onsetStrength = 0;
+    let onsetClassCode = 0;
+    if (warmed && flux > threshold && flux > FLUX_FLOOR && time - this.lastOnset > MIN_GAP_SECONDS) {
+      this.lastOnset = time;
+      onsetStrength = clamp01(0.55 + (flux - threshold) / Math.max(threshold, 1e-4) * 0.45);
+      onsetClassCode = this.classify(flatness);
+    }
+    this.pushHistory(time, flux);
+    this.aggregatePublicBands();
+    this.result.flux = flux;
+    this.result.threshold = threshold;
+    this.result.onsetStrength = onsetStrength;
+    this.result.onsetClassCode = onsetClassCode;
+    return this.result;
+  }
+  classify(flatness) {
+    let low = 0, mid = 0, high = 0;
+    let lowCount = 0, midCount = 0, highCount = 0;
+    for (let band = 0; band < PERCEPTUAL_BAND_COUNT; band++) {
+      if (this.bandEnd[band] <= this.bandStart[band]) continue;
+      const density = this.classificationEnergy[band] * (0.2 + this.positiveFlux[band]);
+      if (band < 2) {
+        low += density;
+        lowCount++;
+      } else if (band < 7) {
+        mid += density;
+        midCount++;
+      } else {
+        high += density;
+        highCount++;
+      }
+    }
+    low /= Math.max(1, lowCount);
+    mid /= Math.max(1, midCount);
+    high /= Math.max(1, highCount);
+    const total = low + mid + high + 1e-6;
+    const lowShare = low / total;
+    const highShare = high / total;
+    if (highShare > 0.4) return ONSET_CLASS_HAT;
+    if (flatness > 0.28) return ONSET_CLASS_SNARE;
+    if (lowShare > 0.56) return ONSET_CLASS_KICK;
+    return ONSET_CLASS_TONAL;
+  }
+  aggregatePublicBands() {
+    for (let pub = 0; pub < PUBLIC_BAND_COUNT; pub++) {
+      let sum = 0;
+      for (let band = 0; band < PERCEPTUAL_BAND_COUNT; band++) {
+        sum += this.result.bands[band] * this.publicWeights[pub * PERCEPTUAL_BAND_COUNT + band];
+      }
+      this.result.publicBands[pub] = clamp01(
+        sum / Math.max(1e-6, this.publicWeightSums[pub]) * PUBLIC_GAINS[pub]
+      );
+    }
+  }
+  expireHistory(time) {
+    while (this.historyCount > 0) {
+      const tail = (this.historyHead - this.historyCount + this.historyCapacity) % this.historyCapacity;
+      if (time - this.historyTime[tail] <= HISTORY_SECONDS) break;
+      const old = this.historyFlux[tail];
+      this.historySum -= old;
+      this.historySquareSum -= old * old;
+      this.historyCount--;
+    }
+    if (this.historyCount === 0) this.historyFirstTime = EMPTY_TIME;
+    else {
+      const tail = (this.historyHead - this.historyCount + this.historyCapacity) % this.historyCapacity;
+      this.historyFirstTime = this.historyTime[tail];
+    }
+  }
+  pushHistory(time, flux) {
+    if (this.historyCount === this.historyCapacity) {
+      const old = this.historyFlux[this.historyHead];
+      this.historySum -= old;
+      this.historySquareSum -= old * old;
+      this.historyCount--;
+    }
+    this.historyTime[this.historyHead] = time;
+    this.historyFlux[this.historyHead] = flux;
+    this.historyHead = (this.historyHead + 1) % this.historyCapacity;
+    this.historyCount++;
+    this.historySum += flux;
+    this.historySquareSum += flux * flux;
+    if (this.historyCount === 1) this.historyFirstTime = time;
+  }
+};
+function clamp01(value) {
+  return value < 0 ? 0 : value > 1 ? 1 : value;
+}
+
 // src/worklets/detector.worklet.ts
-var FEATURE_FLOATS = 16;
 var RING_FRAMES = 256;
 var HEADER_INTS = 4;
 var HEADER_BYTES = HEADER_INTS * 4;
 var CTL_WRITE_COUNT = 0;
-var F_TIME = 0;
-var F_FLUX = 1;
-var F_THRESH = 2;
-var F_LEVEL = 3;
-var F_CREST = 4;
-var F_PAN = 5;
-var F_WIDTH = 6;
-var F_CENTROID = 7;
-var F_FLATNESS = 8;
-var F_BAND_SUB = 9;
-var F_ONSET_STRENGTH = 14;
-var F_ONSET_CLASS = 15;
 var FFT_N = 512;
 var BINS = FFT_N / 2;
-var DETECT_WINDOW = 1.1;
-var DETECT_WARMUP = 0.25;
-var DETECT_K = 1.6;
-var DETECT_FLOOR = 4e-3;
-var DETECT_HZ = 8e3;
-var MIN_GAP = 0.09;
 var MIN_DB = -100;
 var MAX_DB = -30;
 var DB_RANGE = MAX_DB - MIN_DB;
-var WHITEN_DECAY_PER_SEC = 0.9418;
-var WHITEN_FLOOR = 0.02;
-var BAND_EDGES = [
-  [20, 80],
-  // sub
-  [80, 250],
-  // low
-  [250, 2e3],
-  // mid
-  [2e3, 8e3],
-  // high
-  [8e3, 2e4]
-  // air
-];
-var BAND_GAINS = [1.6, 1.5, 2.2, 3, 3];
-var CLASS_KICK = 1;
-var CLASS_SNARE = 2;
-var CLASS_HAT = 3;
-var CLASS_TONAL = 4;
-var CLASS_NAMES = ["", "kick", "snare", "hat", "tonal"];
-var FLUX_EMPTY = -1e9;
 var DetectorProcessor = class extends AudioWorkletProcessor {
   // --- shared output ------------------------------------------------------
   ctl;
@@ -70,29 +309,7 @@ var DetectorProcessor = class extends AudioWorkletProcessor {
   windowGain;
   // --- detector state -----------------------------------------------------
   spec = new Float32Array(BINS);
-  prevSpec = new Float32Array(BINS);
-  whiten = new Float32Array(BINS).fill(1);
-  /**
-   * Flux history, TIME-stamped. Never a frame count — §3.2.
-   *
-   * Empty slots hold FLUX_EMPTY, not 0. A zero timestamp is a LIVE timestamp
-   * for the first second of a context's life, so a zero-filled ring reads as
-   * 421 real samples of flux 0: mean and variance both collapse, the threshold
-   * lands on ~0, and every quantum until the ring fills reports an onset. That
-   * is a burst of a dozen phantom hits on the first note of a track, which is
-   * exactly where it is most visible.
-   */
-  fluxT;
-  fluxV;
-  fluxRing;
-  /** Samples the window must hold before an onset is allowed to fire. */
-  fluxWarmup;
-  fi = 0;
-  lastOnset = -1;
-  topBin;
-  loTopBin;
-  hiBotBin;
-  bandBins;
+  detector = new AdaptiveMultibandDetector(sampleRate, BINS, sampleRate / 128);
   /** Reused onset payload. postMessage structured-clones it, so one is enough. */
   onsetMsg = {
     type: "onset",
@@ -107,7 +324,7 @@ var DetectorProcessor = class extends AudioWorkletProcessor {
     const ring = opts?.ring;
     if (ring) {
       this.ctl = new Int32Array(ring, 0, HEADER_INTS);
-      this.frames = new Float32Array(ring, HEADER_BYTES, RING_FRAMES * FEATURE_FLOATS);
+      this.frames = new Float32Array(ring, HEADER_BYTES, RING_FRAMES * AUDIO_FEATURE_FLOATS);
     } else {
       this.ctl = null;
       this.frames = null;
@@ -130,21 +347,6 @@ var DetectorProcessor = class extends AudioWorkletProcessor {
       this.twCos[k] = Math.cos(2 * Math.PI * k / FFT_N);
       this.twSin[k] = Math.sin(2 * Math.PI * k / FFT_N);
     }
-    this.fluxRing = Math.ceil(DETECT_WINDOW * sampleRate / 128) + 8;
-    this.fluxT = new Float32Array(this.fluxRing).fill(FLUX_EMPTY);
-    this.fluxV = new Float32Array(this.fluxRing);
-    this.fluxWarmup = Math.ceil(DETECT_WARMUP * sampleRate / 128);
-    const nyq = sampleRate / 2;
-    const binOf = (hz) => Math.min(BINS - 1, Math.max(0, Math.round(hz / nyq * BINS)));
-    this.topBin = Math.min(BINS, Math.ceil(DETECT_HZ / nyq * BINS));
-    this.loTopBin = Math.max(1, Math.round(250 / nyq * BINS));
-    this.hiBotBin = Math.round(5e3 / nyq * BINS);
-    this.bandBins = new Int32Array(BAND_EDGES.length * 2);
-    for (let b = 0; b < BAND_EDGES.length; b++) {
-      const edge = BAND_EDGES[b];
-      this.bandBins[b * 2] = binOf(edge[0]);
-      this.bandBins[b * 2 + 1] = binOf(edge[1]);
-    }
     this.port.onmessage = (e) => {
       if (e.data?.type === "reset") this.reset();
     };
@@ -155,12 +357,7 @@ var DetectorProcessor = class extends AudioWorkletProcessor {
     this.histPos = 0;
     this.primed = 0;
     this.spec.fill(0);
-    this.prevSpec.fill(0);
-    this.whiten.fill(1);
-    this.fluxT.fill(FLUX_EMPTY);
-    this.fluxV.fill(0);
-    this.fi = 0;
-    this.lastOnset = -1;
+    this.detector.reset();
   }
   process(inputs) {
     const input = inputs[0];
@@ -208,113 +405,54 @@ var DetectorProcessor = class extends AudioWorkletProcessor {
     const pan = rmsL + rmsR > 1e-5 ? clampSigned((rmsL - rmsR) / (rmsL + rmsR)) : 0;
     this.fft();
     const scale = 2 / this.windowGain;
+    let centroidNumerator = 0, centroidDenominator = 0, logSum = 0, linearSum = 0;
     for (let i = 0; i < BINS; i++) {
       const mag = Math.sqrt(re[i] * re[i] + im[i] * im[i]) * scale;
       const db = 20 * Math.log10(mag + 1e-12);
-      this.spec[i] = clamp((db - MIN_DB) / DB_RANGE);
+      const value = clamp((db - MIN_DB) / DB_RANGE);
+      this.spec[i] = value;
+      centroidNumerator += value * i;
+      centroidDenominator += value;
+      logSum += Math.log(value + 1e-6);
+      linearSum += value;
     }
-    const dt = 128 / sampleRate;
-    const whitenDecay = Math.pow(WHITEN_DECAY_PER_SEC, dt);
-    const top = this.topBin;
-    let flux = 0, wsum = 0;
-    let cNum = 0, cDen = 0, lg = 0, ln = 0;
-    let loE = 0, midE = 0, hiE = 0;
-    for (let i = 0; i < top; i++) {
-      const cur = this.spec[i];
-      this.whiten[i] = Math.max(cur, this.whiten[i] * whitenDecay, WHITEN_FLOOR);
-      const w1 = this.whiten[i];
-      const norm = cur / w1;
-      const prev = this.prevSpec[i] / w1;
-      const w = 1 + 3 * Math.exp(-i / 5);
-      const d = norm - prev;
-      if (d > 0) flux += d * w;
-      wsum += w;
-      this.prevSpec[i] = cur;
-      cNum += cur * i;
-      cDen += cur;
-      lg += Math.log(cur + 1e-6);
-      ln += cur;
-      const pos = d > 0 ? d : 0;
-      if (i < this.loTopBin) loE += pos;
-      else if (i >= this.hiBotBin) hiE += pos;
-      else midE += pos;
-    }
-    flux /= wsum;
-    this.fluxT[this.fi] = t;
-    this.fluxV[this.fi] = flux;
-    this.fi = (this.fi + 1) % this.fluxRing;
-    let cnt = 0, s1 = 0, s2 = 0;
-    for (let i = 0; i < this.fluxRing; i++) {
-      if (t - this.fluxT[i] > DETECT_WINDOW) continue;
-      const v = this.fluxV[i];
-      s1 += v;
-      s2 += v * v;
-      cnt++;
-    }
-    const mean = cnt ? s1 / cnt : 0;
-    const varc = cnt ? Math.max(0, s2 / cnt - mean * mean) : 0;
-    const thresh = mean + DETECT_K * Math.sqrt(varc);
-    const centroid = cDen > 0 ? cNum / cDen / top : 0;
-    const flatness = ln > 0 ? Math.exp(lg / top) / (ln / top) : 0;
-    let onsetStrength = 0;
-    let onsetClass = 0;
-    if (cnt >= this.fluxWarmup && flux > thresh && flux > DETECT_FLOOR && t - this.lastOnset > MIN_GAP) {
-      this.lastOnset = t;
-      onsetStrength = clamp(0.55 + (flux - thresh) / Math.max(thresh, 1e-4) * 0.45);
-      const loBins = Math.max(1, this.loTopBin);
-      const hiBins = Math.max(1, top - this.hiBotBin);
-      const midBins = Math.max(1, this.hiBotBin - this.loTopBin);
-      const loD = loE / loBins;
-      const midD = midE / midBins;
-      const hiD = hiE / hiBins;
-      const totD = loD + midD + hiD + 1e-6;
-      const lo = loD / totD, hi = hiD / totD;
-      if (hi > 0.42) onsetClass = CLASS_HAT;
-      else if (lo > 0.42) onsetClass = CLASS_KICK;
-      else if (flatness > 0.3) onsetClass = CLASS_SNARE;
-      else onsetClass = CLASS_TONAL;
+    const centroid = centroidDenominator > 0 ? centroidNumerator / centroidDenominator / BINS : 0;
+    const flatness = linearSum > 0 ? Math.exp(logSum / BINS) / (linearSum / BINS) : 0;
+    const features = this.detector.analyse(this.spec, 1, t, 128 / sampleRate, flatness);
+    if (features.onsetClassCode !== 0) {
       this.onsetMsg.time = t;
-      this.onsetMsg.strength = onsetStrength;
-      this.onsetMsg.klass = CLASS_NAMES[onsetClass];
+      this.onsetMsg.strength = features.onsetStrength;
+      this.onsetMsg.klass = ONSET_CLASS_NAMES[features.onsetClassCode] ?? "tonal";
       this.onsetMsg.pan = pan;
       this.port.postMessage(this.onsetMsg);
     }
-    this.publish(
-      t,
-      flux,
-      thresh,
-      level,
-      crest,
-      pan,
-      width,
-      centroid,
-      flatness,
-      onsetStrength,
-      onsetClass
-    );
+    this.publish(t, level, crest, pan, width, centroid, flatness);
   }
   /** Write one feature frame and publish it with a single release store. */
-  publish(t, flux, thresh, level, crest, pan, width, centroid, flatness, onsetStrength, onsetClass) {
+  publish(t, level, crest, pan, width, centroid, flatness) {
     const frames = this.frames;
     if (!frames || !this.ctl) return;
-    const base = this.writeCount % RING_FRAMES * FEATURE_FLOATS;
-    frames[base + F_TIME] = t;
-    frames[base + F_FLUX] = flux;
-    frames[base + F_THRESH] = thresh;
-    frames[base + F_LEVEL] = level;
-    frames[base + F_CREST] = crest;
-    frames[base + F_PAN] = pan;
-    frames[base + F_WIDTH] = width;
-    frames[base + F_CENTROID] = centroid;
-    frames[base + F_FLATNESS] = flatness;
-    for (let b = 0; b < BAND_EDGES.length; b++) {
-      const a = this.bandBins[b * 2], e = this.bandBins[b * 2 + 1];
-      let sum = 0;
-      for (let i = a; i <= e; i++) sum += this.spec[i];
-      frames[base + F_BAND_SUB + b] = clamp(sum / (e - a + 1) * BAND_GAINS[b]);
+    const base = this.writeCount % RING_FRAMES * AUDIO_FEATURE_FLOATS;
+    const offsets = AUDIO_FEATURE_OFFSETS;
+    const features = this.detector.result;
+    frames[base + offsets.time] = t;
+    frames[base + offsets.flux] = features.flux;
+    frames[base + offsets.threshold] = features.threshold;
+    frames[base + offsets.level] = level;
+    frames[base + offsets.crest] = crest;
+    frames[base + offsets.pan] = pan;
+    frames[base + offsets.width] = width;
+    frames[base + offsets.centroid] = centroid;
+    frames[base + offsets.flatness] = flatness;
+    for (let band = 0; band < 5; band++) {
+      frames[base + offsets.publicBands + band] = features.publicBands[band];
     }
-    frames[base + F_ONSET_STRENGTH] = onsetStrength;
-    frames[base + F_ONSET_CLASS] = onsetClass;
+    frames[base + offsets.onsetStrength] = features.onsetStrength;
+    frames[base + offsets.onsetClass] = features.onsetClassCode;
+    for (let band = 0; band < PERCEPTUAL_BAND_COUNT; band++) {
+      frames[base + offsets.perceptualBands + band] = features.bands[band];
+      frames[base + offsets.perceptualFlux + band] = features.bandFlux[band];
+    }
     this.writeCount++;
     Atomics.store(this.ctl, CTL_WRITE_COUNT, this.writeCount | 0);
   }

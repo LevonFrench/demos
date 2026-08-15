@@ -67,9 +67,8 @@
   <div id="hint">
     drop an audio file &middot; <kbd>T</kbd> test signal &middot;
     <kbd>Space</kbd> pause &middot; <kbd>&larr;</kbd><kbd>&rarr;</kbd> bar &middot;
-    <kbd>L</kbd> layers &middot;
-    <kbd>1</kbd>&ndash;<kbd>9</kbd> segments &middot;
-    <kbd>[</kbd><kbd>]</kbd> trail &middot; <kbd>K</kbd> kaleidoscope &middot;
+    <kbd>L</kbd> AVS graph &middot; <kbd>,</kbd><kbd>.</kbd> presets &middot; <kbd>P</kbd> auto &middot;
+    <kbd>O</kbd> offline render &middot;
     <kbd>H</kbd> hud &middot; <kbd>D</kbd> debug &middot; <kbd>?</kbd> help
   </div>
 
@@ -82,36 +81,37 @@
         <button class="x" id="guideClose" type="button" aria-label="Close">&times;</button>
       </header>
       <p class="lead">
-        A layered, beat-driven visualiser. Feed it audio, stack layers, and let
-        the director cut presets on the bar.
+        A Winamp AVS compatibility studio. Feed it audio, inspect the real
+        ordered effect graph, and let the director cut presets on the bar.
       </p>
 
       <h3>Get audio in</h3>
       <table>
         <tr><td><b>drop a file</b></td><td>drag any audio file onto the page. No permissions needed.</td></tr>
-        <tr><td><b>load .avs</b></td><td>open <kbd>L</kbd>, then Load a Winamp AVS preset to run its legacy ordered graph.</td></tr>
-        <tr><td><kbd>T</kbd></td><td>built-in 128&nbsp;BPM test signal &mdash; kick, hat and a sustained pad, so both transient and sustained sources have something to read</td></tr>
+        <tr><td><b>choose AVS</b></td><td>open <kbd>L</kbd>, then choose from Original AVS, the full local collection, or My AVS.</td></tr>
+        <tr><td><kbd>T</kbd></td><td>built-in 128&nbsp;BPM kick/hat signal for checking tempo lock and audio reactivity</td></tr>
       </table>
 
       <h3>Transport</h3>
       <table>
         <tr><td><kbd>Space</kbd></td><td>pause / resume without losing the audio-clock position</td></tr>
         <tr><td><kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>skip one musical bar backward / forward</td></tr>
-        <tr><td><kbd>L</kbd></td><td>the layer panel also exposes all three transport controls</td></tr>
+        <tr><td><kbd>L</kbd></td><td>the AVS panel also exposes all three transport controls</td></tr>
       </table>
 
       <h3>Presets</h3>
       <table>
         <tr><td><kbd>P</kbd></td><td>auto preset changes, responsive to energy and onsets on 2–12 bar boundaries</td></tr>
         <tr><td><kbd>,</kbd> <kbd>.</kbd></td><td>previous / next preset</td></tr>
-        <tr><td><kbd>L</kbd></td><td>layer panel &mdash; preset bank, per-layer blend, opacity, clock, envelope</td></tr>
+        <tr><td><kbd>L</kbd></td><td>AVS panel &mdash; preset banks, ordered effect tree, inspector, mute, solo and power</td></tr>
       </table>
 
-      <h3>Effects</h3>
+      <h3>AVS graph</h3>
       <table>
-        <tr><td><kbd>1</kbd>&ndash;<kbd>9</kbd></td><td>kaleidoscope segments (<kbd>1</kbd> bypasses)</td></tr>
-        <tr><td><kbd>K</kbd></td><td>toggle the kaleidoscope</td></tr>
-        <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>trail length, in beats</td></tr>
+        <tr><td><b>P / M / S</b></td><td>power, mute or solo the exact selected AVS renderer</td></tr>
+        <tr><td><b>Save .avs</b></td><td>download the current ordered graph as an AVS preset</td></tr>
+        <tr><td><b>Add to My AVS</b></td><td>copy the current preset to your personal bank without switching sources</td></tr>
+        <tr><td><kbd>O</kbd></td><td>open the full-resolution offline track renderer</td></tr>
       </table>
 
       <h3>Diagnostics</h3>
